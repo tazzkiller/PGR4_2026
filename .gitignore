@@ -1,0 +1,15 @@
+# Build trees and the codegen's output (rexglue.exe codegen pgr4_manifest.toml rebuilds it).
+/out/
+/generated/*
+!/generated/rexglue.cmake
+
+# The game's own executables (taken from the disc and its title update), not ours to version.
+/assets/*.xex
+/assets/*.xexp
+
+# Written by the game and the launcher at run time (made from pgr4.default.toml when missing).
+/pgr4.toml
+*.log
+
+__pycache__/
+*.pyc

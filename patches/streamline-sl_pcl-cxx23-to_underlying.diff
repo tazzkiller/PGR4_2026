@@ -1,0 +1,23 @@
+Local fix to NVIDIA Streamline v2.14.16 include/sl_pcl.h (thirdparty/streamline/include).
+
+Under C++23 (__cplusplus == 202302L) the header declares
+
+    using to_underlying = std::to_underlying;
+
+which is ill-formed (a type alias cannot name a function template), so every C++23 translation
+unit that includes sl_pcl.h (and sl_reflex.h, which includes it) fails to compile with clang:
+"no type named 'to_underlying' in namespace 'std'". The fix makes the header always take its own
+fallback template:
+
+--- a/include/sl_pcl.h
++++ b/include/sl_pcl.h
+@@
+ // c++23 has to_underlying implementation
+-#if __cplusplus == 202302L
++// Local fix (pgr4 project): "using to_underlying = std::to_underlying;" below is ill-formed (an
++// alias of a function template) and breaks every C++23 build; always use the fallback.
++#if 0 && __cplusplus == 202302L
+ using to_underlying = std::to_underlying;
+ #else
+
+(The edit also normalized the file's line endings from CRLF to LF.)

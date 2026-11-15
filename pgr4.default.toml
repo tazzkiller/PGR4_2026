@@ -1,0 +1,98 @@
+# Runtime settings for pgr4.exe, read from beside it at every start.
+# Written by PGR4Launcher when it finds none (pgr4.default.toml, built into the launcher).
+# A --name=value on the command line overrides the same setting here.
+
+# The native D3D12 renderer presents the game, paced on the display (the Xenos plugin still runs
+# fences and interrupts; F9 switches between the two).
+pgr4_native = true
+pgr4_native_primary = true
+# The frame rate unlocked from the console's 30 (the game's presentation interval).
+pgr4_60fps = true
+# 0: pace on the game's own 60 Hz vblank wait (60 FPS). 1-3: pace on the display (unlocked, up
+# to its refresh rate).
+pgr4_native_frame_latency = 3
+# The game's render height: 720 is the game's 16:9 1280x720.
+pgr4_render_height = 720
+pgr4_native_anisotropy = 16
+# Draw resolution scale: every render target at N x the game's 1280x720 (the first launch picks
+# it from the screen, src/pgr4_profile.cpp).
+pgr4_native_resolution_scale = 2
+# Samples per pixel of the 3D scene's MSAA: 1, 2 (the game's own), 4 or 8.
+pgr4_native_msaa = 4
+# Temporal upscaling (DLSS or FSR) instead of MSAA: off, MSAA by default.
+pgr4_native_upscaler = false
+pgr4_native_dlss = true
+pgr4_native_dlss_fg = false
+pgr4_native_dlss_mode = "dlaa"
+pgr4_native_dlss_preset = "E"
+pgr4_native_dlss_jitter_sign = 1
+pgr4_native_dlss_fg_mvec_x = -1
+pgr4_native_dlss_fg_mvec_y = -1
+pgr4_native_dlss_fg_frames = 1
+pgr4_native_frame_generation = false
+pgr4_native_upscaler_width = 1280
+pgr4_native_upscaler_height = 720
+pgr4_native_upscaler_target_fps = 0
+pgr4_native_upscaler_min_height = 360
+# Contrast adaptive sharpening (AMD's CAS), 0 to 1.
+pgr4_native_sharpen_dlss = 0.150000
+pgr4_native_sharpen_fsr = 0.150000
+pgr4_native_gtao = false
+pgr4_native_texture_hd = true
+# Our shaders of the cars, the water and the wet roads (GRAPHICS, ENHANCED REFLECTIONS): off by default.
+pgr4_native_enhanced_reflections = true
+pgr4_native_details = 0
+pgr4_native_brightness = 100
+pgr4_native_present_interval = 1
+pgr4_native_fps_limit = 0
+# No log file by default. To have one, for example when reporting a problem: uncomment this line.
+# log_file = "run.log"
+# In a release F2 switches between the game as it was and the enhanced version (bind_original_look,
+# set by the game when bind_overlay is empty).
+# And F5 turns the free camera on and off, moved with the controller.
+pgr4_free_camera = true
+# No other function key in a release (F1 to F12): they are development keys, and the developer's pgr4.toml
+# does not have these lines (F1 screenshot, F2 settings overlay, F3 debug overlay, F4 settings window,
+# F6 achievements, F7/F8 upscaler, F9 renderer switch).
+bind_screenshot = ""
+bind_overlay = ""
+bind_renderer_switch = ""
+bind_achievements = ""
+bind_upscaler = ""
+bind_upscaler_debug = ""
+bind_debug_overlay = ""
+bind_settings = ""
+
+# Runtime settings: without them the game stops on a black screen after "Press Start".
+gpu_plugin = "xenos"
+execute_unclipped_draw_vs_on_cpu = true
+d3d12_present_vsync = true
+gpu_vblank_deadline_timer = true
+gpu_wait_reg_mem_high_res = true
+clear_memory_page_state = false
+gpu_ring_wake_fast = true
+texture_cache_memory_limit_soft_lifetime = 30
+guest_frame_stats = true
+
+# Xenia Canary patches for PGR4 TU2 (src/pgr4_hooks.cpp). Restart to apply.
+pgr4_disable_motion_blur = true
+pgr4_disable_hdr = false          # avoids flickering when upscaling
+# First launch's settings (src/pgr4_profile.cpp): the definition picked from the screen.
+pgr4_first_launch_done = false
+
+# The window: borderless fullscreen at the desktop's resolution.
+fullscreen = true
+fullscreen_exclusive = false
+fullscreen_resolution = ""
+
+# The camera shake on bumpy roads (1: the game's, 0: none).
+pgr4_camera_shake_scale = 1.0
+# Cockpit view: the eye held to the drawn car, and the cars drawn with their steady orientation.
+pgr4_cockpit_body_follow = true
+pgr4_steady_body_pose = true
+
+# The game's folders, set by the launcher (game\ and title-update\ beside it are found alone).
+game_data_root = ''
+update_data_root = ''
+content_root = ''
+dlc_root = ''

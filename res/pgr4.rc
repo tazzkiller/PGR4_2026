@@ -1,0 +1,4 @@
+// The executables' icon: PGR4's own, its Xbox 360 title image (64x64, from a package header),
+// scaled to the sizes Windows shows. ID 1: the first icon, Explorer's, SDL's window icon and the
+// launcher's window class (launcher.cpp).
+1 ICON "pgr4.ico"

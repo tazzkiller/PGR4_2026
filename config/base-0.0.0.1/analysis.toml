@@ -1,0 +1,68 @@
+# PGR4 analysis results (setjmp/longjmp, rexcrt, SEH) — included from pgr4_manifest.toml [entrypoint]
+# XEX2: retail AES + basic compression, image base 0x82000000, entry 0x8267CA00, size 0xD70000
+# Kernel/XAM imports: 282 thunks, all present in the SDK (248 implemented, 34 stubs)
+
+
+# The title imports __C_specific_handler / RtlUnwind and ships SEH funclets
+# (e.g. 0x828A9BE8 just before setjmp), so generate the exception wrappers.
+# (The wiki says enable_exception_handlers, but config.cpp reads generate_exception_handlers.)
+generate_exception_handlers = true
+
+# setjmp: hook check at +0 (lis r4,0x82BE / lwz r0,0x6010 / bnectr), then saves
+# LR, CR, f14-f31 @0x00, r13-r31 @0x98, VMX @0x140. No .pdata entry.
+setjmp_address = 0x828A9C50
+# longjmp: restores the same layout from r3 (f14-f31, r13-r31), unwinds when jmp_buf+0x138 != 0.
+longjmp_address = 0x828AA1D0
+
+[functions]
+# No names here: "setjmp"/"longjmp" clash with <csetjmp> in the generated headers.
+0x828A9C50 = { size = 0x2CC }  # setjmp
+0x828AA1D0 = { size = 0x314 }  # longjmp
+# Leaf functions without .pdata, reached only by tail branches (codegen run 1: UnresolvedCall)
+0x824B8670 = { size = 0x4 }   # blr stub
+0x82526280 = { size = 0x6C }
+0x828DDA98 = { size = 0x14 }  # ++this->field_8, returns new value (AddRef-like)
+0x829C23A0 = { size = 0x18 }  # if (r3) r3->field_28C = r4
+0x828E5488 = { size = 0x4 }   # thunk: b 0x828E50F8
+
+# C++ catch funclets whose .pdata entry also covers the parent's epilogue, which the parent
+# reaches with its final "b +0xC8" (codegen run 2: unresolved b target). Split them.
+0x82704DD0 = { end = 0x82704E30 }                       # catch funclet of 0x827049D0
+0x82704E30 = { parent = 0x827049D0, end = 0x82704E50 }  # 0x827049D0 epilogue
+0x82746C24 = { end = 0x82746C84 }                       # catch funclet of 0x82746820
+0x82746C84 = { parent = 0x82746820, end = 0x82746CA4 }  # 0x82746820 epilogue
+0x827561B4 = { end = 0x82756214 }                       # catch funclet of 0x82755DB0
+0x82756214 = { parent = 0x82755DB0, end = 0x82756234 }  # 0x82755DB0 epilogue
+
+[rexcrt]
+# Heap (all four required together). Callers: LocalAlloc 0x8267E0C8, LocalFree 0x8267E110,
+# _msize 0x828A5EF0, CRT free 0x828A6028, CRT realloc 0x828A62B8; process heap = 0x82673470.
+RtlAllocateHeap = 0x82671FE8
+RtlFreeHeap = 0x826728D0
+RtlSizeHeap = 0x82671280
+RtlReAllocateHeap = 0x82672BB8
+
+# Memory / string
+memcpy = 0x828A3790
+memset = 0x828A4690
+strcpy_s = 0x828A5700
+
+# File I/O (XAPI, via the Nt* dispatch table at 0x82A317F0)
+CreateFileA = 0x82673890
+ReadFile = 0x82673E80
+WriteFile = 0x82673768
+SetFilePointer = 0x82673C00
+GetFileSizeEx = 0x8267E158
+SetEndOfFile = 0x82673D70
+FlushFileBuffers = 0x828D9418
+CloseHandle = 0x82670208
+DeleteFileA = 0x8267BF48
+CreateDirectoryA = 0x82674140
+FindFirstFileA = 0x8267C000
+FindNextFileA = 0x8267C090
+GetFileAttributesA = 0x828D9558
+SetFileAttributesA = 0x82685ED8
+SetFileTime = 0x828D95C0
+# Not mapped on purpose:
+#   GetFileAttributesExA = 0x82685990  -> SDK entry takes (level, name, info), the game passes (name, level, info)
+#   0x8267BDA8 is MoveFileWithProgress/MoveFileEx (5 args), 0x82685FB8 is CopyFileEx (6 args): no MoveFileA/CopyFileA

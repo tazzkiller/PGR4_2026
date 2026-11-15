@@ -1,0 +1,3 @@
+# The patches apply byte for byte: never convert their line endings.
+*.diff -text
+*.bin binary
