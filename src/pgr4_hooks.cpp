@@ -1807,3 +1807,111 @@ REX_HOOK_RAW(sub_8238BD38) {
     base[a + 3] = 0xFE;
   }
 }
+
+// Local change (15/11/2026, Tazz): manual gear presses kept until a physics step takes them, at any
+// frame rate. A press lasts one frame in the controls (an up and a down byte, set by sub_822DC9E0
+// on the frame the button goes down), but the gearbox reads them only in the 60 Hz physics step.
+// At the console's 30 FPS every frame had a step; above 60 FPS many frames have none, and a quick
+// tap was often gone before the next step (shifts missed). A press is put back in the next frames'
+// controls until a gearbox step has seen it, for 50 ms at most: one made while the physics is
+// stopped (a pause) is dropped. A press put back is cleared once taken, so that a second step in
+// the same frame does not see it again.
+// Cars: controls sub_822DC420(controls r3, pad r4 in 0..3): bytes +16 (up) and +17 (down); gearbox
+//   sub_822DE628(gearbox r3): +36 the car, car +808 its controls, +29 set by the frame's first step
+//   (the later ones ignore the press), +30 the gear.
+// Bikes: controls sub_822F9D70(bike r3, its pad at +3904, -1 for an AI rider): bike +3230 (up) and
+//   +3231 (down); gearbox sub_822FB680(gearbox r3): +0 the bike, the gear at +12.
+REXCVAR_DEFINE_BOOL(pgr4_gear_press_latch, true, "PGR4",
+                    "Manual gear presses kept until the physics takes them (no shift missed above 60 FPS)");
+REXCVAR_DEFINE_BOOL(pgr4_gear_press_probe, false, "PGR4",
+                    "Development: the gear presses put back and taken, in the log");
+namespace {
+struct HeldGearPress {
+  uint32_t at = 0;  // the guest address of the up byte; the down byte follows it
+  uint8_t up = 0, down = 0;
+  bool put_back = false;  // the bytes in memory now are ours, not the game's
+  std::chrono::steady_clock::time_point since;
+};
+std::mutex g_gear_mutex;
+std::array<HeldGearPress, 8> g_gear_held;  // 4 pads, as a car or a bike
+
+HeldGearPress* FindGearPress(uint32_t at, bool make) {
+  HeldGearPress* free_slot = nullptr;
+  for (HeldGearPress& h : g_gear_held) {
+    if (h.at == at) return &h;
+    if (!free_slot && !h.up && !h.down) free_slot = &h;
+  }
+  if (make && free_slot) free_slot->at = at;
+  return make ? free_slot : nullptr;
+}
+
+// After a controls update: a new press is remembered; with none, a held one is put back.
+void LatchGearPress(uint8_t* base, uint32_t at) {
+  if (!REXCVAR_GET(pgr4_gear_press_latch)) return;
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard lock(g_gear_mutex);
+  if (base[at] || base[at + 1]) {
+    if (HeldGearPress* h = FindGearPress(at, true)) *h = {at, base[at], base[at + 1], false, now};
+    return;
+  }
+  HeldGearPress* h = FindGearPress(at, false);
+  if (!h || (!h->up && !h->down)) return;
+  if (now - h->since > std::chrono::milliseconds(50)) {
+    *h = {};
+    return;
+  }
+  base[at] = h->up;
+  base[at + 1] = h->down;
+  if (REXCVAR_GET(pgr4_gear_press_probe) && !h->put_back)
+    REXLOG_INFO("PGR4 gear: press {:08X} put back ({})", at, h->up ? "up" : "down");
+  h->put_back = true;
+}
+
+// After a gearbox step that saw a press.
+void GearPressTaken(uint8_t* base, uint32_t at, const char* what, int gear_before, int gear_after) {
+  std::lock_guard lock(g_gear_mutex);
+  HeldGearPress* h = FindGearPress(at, false);
+  if (REXCVAR_GET(pgr4_gear_press_probe))
+    REXLOG_INFO("PGR4 gear: {} press {:08X} taken{}, gear {} -> {}", what, at,
+                h && h->put_back ? " (put back)" : "", gear_before, gear_after);
+  if (!h) return;
+  if (h->put_back) base[at] = base[at + 1] = 0;
+  *h = {};
+}
+}  // namespace
+
+REX_EXTERN(__imp__sub_822DC420);
+REX_HOOK_RAW(sub_822DC420) {
+  const uint32_t controls = ctx.r3.u32, pad = ctx.r4.u32 & 0xFF;
+  __imp__sub_822DC420(ctx, base);
+  if (pad < 4 && controls) LatchGearPress(base, controls + 16);
+}
+
+REX_EXTERN(__imp__sub_822DE628);
+REX_HOOK_RAW(sub_822DE628) {
+  const uint32_t gearbox = ctx.r3.u32;
+  const uint32_t car = Be32(base, gearbox + 36);
+  const uint32_t controls = car ? Be32(base, car + 808) : 0;
+  const bool pressed = controls && (base[controls + 16] || base[controls + 17]);
+  const int gear = int8_t(base[gearbox + 30]);
+  __imp__sub_822DE628(ctx, base);
+  if (pressed) GearPressTaken(base, controls + 16, "car", gear, int8_t(base[gearbox + 30]));
+}
+
+REX_EXTERN(__imp__sub_822F9D70);
+REX_HOOK_RAW(sub_822F9D70) {
+  const uint32_t bike = ctx.r3.u32;
+  const int32_t pad = bike ? int32_t(Be32(base, bike + 3904)) : -1;
+  __imp__sub_822F9D70(ctx, base);
+  if (pad >= 0 && pad < 4) LatchGearPress(base, bike + 3230);
+}
+
+REX_EXTERN(__imp__sub_822FB680);
+REX_HOOK_RAW(sub_822FB680) {
+  const uint32_t gearbox = ctx.r3.u32;
+  const uint32_t bike = Be32(base, gearbox);
+  const bool pressed = bike && (base[bike + 3230] || base[bike + 3231]);
+  const int gear = int32_t(Be32(base, gearbox + 12));
+  __imp__sub_822FB680(ctx, base);
+  if (pressed) GearPressTaken(base, bike + 3230, "bike", gear, int32_t(Be32(base, gearbox + 12)));
+}
