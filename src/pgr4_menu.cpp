@@ -228,7 +228,7 @@ const char16_t* const kTexts[kTextCount] = {
     nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr, nullptr,
     nullptr,  u"X2",    u"X3",    u"X4",    u"X5",    u"X6",    u"MSAA",
     u"DLSS FRAME GENERATION", u"FSR FRAME GENERATION", nullptr, u"60%", u"70%", u"80%", u"90%",
-    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.1 (TAZZ)",
+    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.2 (TAZZ)",
 };
 
 // The others, in each of the game's languages (the loc folders' order), every glyph one the game's

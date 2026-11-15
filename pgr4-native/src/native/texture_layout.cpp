@@ -201,6 +201,128 @@ void Convert(TextureConversion conversion, uint8_t* row, uint32_t bytes) {
         std::memcpy(row + i, &v, 4);
       }
       return;
+    case C::kDecompressBC1:
+    case C::kDecompressBC2:
+    case C::kDecompressBC3:
+    case C::kDecompressBC5:
+      return;  // whole blocks, in UntileTexture (DecodeBlock)
+  }
+}
+
+// Local change (pgr4 project): BCn decoding (the D3D10 block compression rules), for the cards
+// without unaligned BC textures (GetDecompressedHostFormat).
+constexpr FormatEntry kDecompressed[] = {
+    {TextureFormat::k_DXT1, {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                             DXGI_FORMAT_UNKNOWN, C::kDecompressBC1, false, kRGBA}},
+    {TextureFormat::k_DXT2_3, {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               DXGI_FORMAT_UNKNOWN, C::kDecompressBC2, false, kRGBA}},
+    {TextureFormat::k_DXT4_5, {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+                               DXGI_FORMAT_UNKNOWN, C::kDecompressBC3, false, kRGBA}},
+    {TextureFormat::k_DXN, {DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_UNKNOWN,
+                            C::kDecompressBC5, false, kRGGG}},
+};
+
+bool Decompressing(TextureConversion c) {
+  return c == C::kDecompressBC1 || c == C::kDecompressBC2 || c == C::kDecompressBC3 ||
+         c == C::kDecompressBC5;
+}
+
+// Host bytes per block (per texel for the decompressed formats).
+uint32_t HostBytesPerBlock(const HostFormat& host, const FormatInfo* info) {
+  switch (host.conversion) {
+    case C::kDecompressBC1:
+    case C::kDecompressBC2:
+    case C::kDecompressBC3:
+      return 4;
+    case C::kDecompressBC5:
+      return 2;
+    default:
+      return info->bytes_per_block();
+  }
+}
+
+// A BC1 colour block (8 bytes) into 16 RGBA texels; BC2 and BC3 always take its four-colour mode.
+void DecodeColorBlock(const uint8_t* b, bool four_colors_only, uint8_t out[16][4]) {
+  const uint16_t c0 = uint16_t(b[0] | b[1] << 8), c1 = uint16_t(b[2] | b[3] << 8);
+  const uint32_t bits = uint32_t(b[4]) | uint32_t(b[5]) << 8 | uint32_t(b[6]) << 16 |
+                        uint32_t(b[7]) << 24;
+  uint8_t c[4][4];
+  const auto expand = [](uint16_t v, uint8_t* o) {
+    const uint32_t r = (v >> 11) & 31, g = (v >> 5) & 63, bl = v & 31;
+    o[0] = uint8_t(r << 3 | r >> 2);
+    o[1] = uint8_t(g << 2 | g >> 4);
+    o[2] = uint8_t(bl << 3 | bl >> 2);
+    o[3] = 255;
+  };
+  expand(c0, c[0]);
+  expand(c1, c[1]);
+  if (four_colors_only || c0 > c1) {
+    for (int k = 0; k < 3; ++k) {
+      c[2][k] = uint8_t((2 * c[0][k] + c[1][k] + 1) / 3);
+      c[3][k] = uint8_t((c[0][k] + 2 * c[1][k] + 1) / 3);
+    }
+    c[2][3] = c[3][3] = 255;
+  } else {
+    for (int k = 0; k < 3; ++k) c[2][k] = uint8_t((c[0][k] + c[1][k]) / 2);
+    c[2][3] = 255;
+    c[3][0] = c[3][1] = c[3][2] = c[3][3] = 0;
+  }
+  for (int i = 0; i < 16; ++i) std::memcpy(out[i], c[(bits >> (2 * i)) & 3], 4);
+}
+
+// A BC3 alpha / BC4 / BC5 channel block (8 bytes) into 16 values.
+void DecodeChannelBlock(const uint8_t* b, uint8_t out[16]) {
+  const uint32_t a0 = b[0], a1 = b[1];
+  uint8_t a[8] = {uint8_t(a0), uint8_t(a1)};
+  if (a0 > a1) {
+    for (uint32_t k = 1; k < 7; ++k) a[k + 1] = uint8_t(((7 - k) * a0 + k * a1 + 3) / 7);
+  } else {
+    for (uint32_t k = 1; k < 5; ++k) a[k + 1] = uint8_t(((5 - k) * a0 + k * a1 + 2) / 5);
+    a[6] = 0;
+    a[7] = 255;
+  }
+  uint64_t bits = 0;
+  for (int i = 0; i < 6; ++i) bits |= uint64_t(b[2 + i]) << (8 * i);
+  for (int i = 0; i < 16; ++i) out[i] = a[(bits >> (3 * i)) & 7];
+}
+
+// One block of `conversion`'s format into 16 texels of the host's bytes per texel (4 or 2), in
+// row order.
+void DecodeBlock(TextureConversion conversion, const uint8_t* b, uint8_t* texels) {
+  uint8_t rgba[16][4];
+  switch (conversion) {
+    case C::kDecompressBC1:
+      DecodeColorBlock(b, false, rgba);
+      std::memcpy(texels, rgba, 64);
+      return;
+    case C::kDecompressBC2:
+      DecodeColorBlock(b + 8, true, rgba);
+      for (int i = 0; i < 16; ++i) {
+        const uint32_t nibble = (b[i / 2] >> (4 * (i & 1))) & 15;
+        rgba[i][3] = uint8_t(nibble * 17);
+      }
+      std::memcpy(texels, rgba, 64);
+      return;
+    case C::kDecompressBC3: {
+      uint8_t alpha[16];
+      DecodeChannelBlock(b, alpha);
+      DecodeColorBlock(b + 8, true, rgba);
+      for (int i = 0; i < 16; ++i) rgba[i][3] = alpha[i];
+      std::memcpy(texels, rgba, 64);
+      return;
+    }
+    case C::kDecompressBC5: {
+      uint8_t r[16], g[16];
+      DecodeChannelBlock(b, r);
+      DecodeChannelBlock(b + 8, g);
+      for (int i = 0; i < 16; ++i) {
+        texels[2 * i] = r[i];
+        texels[2 * i + 1] = g[i];
+      }
+      return;
+    }
+    default:
+      return;
   }
 }
 
@@ -242,6 +364,14 @@ const HostFormat* GetHostFormat(TextureFormat f) {
   return i < 0 ? nullptr : &kFormats[i].host;
 }
 
+const HostFormat* GetDecompressedHostFormat(TextureFormat f) {
+  for (const FormatEntry& e : kDecompressed)
+    if (e.format == f) return &e.host;
+  return nullptr;
+}
+
+bool IsDecompressed(const HostFormat& host) { return Decompressing(host.conversion); }
+
 uint64_t SignedViewIsUnsignedFormats() {
   uint64_t formats = 0;
   for (uint32_t f = 0; f < 64; ++f) {
@@ -281,17 +411,17 @@ void GetGuestExtents(const TextureKey& key, uint32_t* base_bytes, uint32_t* mips
 }
 
 uint64_t GetHostFootprints(const TextureKey& key, bool d3d12_placement,
-                           std::vector<HostSubresource>* subresources) {
+                           std::vector<HostSubresource>* subresources, const HostFormat* host) {
   subresources->clear();
-  const HostFormat* host = GetHostFormat(key.format);
+  if (!host) host = GetHostFormat(key.format);
   if (!host) return 0;
   subresources->reserve(size_t(key.array_size()) * key.mip_levels());
   const FormatInfo* info = FormatInfo::Get(key.format);
   uint32_t bw = host->block_compressed ? info->block_width : 1;
   uint32_t bh = host->block_compressed ? info->block_height : 1;
   // Host bytes per block equal the guest ones for every format in the table (the conversions
-  // keep the size).
-  uint32_t bpb = info->bytes_per_block();
+  // keep the size); per texel for the decompressed ones.
+  uint32_t bpb = HostBytesPerBlock(*host, info);
   uint64_t offset = 0;
   for (uint32_t slice = 0; slice < key.array_size(); ++slice) {
     for (uint32_t level = 0; level <= key.mip_max_level; ++level) {
@@ -327,8 +457,44 @@ bool UntileTexture(const TextureKey& key, const GuestTextureMemory& memory,
 bool UntileTexture(const TextureKey& key, const texture_util::TextureGuestLayout& layout,
                    const GuestTextureMemory& memory,
                    const std::vector<HostSubresource>& subresources, uint8_t* dst,
-                   std::vector<uint8_t>* scratch, UntileStats* stats) {
-  const HostFormat* host = GetHostFormat(key.format);
+                   std::vector<uint8_t>* scratch, UntileStats* stats, const HostFormat* host) {
+  if (host && Decompressing(host->conversion)) {
+    // Local change (pgr4 project): the blocks untiled as for the BC host format (tight rows),
+    // then decoded into the texels, those past the texture's size dropped.
+    const HostFormat* bc = GetHostFormat(key.format);
+    std::vector<HostSubresource> blocks;
+    const uint64_t bc_size = bc ? GetHostFootprints(key, false, &blocks, bc) : 0;
+    if (!bc_size || blocks.size() != subresources.size()) return false;
+    std::vector<uint8_t> bc_data(bc_size);
+    if (!UntileTexture(key, layout, memory, blocks, bc_data.data(), scratch, stats, bc))
+      return false;
+    const uint32_t bc_bpb = FormatInfo::Get(key.format)->bytes_per_block();
+    const uint32_t texel_bytes = HostBytesPerBlock(*host, FormatInfo::Get(key.format));
+    uint8_t texels[16 * 4];
+    for (size_t i = 0; i < subresources.size(); ++i) {
+      const HostSubresource& s = subresources[i];
+      const HostSubresource& b = blocks[i];
+      for (uint32_t z = 0; z < s.depth; ++z)
+        for (uint32_t by = 0; by < b.block_rows; ++by)
+          for (uint32_t bx = 0; bx < b.block_columns; ++bx) {
+            DecodeBlock(host->conversion,
+                        bc_data.data() + b.offset + (size_t(z) * b.block_rows + by) * b.row_pitch +
+                            size_t(bx) * bc_bpb,
+                        texels);
+            for (uint32_t ty = 0; ty < 4; ++ty) {
+              const uint32_t y = by * 4 + ty;
+              if (y >= s.height) break;
+              const uint32_t x0 = bx * 4;
+              const uint32_t n = std::min(4u, s.width - x0);
+              std::memcpy(dst + s.offset + (size_t(z) * s.block_rows + y) * s.row_pitch +
+                              size_t(x0) * texel_bytes,
+                          texels + size_t(ty) * 4 * texel_bytes, size_t(n) * texel_bytes);
+            }
+          }
+    }
+    return true;
+  }
+  if (!host) host = GetHostFormat(key.format);
   if (!host) return false;
   const FormatInfo* info = FormatInfo::Get(key.format);
   const uint32_t bpb = info->bytes_per_block();

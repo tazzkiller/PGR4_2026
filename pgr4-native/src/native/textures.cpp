@@ -61,6 +61,10 @@ REXCVAR_DEFINE_INT32(pgr4_native_texture_memory_hard_mb, -1, "PGR4 native",
 REXCVAR_DECLARE(bool, pgr4_native_texture_catalog);
 REXCVAR_DECLARE(std::string, pgr4_native_capture_dir);
 
+REXCVAR_DEFINE_BOOL(pgr4_native_test_no_unaligned_bc, false, "PGR4 native",
+                    "Development: as if the card had no unaligned BC textures (Windows 10): "
+                    "those textures decoded on the CPU (at startup)");
+
 REXCVAR_DEFINE_BOOL(pgr4_native_scaled_cube, true, "PGR4 native",
                     "Cube maps the game renders (the cars' surroundings) bound at the draw "
                     "resolution scale, not shrunk to the game's size (local change)");
@@ -235,6 +239,7 @@ TextureCache::TextureCache(ID3D12Device* device, const uint8_t* physical_membase
                                              sizeof(options8)))) {
     unaligned_bc_supported_ = options8.UnalignedBlockTexturesSupported;
   }
+  if (REXCVAR_GET(pgr4_native_test_no_unaligned_bc)) unaligned_bc_supported_ = false;
   REXLOG_INFO("PGR4 native textures: cache up (unaligned BC textures {})",
               unaligned_bc_supported_ ? "supported" : "not supported");
 #ifndef PGR4_TEXTURES_OFFLINE
@@ -875,7 +880,8 @@ void ReplaceOrDump(const TextureKey& key, const GuestTextureMemory& guest,
 
 uint64_t TextureCache::RunUntile(const UntileJob& job, std::vector<uint8_t>* scratch) {
   const uint64_t t0 = NowNs();
-  UntileTexture(job.key, job.layout, job.guest, job.footprints, job.dst, scratch);
+  UntileTexture(job.key, job.layout, job.guest, job.footprints, job.dst, scratch, nullptr,
+                job.host);
   ReplaceOrDump(job.key, job.guest, job.footprints, job.dst, job.copies.format);
   const uint64_t ns = NowNs() - t0;
   if (ns > 500000) {
@@ -1117,15 +1123,27 @@ TextureCache::Texture* TextureCache::NewTexture(const TextureKey& key) {
   return t;
 }
 
-TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFormat& host) {
+TextureCache::Texture* TextureCache::Create(const TextureKey& key, const HostFormat& guest_host) {
   Texture& t = *NewTexture(key);
-  t.host = &host;
   t.layout = GetGuestLayout(key);
   GetGuestExtents(key, t.layout, &t.base_bytes, &t.mips_bytes);
   t.resolved_seq.assign(size_t(key.mip_levels()) * key.array_size(), 0);
 
   const rex::graphics::FormatInfo* info = rex::graphics::FormatInfo::Get(key.format);
   bool unaligned = (key.width % info->block_width) || (key.height % info->block_height);
+  // Local change (15/11/2026): a card without unaligned BC textures (Windows 10) gets such a
+  // texture (a 128x1 DXT1) decoded on the CPU into R8G8B8A8 (R8G8 for DXN). Before, it was not
+  // drawn at all (a player's race HUD lost its minimap).
+  const HostFormat* decompressed =
+      guest_host.block_compressed && unaligned && !unaligned_bc_supported_
+          ? GetDecompressedHostFormat(key.format)
+          : nullptr;
+  if (decompressed)
+    PGR4_LOG_FIRST(8, INFO,
+                   "PGR4 native textures: {}x{} {} decoded on the CPU (no unaligned BC support)",
+                   key.width, key.height, info->name);
+  const HostFormat& host = decompressed ? *decompressed : guest_host;
+  t.host = &host;
   if (host.block_compressed && unaligned && !unaligned_bc_supported_) {
     PGR4_WARN_ONCE(
         "PGR4 native textures: {}x{} {} needs decompression (no unaligned BC support); "
@@ -1423,7 +1441,7 @@ void TextureCache::Transition(Texture& t, ID3D12GraphicsCommandList* list,
 bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t frame_fence,
                           bool defer) {
   const TextureKey& key = t.key;
-  uint64_t size = GetHostFootprints(key, true, &footprints_);
+  uint64_t size = GetHostFootprints(key, true, &footprints_, t.host);
   if (!size) return false;
   if (ResolvesCoverAll(t)) {
     // The CopyResolved that follows overwrites every subresource in full (it copies even over
@@ -1485,6 +1503,7 @@ bool TextureCache::Upload(Texture& t, ID3D12GraphicsCommandList* list, uint64_t 
   job.base_bytes = t.base_bytes;
   job.mips_bytes = t.mips_bytes;
   job.conversion = t.host->conversion;
+  job.host = t.host;
   if (workers_.empty()) {
     ArmWatches(job.key, job.base_bytes, job.mips_bytes);
     stats_.untile_ns += RunUntile(job, &untile_scratch_);
@@ -1807,7 +1826,8 @@ void TextureCache::ApplyHd(Texture& t, ID3D12GraphicsCommandList* list, uint64_t
   const bool rgba8 = resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS ||
                      resource_format == DXGI_FORMAT_R8G8B8A8_UNORM;
   if (!key.base_page || key.dimension == xenos::DataDimension::kCube ||
-      (!key.is_3d() && key.array_size() != 1) || !(t.host->block_compressed || rgba8))
+      (!key.is_3d() && key.array_size() != 1) || !(t.host->block_compressed || rgba8) ||
+      IsDecompressed(*t.host))
     return;
   HdFiles& hd = Hd();
   // Without an HD pack, still the 128 x 128 ones: the snow's flakes tell that it snows (draw.cpp).

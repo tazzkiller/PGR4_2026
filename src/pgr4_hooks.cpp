@@ -5,6 +5,7 @@
 
 #include <rex/audio/audio_media_player.h>
 #include <rex/audio/audio_system.h>
+#include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
 #include <rex/runtime.h>
 #include <rex/hook.h>
@@ -881,9 +882,64 @@ REX_HOOK_RAW(sub_8283A3C0) {
   __imp__sub_8283A3C0(ctx, base);
 }
 REX_EXTERN(__imp__sub_82806450);
+// pgr4_audio_voice_probe (15/11/2026, the kudos counter's tick inaudible though decoded): for
+// 40 ms after the UI's HUD_Kudos_Up or HUD_Kudos_Bank (sub_826A03A8), every voice the audio
+// thread runs whose object points at an XMA context (a word in its first 2 KB inside the
+// context array, ContextArrayAddress, 64 bytes a context) logged with the context and its
+// candidate gain fields; the first voices' 512 bytes dumped, to compare the two sounds.
+REXCVAR_DEFINE_BOOL(pgr4_audio_voice_probe, false, "PGR4",
+                    "Development: the voices playing the kudos sounds, in the log");
+std::atomic<int64_t> g_ui_sound_at{0};    // steady_clock ns of the last kudos UI sound
+std::atomic<uint32_t> g_ui_sound_index{0};
+std::atomic<uint32_t> g_tick_xma{0};  // the XMA object of the last HUD_Kudos_Up's voice
+REXCVAR_DEFINE_DOUBLE(pgr4_audio_tick_boost, 0.0, "PGR4",
+                      "Development: the kudos tick voice's output multiplied by this (0 off)");
 REX_HOOK_RAW(sub_82806450) {
   NoteMixer(base, ctx.r3.u32, 'v');
+  // The tick's voice (its XMA object at +80 the one started right after HUD_Kudos_Up, g_tick_xma):
+  // its state before the render and the 256 floats it rendered into r4.
+  const uint32_t voice = ctx.r3.u32, out = ctx.r4.u32, params = ctx.r5.u32;
+  bool trace = false;
+  int64_t since = 0;
+  std::string before;
+  if (REXCVAR_GET(pgr4_audio_voice_probe) && g_tick_xma.load() &&
+      GuestLoad32(voice + 80) == g_tick_xma.load()) {
+    since = std::chrono::steady_clock::now().time_since_epoch().count() - g_ui_sound_at.load();
+    static std::atomic<int> lines{0};
+    trace = since >= 0 && since < 60'000'000 && lines.fetch_add(1) < 3000;
+    if (trace) {
+      const uint8_t* v = base + voice;
+      before = fmt::format(
+          "b28 {} b29 {} b36 {} b72 {} b73 {} b7C {} w50 {} w5C {} w90 {} wAC {} f64 {:.3f} "
+          "vol {:.3f}..{:.3f} t {:.3f}",
+          v[28], v[29], v[36], v[0x72], v[0x73], v[0x7C], GuestLoad32(voice + 0x50),
+          GuestLoad32(voice + 0x5C), GuestLoad32(voice + 0x90), GuestLoad32(voice + 0xAC),
+          BeF(v + 0x64), BeF(v + 0x68), BeF(v + 0x6C), params ? BeF(base + params + 12) : -1.0f);
+    }
+  }
   __imp__sub_82806450(ctx, base);
+  // Development test (15/11/2026): the tick voice's rendered block multiplied, to tell a tick too
+  // quiet from one thrown away after its voice.
+  if (const double boost = REXCVAR_GET(pgr4_audio_tick_boost);
+      boost > 0 && g_tick_xma.load() && GuestLoad32(voice + 80) == g_tick_xma.load()) {
+    for (uint32_t i = 0; i < 256; ++i)
+      PutBeF(base + out + 4 * i,
+             std::clamp(float(BeF(base + out + 4 * i) * boost), -1.0f, 1.0f));
+  }
+  if (trace) {
+    double sum = 0, peak = 0;
+    for (uint32_t i = 0; i < 256; ++i) {
+      const double s = BeF(base + out + 4 * i);
+      sum += s * s;
+      peak = std::max(peak, std::abs(s));
+    }
+    const double rms = std::sqrt(sum / 256);
+    REXLOG_INFO("PGR4 audio tick voice +{:.1f}ms {:08X}: {} -> ret {} out rms {:.0f} dB peak {:.0f} "
+                "dB, after b36 {} b73 {} wAC {}",
+                since / 1e6, voice, before, int32_t(ctx.r3.u32),
+                rms > 0 ? 20 * std::log10(rms) : -99.0, peak > 0 ? 20 * std::log10(peak) : -99.0,
+                base[voice + 36], base[voice + 0x73], GuestLoad32(voice + 0xAC));
+  }
 }
 
 // pgr4_audio_event_probe: the vehicle sound's event calls into the sound system: sub_82689A60
@@ -916,6 +972,207 @@ REX_HOOK_RAW(sub_8268EE28) {
     REXLOG_INFO("PGR4 audio event E28 (frame {}): sound {:08X} r4 {} index {}", g_frame_no,
                 ctx.r3.u32, int32_t(ctx.r4.u32), int32_t(ctx.r5.u32));
   __imp__sub_8268EE28(ctx, base);
+}
+
+// pgr4_audio_script_probe (15/11/2026, the kudos counter's tick inaudible): the sound scripts'
+// interpreter, sub_82830998(script, instance): one instruction a call (sub_82831158 loops while
+// the state's +264 is set). State at *(script+16) + *(instance+44): float stack from +0, program
+// counter +256, stack height +260, compare flags +265/+266/+267; code at *(script+20) +
+// *(*(script+8)+12), its length at *(*(script+12) + *(*(script+8)+12) + 8). Each instruction
+// run within 40 ms of a kudos UI sound logged with its operand and the stack after it.
+REXCVAR_DEFINE_BOOL(pgr4_audio_script_probe, false, "PGR4",
+                    "Development: the sound scripts' instructions after a kudos sound, in the log");
+extern std::atomic<int64_t> g_ui_sound_at;
+REX_EXTERN(__imp__sub_82830998);
+REX_EXTERN(sub_827E32F8);  // a sound component's value (object, component, instance state, 0)
+REX_HOOK_RAW(sub_82830998) {
+  bool trace = false;
+  uint32_t state = 0, code = 0, pc = 0, script = ctx.r3.u32, instance = ctx.r4.u32;
+  if (REXCVAR_GET(pgr4_audio_script_probe)) {
+    const int64_t since =
+        std::chrono::steady_clock::now().time_since_epoch().count() - g_ui_sound_at.load();
+    static std::atomic<int> lines{0};
+    if (since >= 0 && since < 40'000'000 && lines.load() < 4000) {
+      ++lines;
+      trace = true;
+      const uint32_t shared = GuestLoad32(GuestLoad32(script + 8) + 12);
+      state = GuestLoad32(script + 16) + GuestLoad32(instance + 44);
+      code = GuestLoad32(script + 20) + shared;
+      pc = GuestLoad32(state + 256);
+    }
+  }
+  __imp__sub_82830998(ctx, base);
+  if (trace && GuestLoad32(code + 4 * pc) == 0x1000 && GuestLoad32(code + 4 * pc + 4) == 0x65) {
+    // HUD_Kudos_UpScript just played HUD_Kudos_UpSound (UI.dat component 101): the values of
+    // the components around it, read as the interpreter's op 0x1001 does (sub_827E32F8(object,
+    // component, instance state, 0) -> f1).
+    const PPCContext saved = ctx;
+    std::string values;
+    for (uint32_t component : {52u, 97u, 98u, 99u, 100u, 101u, 10u, 163u}) {
+      ctx.r3.u64 = GuestLoad32(script + 8);
+      ctx.r4.u64 = component;
+      ctx.r5.u64 = GuestLoad32(instance + 44);
+      ctx.r6.u64 = 0;
+      sub_827E32F8(ctx, base);
+      values += fmt::format(" {}={:.3f}", component, ctx.f1.f64);
+    }
+    ctx = saved;
+    REXLOG_INFO("PGR4 audio script values after HUD_Kudos_UpSound:{}", values);
+  }
+  if (trace) {
+    const uint32_t sp = GuestLoad32(state + 260);
+    std::string stack;
+    for (uint32_t i = 0; i < std::min(sp, 8u); ++i)
+      stack += fmt::format(" {:.3f}", BeF(base + state + 4 * i));
+    REXLOG_INFO("PGR4 audio script {:08X}/{:08X} pc {}: op {:04X} {:08X} -> pc {} sp {} [{} ] flags "
+                "{}{}{} run {}",
+                script, instance, pc, GuestLoad32(code + 4 * pc), GuestLoad32(code + 4 * pc + 4),
+                GuestLoad32(state + 256), sp, stack, base[state + 265], base[state + 266],
+                base[state + 267], base[state + 264]);
+  }
+}
+
+// pgr4_audio_xaudio_probe (15/11/2026, the kudos tick): the title's XAudio source voice step,
+// sub_8291AD10(voice): its XMA context at +0xB8 (sub_829146D8, sub_82915028), flags at +0xAC (1
+// playing?, 2 start, 4 ramp, 0x10), outputs +0x38, volume +0x70, ramp count +0xAE, state +0x124.
+// Each call within 40 ms of a kudos UI sound logged before and after, with its return.
+REXCVAR_DEFINE_BOOL(pgr4_audio_xaudio_probe, false, "PGR4",
+                    "Development: the XAudio voices stepped after a kudos sound, in the log");
+REX_EXTERN(__imp__sub_8291AD10);
+REX_HOOK_RAW(sub_8291AD10) {
+  bool trace = false;
+  const uint32_t voice = ctx.r3.u32;
+  std::string before;
+  if (REXCVAR_GET(pgr4_audio_xaudio_probe)) {
+    const int64_t since =
+        std::chrono::steady_clock::now().time_since_epoch().count() - g_ui_sound_at.load();
+    static std::atomic<int> lines{0};
+    if (since >= 0 && since < 40'000'000 && lines.load() < 6000) {
+      ++lines;
+      trace = true;
+      before = fmt::format("+{}ms ctx {:08X} flags {:02X} outs {} vol {:.3f} ramp {} state {}",
+                           since / 1000000, GuestLoad32(voice + 0xB8), base[voice + 0xAC],
+                           base[voice + 0x38], BeF(base + voice + 0x70),
+                           uint16_t(base[voice + 0xAE] << 8 | base[voice + 0xAF]),
+                           base[voice + 0x124]);
+    }
+  }
+  __imp__sub_8291AD10(ctx, base);
+  if (trace)
+    REXLOG_INFO("PGR4 audio xaudio {:08X}: {} -> ret {} flags {:02X} vol {:.3f} state {}", voice,
+                before, int32_t(ctx.r3.u32), base[voice + 0xAC], BeF(base + voice + 0x70),
+                base[voice + 0x124]);
+}
+
+// pgr4_audio_xaudio_probe, continued: the title's XMA helpers (r3 the context) and the XAudio
+// voice methods (vtable 0x82246458, r3 the voice, its context at +0xB8), each call within 40 ms
+// of a kudos UI sound logged with its caller (lr) and return.
+namespace {
+void NoteXAudioCall(const char* name, uint32_t fn, PPCContext& ctx, uint8_t* base,
+                    void (*call)(PPCContext&, uint8_t*)) {
+  bool trace = false;
+  int64_t since = 0;
+  const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, lr = uint32_t(ctx.lr);
+  if ((REXCVAR_GET(pgr4_audio_voice_probe) || REXCVAR_GET(pgr4_audio_tick_boost) > 0) &&
+      fn == 0x82914C58 && lr == 0x8280634C &&
+      g_ui_sound_index.load() == 5) {
+    // A voice started (sub_82806180) within 15 ms of HUD_Kudos_Up: the tick's.
+    const int64_t s =
+        std::chrono::steady_clock::now().time_since_epoch().count() - g_ui_sound_at.load();
+    if (s >= 0 && s < 15'000'000 && g_tick_xma.exchange(r3) != r3)
+      REXLOG_INFO("PGR4 audio tick voice: XMA object {:08X}", r3);
+  }
+  if (REXCVAR_GET(pgr4_audio_xaudio_probe)) {
+    since = std::chrono::steady_clock::now().time_since_epoch().count() - g_ui_sound_at.load();
+    static std::atomic<int> lines{0};
+    trace = since >= 0 && since < 40'000'000 && lines.fetch_add(1) < 8000;
+  }
+  call(ctx, base);
+  if (trace) {
+    const bool voice = fn >= 0x82916000;
+    REXLOG_INFO("PGR4 audio xcall +{:.1f}ms {} {:08X}({:08X}, {:08X}){} from {:08X} -> {:08X}",
+                since / 1e6, name, fn, r3, r4,
+                voice ? fmt::format(" ctx {:08X} state {} flags {:02X}", GuestLoad32(r3 + 0xB8),
+                                    base[r3 + 0x124], base[r3 + 0xAC])
+                      : std::string(),
+                lr, ctx.r3.u32);
+  }
+}
+}  // namespace
+#define PGR4_XAUDIO_PROBE(addr, name)                                   \
+  REX_EXTERN(__imp__sub_##addr);                                        \
+  REX_HOOK_RAW(sub_##addr) {                                            \
+    NoteXAudioCall(name, 0x##addr, ctx, base, &__imp__sub_##addr);      \
+  }
+PGR4_XAUDIO_PROBE(82915170, "xma kick?")
+PGR4_XAUDIO_PROBE(829150A8, "xma 50A8")
+PGR4_XAUDIO_PROBE(82915028, "xma 5028")
+PGR4_XAUDIO_PROBE(829146D8, "xma 46D8")
+PGR4_XAUDIO_PROBE(82914C58, "xma 4C58")
+PGR4_XAUDIO_PROBE(82914E78, "xma 4E78")
+PGR4_XAUDIO_PROBE(829152C0, "xma 52C0")
+PGR4_XAUDIO_PROBE(829197E0, "voice stop")
+PGR4_XAUDIO_PROBE(829198E0, "voice state")
+PGR4_XAUDIO_PROBE(82919A30, "voice 9A30")
+PGR4_XAUDIO_PROBE(82919B60, "voice 9B60")
+PGR4_XAUDIO_PROBE(82919C78, "voice 9C78")
+PGR4_XAUDIO_PROBE(8291A560, "voice A560")
+PGR4_XAUDIO_PROBE(8291A7E8, "voice A7E8")
+PGR4_XAUDIO_PROBE(8291A9A0, "voice A9A0")
+PGR4_XAUDIO_PROBE(8291ABA0, "voice ABA0")
+PGR4_XAUDIO_PROBE(8291B790, "voice B790")
+PGR4_XAUDIO_PROBE(829195F0, "voice 95F0")
+#undef PGR4_XAUDIO_PROBE
+
+// pgr4_audio_ui_probe (15/11/2026, a player's kudos without sound): the UI sound object's events
+// (GAME:\game\audio\UI.dat, registered by name in sub_826A0870 through sub_826A0770, the handle
+// at object + (index + 0x111) * 4), played by sub_826A03A8(object, index) when the object is on
+// (+0x14), loaded (+0x440) and the event's handle is not 0.
+REXCVAR_DEFINE_BOOL(pgr4_audio_ui_probe, false, "PGR4",
+                    "Development: the UI sound events the game plays (kudos, countdown), in the log");
+// Local change (15/11/2026, Tazz): the kudos counter's tick (HUD_Kudos_Up, index 5) at the
+// console's 30 FPS pace. The HUD's counter steps once per so many game frames, and the game runs
+// at the real frame rate (up to the screen's: 165 Hz and more), so it asked for its tick
+// rate / 30 times too often. Each request adds 30 x the frame's duration; a tick plays when that
+// reaches 1: every request at 30 FPS, one in two at 60, about one in 5.5 at 165.
+REXCVAR_DEFINE_BOOL(pgr4_kudos_tick_30fps_pace, true, "PGR4",
+                    "The kudos counter's tick played at the console's 30 FPS pace at any frame rate");
+REX_EXTERN(__imp__sub_826A03A8);
+REX_HOOK_RAW(sub_826A03A8) {
+  if (ctx.r4.u32 == 5 && REXCVAR_GET(pgr4_kudos_tick_30fps_pace)) {
+    static double credit = 1.0;
+    credit = std::min(credit + std::clamp(double(Pgr4FrameSeconds()) * 30.0, 0.0, 1.0), 2.0);
+    if (credit < 1.0) return;
+    credit -= 1.0;
+  }
+  if (REXCVAR_GET(pgr4_audio_ui_probe)) {
+    static const char* const kNames[] = {
+        "UI_Move", "UI_Confirm", "UI_Back", "HUD_Countdown", "HUD_Go", "HUD_Kudos_Up",
+        "HUD_Kudos_Bank", "HUD_Kudos_Lose", "KudosCircleComplete", "KudosCircleComplete5",
+        "KudosWordsSwoosh", "KudosStarSprayStart", "KudosStarSprayStop", "TimeSheetPopUp",
+        "TwoDCrowd", "KudosStarSpray", "KudosAwardText", "ConeHitPositive", "CheckPointPassed",
+        "ConeHitNegative", "EliminationWarning", "Eliminated", "GateOff", "FastestLap",
+        "KudosChallengeTargetAchieved", "SpeedChallengePassCamera", "TimeKudosTimerStart",
+        "TimeKudosTimerStop", "TestTrackTopSpeed", "TestTrackFigure8Drift", "NetSurvivorBeenHit",
+        "NetSurvivorHitting", "CoOpKudosMode", "CoOpKudosCarsLocked", "MenuMovement",
+        "CarPurchasedOrUnlocked", "AwardsGiven", "MedalsAchieved", "TrophiesAchieved",
+        "UIPauseActionIn", "UIResumeActionIn", "PostRaceWinStart", "PostRaceWinStop",
+        "PostRaceLoseStart", "PostRaceLoseStop", "LoadingScreenStart", "LoadingScreenStop",
+        "EnteringUISection", "LeavingUISection", "UIPhotoClickActionIn",
+        "UIMissedConeGateActionIn", "RaceEnd", "EnableMusic", "DisableMusic", "CalanderRedOut",
+        "LoadingScreenPanelOut", "LoadingScreenPanelIn", "TodaysEventCircle", "CongratsTrophy",
+        "FailedMajor", "UI_Move2", "CongratsTrophyExit", "FailedMajorExit"};
+    const uint32_t object = ctx.r3.u32, index = ctx.r4.u32;
+    if (index == 5 || index == 6) {
+      g_ui_sound_index = index;
+      g_ui_sound_at = std::chrono::steady_clock::now().time_since_epoch().count();
+    }
+    const uint8_t on = *rex::system::kernel_memory()->TranslateVirtual<const uint8_t*>(object + 0x14);
+    REXLOG_INFO("PGR4 audio ui (frame {}): {} ({}) on {} loaded {:08X} handle {:08X}", g_frame_no,
+                index < std::size(kNames) ? kNames[index] : "?", index, on,
+                GuestLoad32(object + 0x440), GuestLoad32(object + (index + 0x111) * 4));
+  }
+  __imp__sub_826A03A8(ctx, base);
 }
 
 // pgr4_audio_queue_probe: the sound system's message queue (sub_82807E30(queue, type, data,

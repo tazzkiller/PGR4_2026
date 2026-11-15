@@ -419,6 +419,7 @@ class TextureCache {
     uint32_t upload_number = 0;  // the texture's Upload count (the slow-upload log)
     uint32_t base_bytes = 0, mips_bytes = 0;
     TextureConversion conversion = TextureConversion::kCopy;
+    const HostFormat* host = nullptr;  // the texture's (a decompressed one decodes the blocks)
     UploadCopies copies;
     // A deferred upload: the copies are recorded after the untile, on the untiling thread's
     // upload list for the frame completing at frame_fence, with the texture going from `state`

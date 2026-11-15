@@ -64,6 +64,12 @@ enum class TextureConversion : uint8_t {
   kR5G5B6ToB5G6R5WithRBGASwizzle,  // k_6_5_5: host swizzle R,B,G,G restores the order
   kDepthUnorm24ToFloat32,          // k_24_8: R32_FLOAT = unorm24(d >> 8)
   kDepthFloat24ToFloat32,          // k_24_8_FLOAT: R32_FLOAT = float20e4(d >> 8)
+  // Local change (pgr4 project): BCn decoded to texels on the CPU (GetDecompressedHostFormat):
+  // DXT1/DXT2_3/DXT4_5 to R8G8B8A8, DXN to R8G8.
+  kDecompressBC1,
+  kDecompressBC2,
+  kDecompressBC3,
+  kDecompressBC5,
 };
 
 struct HostFormat {
@@ -77,6 +83,13 @@ struct HostFormat {
 
 // nullptr for formats PGR4 does not use yet (or that need a decompressing load).
 const HostFormat* GetHostFormat(rex::graphics::xenos::TextureFormat base_format);
+
+// Local change (pgr4 project): the host format of a BCn texture decoded on the CPU, for a card
+// without D3D12 UnalignedBlockTexturesSupported (Windows 10) when the texture's size is not a
+// multiple of 4 (a 128x1 DXT1): R8G8B8A8 (R8G8 for DXN), same channels and host swizzle.
+// nullptr for formats that are not BCn.
+const HostFormat* GetDecompressedHostFormat(rex::graphics::xenos::TextureFormat base_format);
+bool IsDecompressed(const HostFormat& host);
 
 // Bit f is set when fetch constant format f (before GetBaseFormat) has a host format whose
 // signed view is its unsigned view (the float and depth formats): signed components of such a
@@ -101,9 +114,11 @@ struct HostSubresource {
 // Host footprints of every subresource and the total buffer size. With d3d12_placement the
 // row pitch is aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and offsets to
 // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT (an upload buffer); without, rows are tight
-// (dump comparison). Returns 0 for unsupported formats.
+// (dump comparison). Returns 0 for unsupported formats. `host`: the texture's host format
+// (GetHostFormat(key.format) when null).
 uint64_t GetHostFootprints(const TextureKey& key, bool d3d12_placement,
-                           std::vector<HostSubresource>* subresources);
+                           std::vector<HostSubresource>* subresources,
+                           const HostFormat* host = nullptr);
 
 // Guest memory of one texture: the bytes at the physical base and mip addresses. Sizes bound
 // the reads (blocks past them read as zero and are counted).
@@ -132,12 +147,14 @@ struct UntileStats {
 // Endian-swaps (per 32-bit word, as the Xenos texture fetch does) and untiles every
 // subresource into dst (sized by GetHostFootprints with the same subresources), applying the
 // host format conversion. `scratch` is reused between calls to hold the swapped guest data.
-// Returns false for unsupported formats. `layout`: GetGuestLayout(key).
+// Returns false for unsupported formats. `layout`: GetGuestLayout(key). `host`: as for
+// GetHostFootprints (a decompressed one decodes the blocks into texels).
 bool UntileTexture(const TextureKey& key,
                    const rex::graphics::texture_util::TextureGuestLayout& layout,
                    const GuestTextureMemory& memory,
                    const std::vector<HostSubresource>& subresources, uint8_t* dst,
-                   std::vector<uint8_t>* scratch, UntileStats* stats = nullptr);
+                   std::vector<uint8_t>* scratch, UntileStats* stats = nullptr,
+                   const HostFormat* host = nullptr);
 bool UntileTexture(const TextureKey& key, const GuestTextureMemory& memory,
                    const std::vector<HostSubresource>& subresources, uint8_t* dst,
                    std::vector<uint8_t>* scratch, UntileStats* stats = nullptr);

@@ -529,22 +529,52 @@ index 471149c..a2dd5cd 100644
  
   protected:
 diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
-index 8426798..0ef1ccd 100644
+index 8426798..6816881 100644
 --- a/include/rex/audio/xma/context.h
 +++ b/include/rex/audio/xma/context.h
-@@ -62,10 +62,10 @@ struct XMA_CONTEXT_DATA {
+@@ -62,6 +62,9 @@ struct XMA_CONTEXT_DATA {
    uint32_t input_buffer_1_packet_count : 12;  // XMASetInputBuffer1, number of
                                                // 2KB packets. Max 4095 packets.
                                                // These packets form a block.
--  uint32_t loop_subframe_end : 2;             // +12bit, XMAPlaybackSetLoop
-+  uint32_t loop_subframe_start : 2;           // +12bit, XMAPlaybackSetLoop
-+  uint32_t loop_subframe_end : 3;             // +14bit, XMAPlaybackSetLoop
++  // Local change (15/11/2026): back to the SHAPE / Xenia layout. PGR4 writes the loop end on 2
++  // bits at bit 12 (sub_82914DA0: rlwimi ...,12,18,19); a 3-bit field at bit 14 read 0, every
++  // loop wrap then put out only subframe 0 of its last frame.
+   uint32_t loop_subframe_end : 2;             // +12bit, XMAPlaybackSetLoop
                                                // dwLoopSubframeEnd: last loop frame
                                                // plays subframes 0..end
--  uint32_t unk_dword_1_a : 3;                 // +14bit
-   uint32_t loop_subframe_skip : 3;            // +17bit, XMAPlaybackSetLoop
-                                               // dwLoopSubframeSkip: subframes to
-                                               // discard at loop start; 4 = whole
+diff --git a/include/rex/audio/xma/decoder.h b/include/rex/audio/xma/decoder.h
+index df00f06..97a8b3f 100644
+--- a/include/rex/audio/xma/decoder.h
++++ b/include/rex/audio/xma/decoder.h
+@@ -19,6 +19,7 @@
+ #include <rex/audio/xma/register_file.h>
+ #include <rex/bit.h>
+ #include <rex/kernel.h>
++#include <rex/ppc/context.h>
+ #include <rex/system/xthread.h>
+ 
+ namespace rex::runtime {
+@@ -27,6 +28,12 @@ class FunctionDispatcher;
+ 
+ namespace rex::audio {
+ 
++// Local change (pgr4 project, 15/11/2026): the guest's link register at its last XMA register
++// write on this thread (the caller of the kick, lock or clear), for apu_xma_level_probe.
++inline thread_local uint32_t xma_mmio_lr = 0;
++// xma_context.cpp: a context followed step by step by apu_xma_level_probe.
++bool XmaProbeWatched(uint32_t id);
++
+ struct XMA_CONTEXT_DATA;
+ 
+ class XmaDecoder {
+@@ -64,6 +71,7 @@ class XmaDecoder {
+   }
+   static void MMIOWriteRegisterThunk(void* ppc_context, XmaDecoder* as, uint32_t addr,
+                                      uint32_t value) {
++    xma_mmio_lr = ppc_context ? uint32_t(static_cast<const PPCContext*>(ppc_context)->lr) : 0;
+     as->WriteRegister(addr, value);
+   }
+ 
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
 index da8e432..ac55b09 100644
 --- a/include/rex/graphics/command_processor.h
@@ -3484,7 +3514,7 @@ index 68da0cf..e8591af 100644
  
  }  // namespace rex::audio::sdl
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..54ff6a0 100644
+index 11b83be..fa901eb 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -10,9 +10,16 @@
@@ -3504,7 +3534,7 @@ index 11b83be..54ff6a0 100644
  #include <rex/audio/xma/decoder.h>
  #include <rex/audio/xma/helpers.h>
  #include <rex/dbg.h>
-@@ -36,10 +43,94 @@ extern "C" {
+@@ -36,10 +43,112 @@ extern "C" {
  // Credits for most of this code goes to:
  // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
  
@@ -3523,6 +3553,13 @@ index 11b83be..54ff6a0 100644
 +// apu_xma_canary_30oct: Xenia Canary 6bef1fb (drain a partly written frame) and 7015473 (a
 +// continuation packet's skip count), ported on 30/10/2026 as a precaution. False gives the
 +// decoder as it was before them: off by default, the rev limiter looped with them (31/10/2026).
++// apu_xma_trim_lead (local change, pgr4 project, 15/11/2026): Consume. Off: it brought a
++// two-frame wave under the 1024 samples the title's XMA voice needs to play it (audit 15/11).
++REXCVAR_DEFINE_BOOL(apu_xma_trim_lead, false, "Audio",
++                    "A wave's leading blocks of silence (the decoder's start delay) dropped");
++// apu_xma_flush_tail (local change, pgr4 project, 15/11/2026): Work, flush_tail.
++REXCVAR_DEFINE_BOOL(apu_xma_flush_tail, true, "Audio",
++                    "A wave's last decoded frame put out at its end (a one-frame wave was silent)");
 +REXCVAR_DEFINE_BOOL(apu_xma_canary_30oct, false, "Audio",
 +                    "Xenia Canary's XMA fixes 6bef1fb and 7015473 (ported 30/10/2026)");
 +
@@ -3548,6 +3585,10 @@ index 11b83be..54ff6a0 100644
 +enum class LevelEvent { kNone, kLoop, kReinit, kFailed };
 +// Contexts reset since their last decode: the next decode logs how the stream starts.
 +std::set<uint32_t> fresh_contexts;
++// apu_xma_trim_lead: per context, the leading silent blocks dropped since its reset (4: done).
++std::array<uint8_t, 512> lead_blocks_{};
++// One-packet waves followed Work by Work (apu_xma_level_probe, local change 15/11/2026).
++std::set<uint32_t> watched_contexts;
 +std::mutex level_mutex;
 +std::map<uint32_t, ContextLevel> levels;
 +std::chrono::steady_clock::time_point level_logged;
@@ -3596,10 +3637,38 @@ index 11b83be..54ff6a0 100644
 +
 +}  // namespace
 +
++// apu_xma_level_probe: whether a context is followed step by step (a short wave without loop).
++bool XmaProbeWatched(uint32_t id) {
++  if (!REXCVAR_GET(apu_xma_level_probe)) return false;
++  std::lock_guard<std::mutex> lock(level_mutex);
++  return watched_contexts.count(id) != 0;
++}
++
  const uint32_t XmaContext::kBitsPerPacketHeader;
  const uint32_t XmaContext::kOutputMaxSizeBytes;
  
-@@ -109,6 +200,9 @@ bool XmaContext::Work() {
+@@ -103,12 +212,30 @@ bool XmaContext::Work() {
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
+   const XMA_CONTEXT_DATA initial_data = data;
++  bool watched = false;
++  if (REXCVAR_GET(apu_xma_level_probe)) {
++    std::lock_guard<std::mutex> lock(level_mutex);
++    watched = watched_contexts.count(id()) != 0;
++  }
++  if (watched) {
++    REXAPU_INFO("XMA work {} in (kick from {:08X}): output read {} write {} of {} (padding {}, "
++                "sdc {}) valid {}, input valid {}/{}, free blocks {}, frame left {}",
++                id(), xma_mmio_lr, uint32_t(data.output_buffer_read_offset),
++                uint32_t(data.output_buffer_write_offset), uint32_t(data.output_buffer_block_count),
++                uint32_t(data.output_buffer_padding), uint32_t(data.subframe_decode_count),
++                uint32_t(data.output_buffer_valid), uint32_t(data.input_buffer_0_valid),
++                uint32_t(data.input_buffer_1_valid), remaining_subframe_blocks_in_output_buffer_,
++                uint32_t(current_frame_remaining_subframes_));
++  }
+ 
+   if (!data.output_buffer_valid) {
+     return true;
    }
  
    memory::RingBuffer output_rb = PrepareOutputRingBuffer(&data);
@@ -3609,15 +3678,24 @@ index 11b83be..54ff6a0 100644
  
    // Consume-only context: no input, just drain remaining subframes.
    if (data.IsConsumeOnlyContext()) {
-@@ -124,19 +218,28 @@ bool XmaContext::Work() {
+@@ -117,6 +244,7 @@ bool XmaContext::Work() {
+     }
+     Consume(&output_rb, &data);
+     data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
++    if (remaining_subframe_blocks_in_output_buffer_ <= 0) data.output_buffer_valid = 0;  // full
+     StoreContextMerged(data, initial_data, context_ptr);
+     return true;
+   }
+@@ -124,28 +252,90 @@ bool XmaContext::Work() {
    // Minimum free blocks needed before attempting a decode.
    // Use subframe_decode_count (clamped to 1) instead of full frame size.
    const uint32_t effective_sdc = std::max(static_cast<uint32_t>(1), data.subframe_decode_count);
 +  const bool fill = REXCVAR_GET(apu_xma_fill_output);
-+  const int32_t reserve = std::max(1, static_cast<int32_t>(data.output_buffer_padding));
++  // Local change (15/11/2026): with fill, a single free block is enough; the ring is filled to
++  // its last block and then reported full (output_buffer_valid 0, below), as the hardware does.
    const int32_t minimum_subframe_decode_count =
 -      static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
-+      fill ? reserve + 1 : static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
++      fill ? 1 : static_cast<int32_t>(effective_sdc) + data.output_buffer_padding;
  
    if (minimum_subframe_decode_count > remaining_subframe_blocks_in_output_buffer_) {
      StoreContextMerged(data, initial_data, context_ptr);
@@ -3625,13 +3703,51 @@ index 11b83be..54ff6a0 100644
    }
  
 -  while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
++  // Local change (pgr4 project, 15/11/2026): the realignment (Decode, carry_frame_) puts out a
++  // frame only once the next one is decoded, so a wave's last frame never came out: a one-frame
++  // wave (PGR4's kudos counter tick, HUD_Kudos_Up in UIbank.baf, a single packet) played nothing
++  // at all. At the end of a wave that does not loop (no input buffer left), its carried tail goes
++  // out, the start padding's place filled with silence.
++  const auto flush_tail = [&] {
++    if (!REXCVAR_GET(apu_xma_flush_tail) || !carry_valid_ ||
++        current_frame_remaining_subframes_ != 0 || data.IsAnyInputBufferValid() ||
++        data.loop_count != 0) {
++      return false;
++    }
++    const size_t pad_bytes = kDecoderStartPadding * kBytesPerSample << data.is_stereo;
++    const size_t carry_bytes = (kBytesPerFrameChannel << data.is_stereo) - pad_bytes;
++    std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
++    std::memset(raw_frame_.data() + carry_bytes, 0, pad_bytes);
++    if (REXCVAR_GET(apu_xma_level_probe)) {
++      double sum = 0, peak = 0;
++      for (size_t i = 0; i + 1 < carry_bytes; i += 2) {
++        const double s = int16_t(uint16_t(raw_frame_[i]) << 8 | raw_frame_[i + 1]) / 32768.0;
++        sum += s * s;
++        peak = std::max(peak, std::abs(s));
++      }
++      const double rms = std::sqrt(sum / double(std::max<size_t>(carry_bytes / 2, 1)));
++      REXAPU_INFO("XMA tail {}: {} samples, rms {:.0f} dB, peak {:.0f} dB", id(), carry_bytes / 2,
++                  rms > 0 ? 20 * std::log10(rms) : -99.0, peak > 0 ? 20 * std::log10(peak) : -99.0);
++    }
++    current_frame_remaining_subframes_ = 4 << data.is_stereo;
++    loop_frame_output_limit_ = pending_output_limit_;
++    current_frame_remaining_subframes_ -=
++        std::min(pending_start_skip_, current_frame_remaining_subframes_);
++    carry_valid_ = false;
++    pending_output_limit_ = 0;
++    pending_start_skip_ = 0;
++    return true;
++  };
++
 +  for (int guard = 0;
 +       remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count && guard < 256;
 +       ++guard) {
      Decode(&data);
      Consume(&output_rb, &data);
- 
+-
 -    if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
++    if (flush_tail()) Consume(&output_rb, &data);
++
 +    // Xenia Canary 6bef1fb (local change, pgr4 project): don't abandon a partially consumed
 +    // frame. Consume() may leave part of the frame for the next pass, but Work() has cleared
 +    // is_enabled_ and only XMAEnableContext sets it again: a game polling for the remainder
@@ -3641,7 +3757,49 @@ index 11b83be..54ff6a0 100644
        break;
      }
    }
-@@ -192,18 +295,20 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
+ 
+   data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
+ 
+-  if (output_rb.empty()) {
++  // Local change (15/11/2026): output_buffer_valid 0 means the ring is FULL. The title's
++  // XMAGetOutputBufferReadable (sub_829148E8) then counts the whole ring as readable, and its read
++  // (sub_82914978) sets the bit again. It was cleared here when the ring was EMPTY: at the end
++  // of a wave, or a stream short of data, the title read a whole ring of stale samples.
++  if (remaining_subframe_blocks_in_output_buffer_ <= 0) {
+     data.output_buffer_valid = 0;
+   }
++  if (REXCVAR_GET(apu_xma_level_probe) && !watched) {
++    // The first Work of a one-packet wave: its start (Decode) put it in the set.
++    std::lock_guard<std::mutex> lock(level_mutex);
++    watched = watched_contexts.count(id()) != 0;
++  }
++  if (watched) {
++    REXAPU_INFO("XMA work {} out: output write {} valid {}, input valid {}/{}, frame left {}",
++                id(), uint32_t(data.output_buffer_write_offset), uint32_t(data.output_buffer_valid),
++                uint32_t(data.input_buffer_0_valid), uint32_t(data.input_buffer_1_valid),
++                uint32_t(current_frame_remaining_subframes_));
++  }
+ 
+   StoreContextMerged(data, initial_data, context_ptr);
+   return true;
+@@ -173,6 +363,16 @@ void XmaContext::Clear() {
+ 
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
++  // Local change (pgr4 project, 15/11/2026): how the previous wave ended (a one-frame wave's
++  // output read by the game or not).
++  if (REXCVAR_GET(apu_xma_level_probe)) {
++    REXAPU_INFO("XMA clear {}: output read {} write {} of {} valid {}, input valid {}/{}, "
++                "remaining subframes {}",
++                id(), uint32_t(data.output_buffer_read_offset),
++                uint32_t(data.output_buffer_write_offset), uint32_t(data.output_buffer_block_count),
++                uint32_t(data.output_buffer_valid), uint32_t(data.input_buffer_0_valid),
++                uint32_t(data.input_buffer_1_valid), uint32_t(current_frame_remaining_subframes_));
++  }
+   ClearLocked(&data);
+   data.Store(context_ptr);
+ }
+@@ -192,18 +392,22 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
  void XmaContext::ResetDecoderState() {
    // A freed or re-initialized context is a new logical stream, so the previous
    // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
@@ -3662,14 +3820,16 @@ index 11b83be..54ff6a0 100644
    decoded_frame_.fill(0);
    carry_frame_.fill(0);
    carry_valid_ = false;
++  lead_blocks_[id() % lead_blocks_.size()] = 0;
 +  if (REXCVAR_GET(apu_xma_level_probe)) {
 +    std::lock_guard<std::mutex> lock(level_mutex);
 +    fresh_contexts.insert(id());
++    watched_contexts.erase(id());
 +  }
    pending_output_limit_ = 0;
    pending_start_skip_ = 0;
    current_frame_remaining_subframes_ = 0;
-@@ -250,6 +355,9 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+@@ -250,6 +454,9 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
  
    data->input_buffer_read_offset = loop_start;
    loop_start_skip_pending_ = true;
@@ -3679,7 +3839,7 @@ index 11b83be..54ff6a0 100644
  
    if (data->loop_count < 255) {
      data->loop_count--;
-@@ -316,7 +424,19 @@ uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_pack
+@@ -316,7 +523,19 @@ uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_pack
      if (packet_frame_offset <= kMaxFrameSizeinBits) {
        return (next_packet_index * kBitsPerPacket) + packet_frame_offset;
      }
@@ -3700,7 +3860,7 @@ index 11b83be..54ff6a0 100644
    }
  
    return kBitsPerPacketHeader;
-@@ -359,6 +479,17 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
+@@ -359,6 +578,17 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
  
    while (true) {
      if (stream.BitsRemaining() < kBitsPerFrameHeader) {
@@ -3718,7 +3878,7 @@ index 11b83be..54ff6a0 100644
        break;
      }
  
-@@ -432,7 +563,9 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -432,7 +662,9 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
                                      << data->is_stereo;
      const uint8_t consumed = total_subframes - current_frame_remaining_subframes_;
      if (consumed >= loop_frame_output_limit_) {
@@ -3729,7 +3889,7 @@ index 11b83be..54ff6a0 100644
        current_frame_remaining_subframes_ = 0;
        loop_frame_output_limit_ = 0;
        return;
-@@ -440,8 +573,19 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -440,8 +672,21 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
    }
  
    const uint8_t effective_sdc = std::max(static_cast<uint32_t>(1), data->subframe_decode_count);
@@ -3737,9 +3897,11 @@ index 11b83be..54ff6a0 100644
    int8_t subframes_to_write = std::min(static_cast<int8_t>(current_frame_remaining_subframes_),
                                         static_cast<int8_t>(effective_sdc));
 +  if (fill) {
-+    // As much of the frame as the buffer takes, its padding (at least a block) kept free.
-+    const int32_t room = remaining_subframe_blocks_in_output_buffer_ -
-+                         std::max(1, static_cast<int32_t>(data->output_buffer_padding));
++    // As much of the frame as the buffer takes, to its last block (Work reports the ring full
++    // then). Local change (15/11/2026): a block was kept free, so the title's XMA voice
++    // (sub_82805820), which plays only whole halves of 1024 samples, never got the 1024 samples
++    // of a two-frame wave (the kudos counter's tick, the exhausts' pops) and dropped it.
++    const int32_t room = remaining_subframe_blocks_in_output_buffer_;
 +    subframes_to_write = static_cast<int8_t>(
 +        std::clamp<int32_t>(room, 0, current_frame_remaining_subframes_));
 +    if (subframes_to_write == 0) {
@@ -3749,13 +3911,61 @@ index 11b83be..54ff6a0 100644
  
    if (loop_frame_output_limit_ > 0) {
      const uint8_t total_subframes = (kBytesPerFrameChannel / kOutputBytesPerBlock)
-@@ -459,8 +603,12 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -453,14 +698,59 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+     }
+   }
  
+-  const int8_t raw_frame_read_offset =
++  int8_t raw_frame_read_offset =
+       ((kBytesPerFrameChannel / kOutputBytesPerBlock) << data->is_stereo) -
+       current_frame_remaining_subframes_;
+ 
++  // Local change (pgr4 project, 15/11/2026): a wave's leading blocks of pure silence (the
++  // decoder's start delay: 256 samples on PGR4's waves) dropped, at most 4. The game plays a
++  // short one-shot for its length only (the kudos counter's tick: one unit, about 10 ms): with
++  // them it played the silence and missed the tick.
++  if (REXCVAR_GET(apu_xma_trim_lead) && lead_blocks_[id()] < 4) {
++    const size_t block_bytes = kOutputBytesPerBlock;
++    while (subframes_to_write > 0 && lead_blocks_[id()] < 4) {
++      const uint8_t* p = raw_frame_.data() + kOutputBytesPerBlock * raw_frame_read_offset;
++      if (std::any_of(p, p + block_bytes, [](uint8_t b) { return b != 0; })) {
++        lead_blocks_[id()] = 4;
++        break;
++      }
++      ++lead_blocks_[id()];
++      ++raw_frame_read_offset;
++      --subframes_to_write;
++      --current_frame_remaining_subframes_;
++    }
++    if (subframes_to_write == 0) return;
++  }
++
    output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
                     subframes_to_write * kOutputBytesPerBlock);
 +  if (REXCVAR_GET(apu_xma_level_probe)) {
 +    NoteLevel(id(), raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
 +              subframes_to_write * kOutputBytesPerBlock, LevelEvent::kNone);
++    bool watched;
++    {
++      std::lock_guard<std::mutex> lock(level_mutex);
++      watched = watched_contexts.count(id()) != 0;
++    }
++    if (watched) {
++      // Each 128-sample block written for a short wave, its RMS (dBFS).
++      std::string blocks;
++      for (int8_t b = 0; b < subframes_to_write; ++b) {
++        const uint8_t* p = raw_frame_.data() + kOutputBytesPerBlock * (raw_frame_read_offset + b);
++        double sum = 0;
++        for (uint32_t i = 0; i + 1 < kOutputBytesPerBlock; i += 2) {
++          const double s = int16_t(uint16_t(p[i]) << 8 | p[i + 1]) / 32768.0;
++          sum += s * s;
++        }
++        const double rms = std::sqrt(sum / (kOutputBytesPerBlock / 2));
++        blocks += fmt::format(" {:.0f}", rms > 0 ? 20 * std::log10(rms) : -99.0);
++      }
++      REXAPU_INFO("XMA out {}: {} blocks at {}, dB:{}", id(), int(subframes_to_write),
++                  output_rb->write_offset() / kOutputBytesPerBlock, blocks);
++    }
 +  }
  
 -  const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
@@ -3763,7 +3973,7 @@ index 11b83be..54ff6a0 100644
                                ? data->output_buffer_padding
                                : 0;
  
-@@ -545,6 +693,26 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -545,6 +835,33 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
  
    uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
  
@@ -3775,22 +3985,29 @@ index 11b83be..54ff6a0 100644
 +    }
 +    if (fresh) {
 +      REXAPU_INFO(
-+          "XMA start {}: buffer {} offset {} (packet {}, bit {}), packets {}/{}, loop {} "
-+          "{}..{} subframes skip {} end {}, rate {}, stereo {}",
-+          id(), uint32_t(data->current_buffer), uint32_t(data->input_buffer_read_offset),
++          "XMA start {} ({:08X}, kick from {:08X}): buffer {} offset {} (packet {}, bit {}), "
++          "packets {}/{}, loop {} {}..{} subframes skip {} end {}, rate {}, stereo {}",
++          id(), guest_ptr(), xma_mmio_lr, uint32_t(data->current_buffer), uint32_t(data->input_buffer_read_offset),
 +          uint32_t(data->input_buffer_read_offset) / kBitsPerPacket,
 +          uint32_t(data->input_buffer_read_offset) % kBitsPerPacket,
 +          uint32_t(data->input_buffer_0_packet_count), uint32_t(data->input_buffer_1_packet_count),
 +          uint32_t(data->loop_count), uint32_t(data->loop_start), uint32_t(data->loop_end),
 +          uint32_t(data->loop_subframe_skip), uint32_t(data->loop_subframe_end),
 +          uint32_t(data->sample_rate), uint32_t(data->is_stereo));
++      // A short wave without loop (the kudos tick, one packet; the countdown, the kudos bank):
++      // each Work on it logged until its context is reset.
++      if (data->loop_count == 0 &&
++          data->input_buffer_0_packet_count + data->input_buffer_1_packet_count <= 16) {
++        std::lock_guard<std::mutex> lock(level_mutex);
++        watched_contexts.insert(id());
++      }
 +    }
 +  }
 +
    input_buffer_.fill(0);
  
    // Loop-end frame: decode it here (output limited to loop_subframe_end),
-@@ -617,6 +785,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -617,6 +934,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
  
      uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
      if (frame_size == xma::kMaxFrameLength) {
@@ -3799,7 +4016,7 @@ index 11b83be..54ff6a0 100644
        data->error_status = 4;
        return;
      }
-@@ -640,6 +810,12 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -640,6 +959,12 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
        const uint8_t* next_packet =
            GetNextPacket(data, next_packet_index, current_input_packet_count);
        if (!next_packet) {
@@ -3812,7 +4029,7 @@ index 11b83be..54ff6a0 100644
          data->error_status = 4;
          return;
        }
-@@ -664,6 +840,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -664,6 +989,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      // Reopening the codec restarts its output; the carried tail belongs to the
      // old stream.
      carry_valid_ = false;
@@ -3822,7 +4039,7 @@ index 11b83be..54ff6a0 100644
    }
    PreparePacket(packet_info.current_frame_size_, padding_start);
    const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
-@@ -707,6 +886,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -707,6 +1035,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      // A dropped frame breaks the carry's adjacency; re-prime rather than splice
      // two blocks that are not neighbors.
      carry_valid_ = false;
@@ -3833,10 +4050,19 @@ index 11b83be..54ff6a0 100644
  
    // Compute where to go next.
 diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
-index a0a178d..4366dfc 100644
+index a0a178d..4e66d5d 100644
 --- a/src/audio/xma_decoder.cpp
 +++ b/src/audio/xma_decoder.cpp
-@@ -304,7 +304,8 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -299,12 +299,16 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+       if (kicked_value & 1) {
+         uint32_t context_id = base_context_id + i;
+         auto& context = contexts_[context_id];
+-        if (context.Work()) {
++        const bool worked = context.Work();
++        if (XmaProbeWatched(context_id))
++          REXAPU_INFO("XMA kick {}: worked {}", context_id, worked);
++        if (worked) {
+           context.SignalWorkDone();
          }
        }
      }
@@ -3846,6 +4072,22 @@ index a0a178d..4366dfc 100644
    } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
      // Context lock command.
      // This requests a lock by flagging the context.
+@@ -314,6 +318,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+       if (value & 1) {
+         uint32_t context_id = base_context_id + i;
+         auto& context = contexts_[context_id];
++        if (XmaProbeWatched(context_id)) REXAPU_INFO("XMA lock {}", context_id);
+         context.Disable();
+         // [XMA fix] Added Block(false) after Disable(). Without this, the game
+         // could call XMADisableContext and start modifying the context struct
+@@ -332,6 +337,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+       if (value & 1) {
+         uint32_t context_id = base_context_id + i;
+         XmaContext& context = contexts_[context_id];
++        if (XmaProbeWatched(context_id)) REXAPU_INFO("XMA clear register {}", context_id);
+         context.Clear();
+       }
+     }
 diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
 index f560429..04f3292 100644
 --- a/src/codegen/builders/system.cpp
