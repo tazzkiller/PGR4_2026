@@ -15,6 +15,7 @@
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/xfile.h>  // XFile::OpenMovies: a video playing
 #include <rex/system/xmemory.h>
 
 #include <algorithm>
@@ -627,7 +628,16 @@ void Presenter::Impl::OnSwap(const SwapCall& swap, bool shown, const SwapCopy* c
       // The image (1280x720 in PGR4's mode) scaled to fit the window, centred, aspect kept.
       const float iw = float(extent.width), ih = float(extent.height);
       const float ww = float(d.width()), wh = float(d.height());
-      const float s = std::min(ww / iw, wh / ih);
+      // Local change (pgr4 project): while the game plays a video (a Bink file open), with a frame
+      // that is not 16:9 (pgr4_render_height other than 720), the video is its central 16:9, the
+      // menus drawing it there (draw.cpp, the interface's viewport): that part is what fits the
+      // window, so a 16:9 screen shows the video whole, edge to edge, the frame's black sides (21:9)
+      // or top and bottom (16:10) cut off, and a screen of the frame's shape the whole frame as
+      // before. The scissor keeps the blit inside the window.
+      const bool movie = rex::system::XFile::OpenMovies() > 0;
+      const float fit_w = movie ? std::min(iw, ih * 16.0f / 9.0f) : iw;
+      const float fit_h = movie ? std::min(ih, iw * 9.0f / 16.0f) : ih;
+      const float s = std::min(ww / fit_w, wh / fit_h);
       const float vw = std::round(iw * s), vh = std::round(ih * s);
       const LONG vx = LONG(std::floor((ww - vw) * 0.5f)), vy = LONG(std::floor((wh - vh) * 0.5f));
       image_rect = {int32_t(vx), int32_t(vy), int32_t(vw), int32_t(vh)};

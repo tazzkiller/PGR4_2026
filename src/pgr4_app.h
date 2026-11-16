@@ -18,6 +18,8 @@ void Pgr4BringWindowToFront();
 bool Pgr4Precompiling();
 // src/pgr4_profile.cpp: false (the launcher opened instead) when pgr4.exe was started on its own.
 bool Pgr4StartedByLauncher();
+// src/pgr4_hooks.cpp: the game's 16:9 made the frame's own aspect (1280 x render height).
+void Pgr4ApplyRenderAspect();
 void Pgr4HideWindow(void* hwnd);
 
 class Pgr4App : public rex::ReXApp {
@@ -55,6 +57,7 @@ class Pgr4App : public rex::ReXApp {
       w->SetCursorVisibility(rex::ui::Window::CursorVisibility::kAutoHidden);
     }
     Pgr4BringWindowToFront();
+    Pgr4ApplyRenderAspect();
     Pgr4DumpImage();
     Pgr4FirstLaunchConfig();
     Pgr4SetupProfile(runtime());

@@ -123,11 +123,24 @@ void Pgr4CameraShakeScaleHook(PPCRegister& f30, PPCRegister& f29, PPCRegister& f
 // below cover the copies the loads cannot: structs the game fills itself and hands to the D3D
 // (viewport, scissor and resolve rects) and the surface creators whose packed sizes the
 // viewport clamp reads back (sub_826C6100).
-REXCVAR_DECLARE(int32_t, pgr4_render_height);  // native/renderer.cpp: the FFX effects size from it
+// pgr4-native fidelityfx.cpp: --pgr4_render_height, 0 resolved from the screen's shape.
+namespace pgr4::native {
+uint32_t FfxSceneHeight();
+}
 REXCVAR_DECLARE(std::string, pgr4_native_capture_dir);  // native/draw.cpp: development logs
 
 void Pgr4RenderHeightHook(PPCRegister& r) {
-  if (r.u32 == 720) r.u64 = uint32_t(REXCVAR_GET(pgr4_render_height));
+  if (r.u32 == 720) r.u64 = pgr4::native::FfxSceneHeight();
+}
+
+// The scene's surface pair creators fn_826C8B18 and sub_822B3FC8 (r4: the height). A frame taller
+// than 720 needs taller surfaces: sub_826C6100 clamps every viewport to the bound target's packed
+// size, which would clamp it back to 720. A shorter frame (21:9) keeps the game's 720 surfaces,
+// which hold it, and so does every other 720-tall surface they make: the videos' target, whose
+// 1280x720 Bink frame is resolved whole into the texture the menus show (at the render height
+// its draw was cut to that many rows, the rest of the picture missing).
+void Pgr4SurfaceHeightHook(PPCRegister& r4) {
+  if (r4.u32 == 720 && pgr4::native::FfxSceneHeight() > 720) r4.u64 = pgr4::native::FfxSceneHeight();
 }
 
 uint32_t GuestLoad32(uint32_t a) {
@@ -144,13 +157,13 @@ void GuestStore32(uint32_t a, uint32_t v) {
 void Pgr4ResolveRectHook(PPCRegister& r5) {
   if (!r5.u32) return;
   if (GuestLoad32(r5.u32 + 8) == 1280 && GuestLoad32(r5.u32 + 12) == 720)
-    GuestStore32(r5.u32 + 12, uint32_t(REXCVAR_GET(pgr4_render_height)));
+    GuestStore32(r5.u32 + 12, pgr4::native::FfxSceneHeight());
 }
 
 void Pgr4ViewportHook(PPCRegister& r4) {
   if (!r4.u32) return;
   if (GuestLoad32(r4.u32 + 8) == 1280 && GuestLoad32(r4.u32 + 12) == 720)
-    GuestStore32(r4.u32 + 12, uint32_t(REXCVAR_GET(pgr4_render_height)));
+    GuestStore32(r4.u32 + 12, pgr4::native::FfxSceneHeight());
 }
 
 // The float viewport setter (sub_826C63F8, the one the scene's views use): r4 points at
@@ -160,35 +173,71 @@ void Pgr4ViewportFHook(PPCRegister& r4) {
   constexpr uint32_t kW = 0x44A00000;  // 1280.0f
   constexpr uint32_t kH = 0x44340000;  // 720.0f
   if (GuestLoad32(r4.u32 + 8) == kW && GuestLoad32(r4.u32 + 12) == kH) {
-    const float h = float(REXCVAR_GET(pgr4_render_height));
+    const float h = float(pgr4::native::FfxSceneHeight());
     GuestStore32(r4.u32 + 12, std::bit_cast<uint32_t>(h));
   }
 }
 
 // The vertex block's c45, the HUD's orthographic projection, uploaded with the block by the
-// state apply (sub_82871A20): the game maps its 640x480 HUD space into the central 960x720 of
-// its 720-tall frame (4:3-safe, the pixel scale 1.5). With the frame pgr4_render_height tall,
-// the y scale and offset still divide by 720 and every c45 draw (the dials, the HUD text, the
-// menus) stretches by height/720. Rewrite the game's own value to the same mapping of the
-// taller frame: the central 960x720 of it, centered, as the 960-wide area already is.
-void Pgr4HudOrthoHook(PPCRegister& r5) {
-  const float h = float(REXCVAR_GET(pgr4_render_height));
-  if (h == 720.0f || !r5.u32) return;   // the 16:10 patch is off
-  const uint32_t c = r5.u32 + 45 * 16;  // c45 of the 256-register block
-  if (std::bit_cast<float>(GuestLoad32(c)) != 3.0f / 1280.0f ||
-      std::bit_cast<float>(GuestLoad32(c + 4)) != -3.0f / 720.0f ||
-      std::bit_cast<float>(GuestLoad32(c + 8)) != -0.75f ||
-      std::bit_cast<float>(GuestLoad32(c + 12)) != 1.0f)
-    return;  // not the game's HUD ortho (another mode's): leave it
-  GuestStore32(c + 4, std::bit_cast<uint32_t>(-3.0f / h));
-  GuestStore32(c + 12, std::bit_cast<uint32_t>(720.0f / h));
+// state apply (sub_82871A20). Left as the game wrote it: the menus' and the HUD's draws also take
+// their c45 by other paths (a draw log of the title screen showed the game's value after this
+// block was rewritten), so the native renderer fits it to the frame in the constants every draw
+// uploads instead (pgr4-native draw.cpp, FitHudOrtho). The manifest's hook stays, doing nothing.
+void Pgr4HudOrthoHook(PPCRegister&) {}
+
+// The display's aspect: the game takes 16:9 (4:3 without its widescreen flag, [0x82A93860 +
+// 180]) from one constant, 0x820010A8, at all 15 of its views' setups (cameras, sub_82323160:
+// pixel aspect = aspect x height / width), and its projection (sub_822C2410 ->
+// sub_826E32F0, XMMatrixPerspectiveFovRH's maths) divides the vertical field of view's scale by
+// width / height x that pixel aspect. With the frame 1280 x render height the 16:9 squeezes the
+// picture by height / 720; the frame's own aspect instead keeps the camera's vertical field of
+// view and widens the horizontal one with the frame (Hor+: 21:9 shows more of the sides, the
+// same height). Written once, before the game's first instruction (Pgr4App::OnPreLaunchModule):
+// the constant is in read-only data, its page opened for the write.
+void Pgr4ApplyRenderAspect() {
+  const uint32_t h = pgr4::native::FfxSceneHeight();
+  if (h == 720) return;
+  constexpr uint32_t kWideAspect = 0x820010A8;
+  if (GuestLoad32(kWideAspect) != std::bit_cast<uint32_t>(16.0f / 9.0f)) {
+    REXLOG_WARN("PGR4 aspect: 0x{:08X} is not the game's 16:9, left as it is", kWideAspect);
+    return;
+  }
+  auto* heap = rex::system::kernel_memory()->LookupHeap(kWideAspect);
+  if (!heap) return;
+  const uint32_t page = kWideAspect & ~(heap->page_size() - 1);
+  uint32_t old = 0;
+  heap->Protect(page, heap->page_size(),
+                rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite, &old);
+  const float aspect = 1280.0f / float(h);
+  GuestStore32(kWideAspect, std::bit_cast<uint32_t>(aspect));
+  if (old) heap->Protect(page, heap->page_size(), old);
+  REXLOG_INFO("PGR4 aspect: {:.4f} for the 1280x{} frame (16:9 is 1.7778)", aspect, h);
+}
+
+// A frame taller than 16:9 (16:10) keeps the 16:9's horizontal field of view and shows more above
+// and below (Vert+), as a wider one keeps the vertical and shows more of the sides: the game's
+// projection (sub_826E32F0(f1 vertical field of view, f2 aspect, f3 near, f4 far), whose x scale is
+// the y scale / f2) gets, for the frame's views (f2 the aspect Pgr4ApplyRenderAspect wrote), a
+// vertical field of view whose tangent is the game's x height / 720.
+REX_EXTERN(__imp__sub_826E32F0);
+REX_HOOK_RAW(sub_826E32F0) {
+  static const uint32_t h = pgr4::native::FfxSceneHeight();
+  if (h > 720 && std::abs(ctx.f2.f64 - 1280.0 / h) < 1e-4 && ctx.f1.f64 > 0.0 && ctx.f1.f64 < 3.0) {
+    const double game = ctx.f1.f64;
+    ctx.f1.f64 = 2.0 * std::atan(std::tan(game * 0.5) * double(h) / 720.0);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 4)
+      REXLOG_INFO("PGR4 aspect: vertical field of view {:.2f} -> {:.2f} degrees (caller {:08X})",
+                  game * 57.29578, ctx.f1.f64 * 57.29578, uint32_t(ctx.lr));
+  }
+  __imp__sub_826E32F0(ctx, base);
 }
 
 // SetScissorRect (fn_826C59D8): r4 points at {x1, y1, x2, y2}.
 void Pgr4ScissorRectHook(PPCRegister& r4) {
   if (!r4.u32) return;
   if (GuestLoad32(r4.u32 + 8) == 1280 && GuestLoad32(r4.u32 + 12) == 720)
-    GuestStore32(r4.u32 + 12, uint32_t(REXCVAR_GET(pgr4_render_height)));
+    GuestStore32(r4.u32 + 12, pgr4::native::FfxSceneHeight());
 }
 
 namespace {

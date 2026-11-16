@@ -23,6 +23,7 @@ const FfxApi* LoadFfxApi();
 
 // The scene both effects take: PGR4's frame, 1280 wide and --pgr4_render_height tall (1280x800
 // on the Steam Deck: the game's own render size, which pgr4_hooks.cpp's hooks make it render).
+// --pgr4_render_height=0: from the main display's shape (fidelityfx.cpp).
 inline constexpr uint32_t kFfxSceneWidth = 1280;
 uint32_t FfxSceneHeight();
 

@@ -53,6 +53,7 @@ REXCVAR_DECLARE(bool, pgr4_native_dlss_fg);
 REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_frames);
 REXCVAR_DECLARE(bool, pgr4_native_frame_generation);
 REXCVAR_DECLARE(int32_t, pgr4_native_resolution_scale);
+REXCVAR_DECLARE(int32_t, pgr4_render_height);  // pgr4-native renderer.cpp
 REXCVAR_DECLARE(int32_t, pgr4_native_msaa);
 REXCVAR_DECLARE(int32_t, pgr4_native_anisotropy);
 REXCVAR_DECLARE(bool, fullscreen);
@@ -91,6 +92,9 @@ const char* const kModes[] = {"auto", "dlaa", "quality", "balanced", "performanc
                               "ultra_performance"};
 const int kMsaa[] = {1, 2, 4, 8};
 const int kAniso[] = {1, 2, 4, 8, 16};
+// The image format's render heights (pgr4_render_height): 0 the screen's shape, then 1280 x 720
+// (16:9), x 800 (16:10), x 548 (21:9), x 360 (32:9).
+const int kAspects[] = {0, 720, 800, 548, 360};
 const int kBrightLevels[] = {60, 70, 80, 90, 100, 110, 120, 130, 140, 150};
 
 // The page's texts, by id offset.
@@ -207,6 +211,11 @@ enum Text : uint32_t {
   kDetailOriginal,  // the enhanced details' choices, the same words too
   kDetailHigh,
   kDetailUltra,
+  kAspectRow,   // DISPLAY's image format (pgr4_render_height): AUTO (kModeAuto), then kAspect169..
+  kAspect169,   // the formats, the same in every language
+  kAspect1610,
+  kAspect219,
+  kAspect329,
   kTextCount
 };
 // IDS_OVER_A_SYSTEM_LINK_HELP (PGR4UIStrings.loc), the Multiplayer menu's system link line:
@@ -228,7 +237,7 @@ const char16_t* const kTexts[kTextCount] = {
     nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr, nullptr,
     nullptr,  u"X2",    u"X3",    u"X4",    u"X5",    u"X6",    u"MSAA",
     u"DLSS FRAME GENERATION", u"FSR FRAME GENERATION", nullptr, u"60%", u"70%", u"80%", u"90%",
-    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.2 (TAZZ)",
+    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.3 (TAZZ)",
 };
 
 // The others, in each of the game's languages (the loc folders' order), every glyph one the game's
@@ -245,7 +254,8 @@ constexpr Text kLocalized[] = {kTitle,     kUpscaler,     kUpscalerOff, kQuality
                                kSignOutTitle, kSignOutMessage, kLocalXenonHelp,
                                kLocalXenonHelpPs, kSharpRow, kShotHint,
                                kHdRow, kReflectRow, kDetailsRow, kAoRow, kImageRow, kImageOpen,
-                               kRestartTitle, kRestartMessage, kWelcomeTitle, kWelcomeText};
+                               kRestartTitle, kRestartMessage, kWelcomeTitle, kWelcomeText,
+                               kAspectRow};
 constexpr size_t kLocalizedCount = std::size(kLocalized);
 const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
     {  // cz
@@ -300,6 +310,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Toto nastavení vyžaduje restart hry. Probíhající závod bude ztracen. Restartovat nyní?",
         u"VÍTEJTE",
         u"Project Gotham Racing 4 edice 2026 je vylepšená verze hry s novými vizuálními efekty a novými grafickými možnostmi. Tato verze by nevznikla bez práce těchto autorů: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Velké díky jim oběma.",
+        u"POMĚR STRAN",
     },
     {  // de
         u"GRAFIK",
@@ -353,6 +364,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Diese Einstellung erfordert einen Neustart des Spiels. Ein laufendes Rennen geht verloren. Jetzt neu starten?",
         u"WILLKOMMEN",
         u"Project Gotham Racing 4 Edition 2026 ist eine verbesserte Version des Spiels mit neuen visuellen Effekten und neuen Grafikoptionen. Diese Version gäbe es nicht ohne die Arbeit von: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Vielen Dank an die beiden.",
+        u"BILDFORMAT",
     },
     {  // en
         u"GRAPHICS",
@@ -406,6 +418,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"This setting requires restarting the game. A race in progress will be lost. Restart now?",
         u"WELCOME",
         u"Project Gotham Racing 4 Edition 2026 is an enhanced version of the game with new visual effects and new graphics options. This version would not exist without the work of: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Many thanks to them.",
+        u"ASPECT RATIO",
     },
     {  // es
         u"GRÁFICOS",
@@ -459,6 +472,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Este ajuste requiere reiniciar el juego. Se perderá la carrera en curso. ¿Reiniciar ahora?",
         u"BIENVENIDO",
         u"Project Gotham Racing 4 Edición 2026 es una versión mejorada del juego con nuevos efectos visuales y nuevas opciones gráficas. Esta versión no existiría sin el trabajo de: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Muchas gracias a ambos.",
+        u"FORMATO DE IMAGEN",
     },
     {  // fr
         u"GRAPHISMES",
@@ -512,6 +526,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Ce réglage nécessite de redémarrer le jeu. Une course en cours sera perdue. Redémarrer maintenant ?",
         u"BIENVENUE",
         u"Project Gotham Racing 4 édition 2026 est une version améliorée du jeu proposant de nouveaux effets visuels et de nouvelles options graphiques. Cette version n'existerait pas sans le travail effectué par : ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Un grand merci à eux.",
+        u"FORMAT D'IMAGE",
     },
     {  // hu
         u"GRAFIKA",
@@ -565,6 +580,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Ehhez a beállításhoz újra kell indítani a játékot. A folyamatban lévő verseny elvész. Újraindítás most?",
         u"ÜDVÖZÖLJÜK",
         u"A Project Gotham Racing 4 2026-os kiadása a játék továbbfejlesztett változata új vizuális effektekkel és új grafikai beállításokkal. Ez a változat nem jöhetett volna létre a következők munkája nélkül: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Köszönjük nekik.",
+        u"KÉPARÁNY",
     },
     {  // it
         u"GRAFICA",
@@ -618,6 +634,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Questa impostazione richiede il riavvio del gioco. Una gara in corso andrà persa. Riavviare ora?",
         u"BENVENUTO",
         u"Project Gotham Racing 4 Edizione 2026 è una versione migliorata del gioco con nuovi effetti visivi e nuove opzioni grafiche. Questa versione non esisterebbe senza il lavoro di: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Un grande grazie a loro.",
+        u"FORMATO IMMAGINE",
     },
     {  // ja
         u"グラフィック",
@@ -671,6 +688,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"この設定にはゲームの再起動が必要です。進行中のレースは失われます。再起動しますか?",
         u"ようこそ",
         u"Project Gotham Racing 4 エディション 2026 は、新しい視覚効果とグラフィック設定を加えた強化バージョンです。このバージョンは次の方々の作業なしには存在しませんでした。 ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~ありがとうございます。",
+        u"画面比率",
     },
     {  // ko
         u"그래픽",
@@ -724,6 +742,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"이 설정을 적용하려면 게임을 다시 시작해야 합니다. 진행 중인 레이스는 사라집니다. 지금 다시 시작하시겠습니까?",
         u"환영합니다",
         u"Project Gotham Racing 4 에디션 2026은 새로운 시각 효과와 그래픽 옵션을 더한 향상된 버전입니다. 이 버전은 다음 분들의 작업이 없었다면 존재하지 않았을 것입니다. ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~두 분께 감사드립니다.",
+        u"화면비",
     },
     {  // pl
         u"GRAFIKA",
@@ -777,6 +796,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"To ustawienie wymaga ponownego uruchomienia gry. Trwający wyścig zostanie utracony. Uruchomić ponownie teraz?",
         u"WITAJ",
         u"Project Gotham Racing 4 Edycja 2026 to ulepszona wersja gry z nowymi efektami wizualnymi i nowymi opcjami graficznymi. Ta wersja nie powstałaby bez pracy: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Wielkie dzięki dla nich.",
+        u"PROPORCJE OBRAZU",
     },
     {  // ru
         u"ГРАФИКА",
@@ -830,6 +850,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Для этого параметра нужно перезапустить игру. Текущая гонка будет потеряна. Перезапустить сейчас?",
         u"ДОБРО ПОЖАЛОВАТЬ",
         u"Project Gotham Racing 4 Издание 2026 — это улучшенная версия игры с новыми визуальными эффектами и новыми настройками графики. Эта версия не появилась бы без работы: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Большое им спасибо.",
+        u"ФОРМАТ ЭКРАНА",
     },
     {  // sc
         u"图形",
@@ -883,6 +904,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"此设置需要重新启动游戏。正在进行的比赛将会丢失。现在重新启动吗?",
         u"欢迎",
         u"Project Gotham Racing 4 2026 版是游戏的增强版本,加入了新的视觉效果和新的图形选项。没有以下人员的工作,就没有这个版本: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~非常感谢他们。",
+        u"屏幕比例",
     },
     {  // tc
         u"視訊",
@@ -936,6 +958,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"此設定需要重新啟動遊戲。進行中的比賽將會遺失。現在重新啟動嗎?",
         u"歡迎",
         u"Project Gotham Racing 4 2026 版是遊戲的增強版本,加入了新的視覺效果和新的圖形選項。沒有以下人員的工作,就沒有這個版本: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~非常感謝他們。",
+        u"畫面比例",
     },
 };
 
@@ -1113,6 +1136,10 @@ const char16_t* TextIn(Lang lang, Text t) {
   if (t == kDetailOriginal) return u"ORIGINAL";
   if (t == kDetailHigh) return u"HIGH";
   if (t == kDetailUltra) return u"ULTRA";
+  if (t == kAspect169) return u"16:9";
+  if (t == kAspect1610) return u"16:10";
+  if (t == kAspect219) return u"21:9";
+  if (t == kAspect329) return u"32:9";
   if (t >= kSharp0 && t <= kSharp20) {
     static std::u16string sharp[21];
     std::u16string& text = sharp[t - kSharp0];
@@ -1164,6 +1191,7 @@ struct Values {
   int details = 0;  // enhanced details: original, high, ultra (pgr4_native_details)
   // The sharpening of the upscaler shown, 0.00 to 1.00 in 0.05 steps (kSharp0..kSharp20).
   int sharp = 3;
+  int aspect = 0;  // index in kAspects (pgr4_render_height): auto, 16:9, 16:10, 21:9, 32:9
 };
 
 // The pages: DISPLAY (window mode, definition, frame rate limit, brightness), GRAPHICS (image and
@@ -1184,6 +1212,7 @@ Values CurrentValues() {
                    : 0;
   v.dlssfg = REXCVAR_GET(pgr4_native_dlss_fg) ? int(pgr4::native::streamline::GeneratedFrames()) : 0;
   v.scale = std::clamp(REXCVAR_GET(pgr4_native_resolution_scale), 1, 4) - 1;
+  v.aspect = IndexOf(kAspects, int(REXCVAR_GET(pgr4_render_height)), 0);
   // The level nearest the setting.
   for (int i = 0; i < int(std::size(kBrightLevels)); ++i)
     if (std::abs(kBrightLevels[i] - REXCVAR_GET(pgr4_native_brightness)) <
@@ -1235,6 +1264,8 @@ std::vector<Row> RowsFor(Page page, const Values& v) {
     for (size_t i = 0; i < ScreenModes().size(); ++i) res.push_back(Text(kRes0 + i));
     rows.push_back({"res", kResolutionRow, res, v.res});
     rows.push_back({"scale", kScale, {kScale1, kScale2, kScale3, kScale4}, v.scale});
+    rows.push_back({"aspect", kAspectRow, {kModeAuto, kAspect169, kAspect1610, kAspect219, kAspect329},
+                    v.aspect});
     std::vector<Text> fps;
     for (const FpsChoice& c : FpsChoices()) fps.push_back(FpsText(c));
     rows.push_back({"fps", kFpsRow, fps, v.fps});
@@ -1323,6 +1354,7 @@ Values DecodePage(const std::string& digits) {
     else if (name == "framegen") v.framegen = d;
     else if (name == "dlssfg") v.dlssfg = d;
     else if (name == "scale") v.scale = d;
+    else if (name == "aspect") v.aspect = d;
     else if (name == "msaa") v.msaa = d;
     else if (name == "aniso") v.aniso = d;
     else if (name == "window") v.window = d;
@@ -1436,6 +1468,7 @@ std::string PageScript(Page page, const Values& values) {
   // The render scale: applied by restarting the game, asked first (PN_AskRestart).
   if (page == kDisplayPage) {
     s += "  GUI.scale_start = UIButtons.GetSelection(GUI.scale_ID)\n";
+    s += "  GUI.aspect_start = UIButtons.GetSelection(GUI.aspect_ID)\n";
     s += "  GUI.restart_title = " + Id(kRestartTitle) + "\n";
     s += "  GUI.restart_message = " + Id(kRestartMessage) + "\n";
   }
@@ -1530,11 +1563,14 @@ function MessageUpdate(msg, a, b, c, d)
     end
   end
 end
--- The render scale changed: the game restarts to apply it (its shaders compiled by the launcher);
--- the row back to the scale in use only if the player says no.
+-- The render scale or the image format changed: the game restarts to apply them (the scale's
+-- shaders compiled by the launcher); the rows back to the values in use only if the player says no.
 function PN_AskRestart()
   if GUI.scale_start == nil or CustomPopup == nil or SetupCustomPopup == nil then return false end
-  if UIButtons.GetSelection(GUI.scale_ID) == GUI.scale_start then return false end
+  if UIButtons.GetSelection(GUI.scale_ID) == GUI.scale_start and
+     (GUI.aspect_start == nil or UIButtons.GetSelection(GUI.aspect_ID) == GUI.aspect_start) then
+    return false
+  end
   CustomPopup.Data["PGR4_RESTART"] = {
     darken = true,
     title_text_ID = GUI.restart_title,
@@ -1542,7 +1578,10 @@ function PN_AskRestart()
     next_text_ID = UIText.IDS_YES_A,
     back_text_ID = UIText.IDS_NO_B,
     next_screen = "Intro\\PX_" .. PN_Digits() .. ".lua",
-    back_CB = function() UIButtons.SetSelection(GUI.scale_ID, GUI.scale_start) end,
+    back_CB = function()
+      UIButtons.SetSelection(GUI.scale_ID, GUI.scale_start)
+      if GUI.aspect_start ~= nil then UIButtons.SetSelection(GUI.aspect_ID, GUI.aspect_start) end
+    end,
   }
   SetupCustomPopup("PGR4_RESTART")
   return true
@@ -1678,6 +1717,11 @@ void ApplyPage(const Values& want, bool restart = false) {
       REXCVAR_SET(pgr4_native_resolution_scale, want.scale + 1);
       rebuild = true;
     }
+    // The image format: read at the start (pgr4-native fidelityfx.cpp), saved for the restart the
+    // page asked for.
+    if (want.aspect != now.aspect)
+      REXCVAR_SET(pgr4_render_height,
+                  kAspects[std::clamp(want.aspect, 0, int(std::size(kAspects)) - 1)]);
     if (want.aniso != now.aniso) {
       REXCVAR_SET(pgr4_native_anisotropy, kAniso[want.aniso]);
       rebuild = true;

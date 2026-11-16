@@ -78,8 +78,9 @@ REXCVAR_DEFINE_BOOL(pgr4_native_resolve_readback, true, "PGR4 native",
                     "Write k_5_6_5 / k_6_5_5 resolves back into guest memory (the GPU waited "
                     "for at the resolve): the team logo on the suit and the liveries, which the "
                     "game composes on the GPU and compresses on the CPU");
-REXCVAR_DEFINE_INT32(pgr4_render_height, 800, "PGR4",
-                     "The render height the 16:10 patch gives every hooked 720 (720 disables it)")
+REXCVAR_DEFINE_INT32(pgr4_render_height, 0, "PGR4",
+                     "The render height the patch gives every hooked 720 (720 disables it, 0: from the "
+                     "screen's shape, 21:9 about 540)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(pgr4_native_csv, "", "PGR4 native",
                       "Per-frame CSV of the native path: counts and CPU time per hook class");

@@ -11,8 +11,9 @@ pgr4_60fps = true
 # 0: pace on the game's own 60 Hz vblank wait (60 FPS). 1-3: pace on the display (unlocked, up
 # to its refresh rate).
 pgr4_native_frame_latency = 3
-# The game's render height: 720 is the game's 16:9 1280x720.
-pgr4_render_height = 720
+# The game's render height: 720 is the game's 16:9 1280x720, 0 the screen's shape (1280 wide,
+# 16:10 -> 800, 21:9 -> about 540: the image fills the screen, the HUD in its central 16:9).
+pgr4_render_height = 0
 pgr4_native_anisotropy = 16
 # Draw resolution scale: every render target at N x the game's 1280x720 (the first launch picks
 # it from the screen, src/pgr4_profile.cpp).

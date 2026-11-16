@@ -390,14 +390,16 @@ name = "Pgr4HudOrthoHook"
 registers = ["r5"]
 after_instruction = true
 
+# The surface creators' height (r4): only a taller frame needs its surfaces taller
+# (Pgr4SurfaceHeightHook); a shorter one keeps the game's 720 (the videos' 1280x720 target).
 [[midasm_hook]]
 address = 0x826C8B18
-name = "Pgr4RenderHeightHook"
+name = "Pgr4SurfaceHeightHook"
 registers = ["r4"]
 
 [[midasm_hook]]
 address = 0x822B3FC8
-name = "Pgr4RenderHeightHook"
+name = "Pgr4SurfaceHeightHook"
 registers = ["r4"]
 
 # Garage walking and the photo camera (sub_824BB618, their collision callback): mflr r12 holds the

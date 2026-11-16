@@ -49,6 +49,7 @@ REXCVAR_DECLARE(bool, pgr4_native_reactive_show);
 REXCVAR_DECLARE(int32_t, pgr4_native_msaa);
 REXCVAR_DECLARE(int32_t, pgr4_native_anisotropy);
 REXCVAR_DECLARE(int32_t, pgr4_native_resolution_scale);
+REXCVAR_DECLARE(int32_t, pgr4_render_height);  // renderer.cpp: the image format (DISPLAY page)
 REXCVAR_DECLARE(double, pgr4_native_tune_road_relief);
 REXCVAR_DECLARE(double, pgr4_native_tune_sun_glint);
 REXCVAR_DECLARE(double, pgr4_native_tune_sun_sharpness);
@@ -167,6 +168,7 @@ std::string SaveRendererSettings(bool upscaler_on) {
       {"pgr4_native_upscaler_width", std::to_string(REXCVAR_GET(pgr4_native_upscaler_width))},
       {"pgr4_native_upscaler_height", std::to_string(REXCVAR_GET(pgr4_native_upscaler_height))},
       {"pgr4_native_resolution_scale", std::to_string(REXCVAR_GET(pgr4_native_resolution_scale))},
+      {"pgr4_render_height", std::to_string(REXCVAR_GET(pgr4_render_height))},
       // The SDK's (d3d12_presenter.cpp), the DISPLAY page's VSYNC row: set there by its name, it
       // was applied but never saved, back to the file's value at the next start.
       {"d3d12_present_vsync",

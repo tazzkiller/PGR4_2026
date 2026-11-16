@@ -229,6 +229,15 @@ REXCVAR_DEFINE_INT32(pgr4_native_draw_log_from, -1, "PGR4 native",
 REXCVAR_DEFINE_INT32(pgr4_native_draw_log_frames, 1, "PGR4 native",
                      "Frames one draw log trigger (--pgr4_native_draw_log_from or draw-debug.txt "
                      "bit 16) covers");
+REXCVAR_DEFINE_BOOL(pgr4_native_fit_glass_c45, true, "PGR4 native",
+                    "Development (21:9): the menus' translucent panels fitted by their c45 (true) "
+                    "or by the viewport as the rest of the interface (false)");
+REXCVAR_DEFINE_BOOL(pgr4_native_fit_ui_viewport, true, "PGR4 native",
+                    "Development (21:9): the interface fitted by the viewport (true) or by its c45 "
+                    "(false, the shaders reading the HUD projection only)");
+REXCVAR_DEFINE_BOOL(pgr4_native_fit_hud, true, "PGR4 native",
+                    "With a render height other than 720, fit the HUD's and the menus' projection "
+                    "(c45) to the frame (local change, pgr4 project; false: the game's)");
 REXCVAR_DEFINE_BOOL(pgr4_native_texture_catalog, false, "PGR4 native",
                     "Write every texture the draws bind, with the shader and the slot that read it, "
                     "to <capture dir>/texture_catalog.tsv (local change, pgr4 project)");
@@ -951,6 +960,102 @@ void PackFloats(CachedCbv& cb, const DxbcShader* shader, const uint32_t* regs, u
     cb.gpu = 0;
 }
 
+// Local change (pgr4 project): a menu's full-screen background in a frame wider than 16:9: a draw
+// of the menus' vertex shaders (44-byte vertices at fetch 95, the position first, in the game's
+// 640x480 space whose 16:9 sides are -106.67 and 746.67) whose every vertex is on a side or
+// beyond, so it spans the 16:9 width. Not the video (texture 0 the Bink frame's resolve), which
+// keeps its shape. FitHudOrtho then leaves its x as the game's: the background covers the frame.
+bool FullWidthBackground(const RegisterFile& regs, const DxbcShader* vs, const uint8_t* membase,
+                         uint32_t video_texture) {
+  if (!vs || !membase || Upscaler::SceneHeight() == 720) return false;
+  const uint64_t hash = vs->ucode_data_hash();
+  if (hash != 0x19EE9CB8A3A22FD7ull && hash != 0x902579CC4AB6A791ull &&
+      hash != 0xA1A5C0F8B117DC24ull)
+    return false;
+  const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(95);
+  const uint32_t address = vf.address << 2, size = vf.size << 2;
+  if (size < 44 * 3 || size > 44 * 64 || size_t(address) + size > 0x20000000) return false;
+  if (video_texture && (regs.GetTextureFetch(0).base_address << 12) == video_texture) return false;
+  for (uint32_t v = 0; v * 44 + 4 <= size; ++v) {
+    const float x = std::bit_cast<float>(
+        __builtin_bswap32(*reinterpret_cast<const uint32_t*>(membase + address + v * 44)));
+    if (x > -106.0f && x < 746.0f) return false;
+  }
+  return true;
+}
+
+// Local change (pgr4 project): the HUD's and the menus' orthographic projection, c45 of their
+// vertex shaders: the game's 640x480 space into the central 960x720 of its 720-tall frame (x
+// scale 3/1280, offset -0.75; y scale -3/720, offset 1), rewritten in the constants a draw uploads
+// (after PackFloats). A taller frame (16:10) keeps the central 960x720, centered, for every HUD
+// draw. A shorter one (21:9) fits its interface by the viewport (Draw, ui_fit) but for the
+// translucent panels, whose x this shrinks to the frame's height, centered.
+// Whether a draw's vertex shader reads the game's HUD and menus' projection in c45 (x scale
+// 3/1280, offset -0.75; y scale -3/720, offset 1), as the game computes it: within a few units in
+// the last place. `c` points at c45's four floats.
+bool IsHudOrtho(const float* c) {
+  const auto close = [](float a, float b) { return std::abs(a - b) <= std::abs(b) * 1e-5f; };
+  return close(c[0], 3.0f / 1280.0f) && close(c[1], -3.0f / 720.0f) && close(c[2], -0.75f) &&
+         close(c[3], 1.0f);
+}
+
+// Whether a draw is one of the HUD's or the menus': its vertex shader reads c45, and c45 holds the
+// game's HUD projection. The first of a frame's on its final image starts the interface's phase
+// (DrawRenderer::Impl::ui_phase).
+bool ReadsHudOrtho(const RegisterFile& regs, const DxbcShader* vs) {
+  if (!vs) return false;
+  const Shader::ConstantRegisterMap& map = vs->constant_register_map();
+  if (!map.float_count || !((map.float_bitmap[0] >> 45) & 1)) return false;
+  float c[4];
+  for (uint32_t k = 0; k < 4; ++k)
+    c[k] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 45 * 4 + k);
+  return IsHudOrtho(c);
+}
+
+// The menus' translucent panels (the wet glass: vs 902579CC4AB6A791 and A1A5C0F8B117DC24) read the
+// image behind them at the screen position their shader computes from oPos: fitted by their c45
+// (FitHudOrtho) in a full-frame viewport, so that position stays where they are drawn, where the
+// rest of the interface is fitted by its viewport.
+// Which they are: the menus' vertex shaders that read c46 (the panel's texture mapping) and c255
+// (the clip-to-texture helper, 1 and 0.5) besides c45: 902579CC4AB6A791, A1A5C0F8B117DC24, the
+// glass 91A5322322B3B77D, which samples a copy of the screen at that position (in a fitted viewport
+// it showed a wider ghost of the previous frame's panel). Not the race's 87B13831BF0A358D, whose
+// c255 is a branch's flag and which has no c46.
+bool IsScreenSampledHud(const DxbcShader* vs) {
+  if (!vs) return false;
+  const Shader::ConstantRegisterMap& map = vs->constant_register_map();
+  return ((map.float_bitmap[0] >> 45) & 1) && ((map.float_bitmap[0] >> 46) & 1) &&
+         ((map.float_bitmap[3] >> 63) & 1);
+}
+
+void FitHudOrtho(CachedCbv& cb, const DxbcShader* vs, bool full_width) {
+  static const uint32_t h = Upscaler::SceneHeight();
+  if (h == 720 || !vs || !REXCVAR_GET(pgr4_native_fit_hud)) return;
+  if (full_width) return;  // the game's: the 16:9 screen over the whole frame
+  const Shader::ConstantRegisterMap& map = vs->constant_register_map();
+  const uint64_t bits = map.float_bitmap[0];
+  if (!map.float_count || !((bits >> 45) & 1)) return;
+  float* c = reinterpret_cast<float*>(cb.last + 16 * std::popcount(bits & ((1ull << 45) - 1)));
+  if (h > 720) {
+    if (!IsHudOrtho(c)) return;
+    c[1] = -3.0f / float(h);
+    c[3] = 720.0f / float(h);
+  } else {
+    // What the central 16:9 viewport does to the other draws: x scaled about the center by
+    // height / 720, whatever the game's c45 (a popup's opening animation has its own); y as it is.
+    const float s = float(h) / 720.0f;
+    c[0] *= s;
+    c[2] *= s;
+  }
+  cb.gpu = 0;  // uploaded again: what PackFloats compares with is the game's value next draw
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXLOG_INFO("PGR4 native HUD: c45 fitted to the 1280x{} frame ({:016X})", h,
+                vs->ucode_data_hash());
+  }
+}
+
 }  // namespace
 
 struct DrawRenderer::Impl {
@@ -1437,6 +1542,20 @@ struct DrawRenderer::Impl {
     }
   }
   bool road_seen = false;
+  // Local change (pgr4 project): the videos. A Bink frame drawn (bink_drawn) is resolved into the
+  // texture the menus show (video_texture, its guest address), which FitHudOrtho keeps 16:9.
+  bool bink_drawn = false;
+  uint32_t video_texture = 0;
+  // Local change (pgr4 project): the interface's part of the frame (21:9): from the first HUD or
+  // menu draw on the final image to the next scene draw (split screen) or the frame's end. Its
+  // draws on the final image are made in the central 16:9 (Draw, ui_fit).
+  bool ui_phase = false;
+  // The race draws scene effects in the HUD's projection before its tone map (the sun's glare: its
+  // flares and veils, 246A313B2DFCE07F, 2EE17BB253937C29), which the tone map's full-frame
+  // rectangle list then composes with the scene: they span the whole frame like the scene. A frame
+  // whose previous one had such a pass after a HUD draw (ui_wait_rect) starts its interface only
+  // after that pass (ui_armed). ui_hud_seen: a HUD draw on the final image since the last scene draw.
+  bool ui_hud_seen = false, ui_armed = false, ui_rect_after_hud = false, ui_wait_rect = false;
   // Local change (pgr4 project): the rain's running drops (drops_run.hlsli): their clock, summed from
   // the car's speed so a change of speed never makes them jump; the road draws' eye (their VS's c24)
   // for the code that needs the camera.
@@ -3931,6 +4050,26 @@ void DrawRenderer::Impl::LogDraw(const DrawState& s, const RegisterFile& regs, u
       const uint32_t index = w * 32 + uint32_t(std::countr_zero(bits));
       const xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(index);
       std::fprintf(draw_log, " vf%u=%08X+%X", index, vf.address << 2, vf.size << 2);
+      // Local change (pgr4 project), development: the menus' quads (vs 19EE9CB8A3A22FD7, 44-byte
+      // vertices, the position first) as the game placed them, in its 640x480 space.
+      // And the videos' Bink frame (vs 161091CC82B3A2E9, 20-byte vertices), in pixels.
+      // And the translucent panels (902579CC, A1A5C0F8), 44-byte vertices too.
+      const uint64_t vs_hash = vs.ucode_data_hash();
+      const uint32_t stride = vs_hash == 0x19EE9CB8A3A22FD7ull || vs_hash == 0x902579CC4AB6A791ull ||
+                                      vs_hash == 0xA1A5C0F8B117DC24ull
+                                  ? 44
+                              : vs_hash == 0x161091CC82B3A2E9ull ? 20
+                                                                 : 0;
+      if (stride && index == 95 && membase && (vf.size << 2) <= 44 * 64) {
+        std::fprintf(draw_log, " pos");
+        for (uint32_t v = 0; v * stride + 16 <= (vf.size << 2) && v < 8; ++v) {
+          const uint8_t* p = membase + (vf.address << 2) + v * stride;
+          float f[4];
+          for (uint32_t k = 0; k < 4; ++k)
+            f[k] = std::bit_cast<float>(__builtin_bswap32(*reinterpret_cast<const uint32_t*>(p + 4 * k)));
+          std::fprintf(draw_log, " (%g,%g,%g,%g)", f[0], f[1], f[2], f[3]);
+        }
+      }
     }
   auto float_hash = [&](const Shader* shader, uint32_t base) {
     uint64_t h = 0;
@@ -4705,8 +4844,90 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   }
   Scissor scissor;
   HostScissor(regs, scissor);
+  // Local change (pgr4 project): a frame that is not 16:9 (21:9, 32:9, 16:10) shows the HUD and
+  // the menus as a 16:9 screen did, in its central 16:9 (columns of a wider frame, rows of a taller
+  // one), the scene and the menus' full-screen backgrounds over the whole frame. In the interface's
+  // phase (ui_phase), every draw on the final image (pitch 1280, not the scene's surface) is made
+  // there: its viewport and scissor scaled about the frame's center, x by height / 720 (wider),
+  // y by 720 / height (taller), whatever its shader (panels, text, the menus' 3D track outlines, the
+  // videos), and the game's elements waiting just off a 16:9 screen stay out of sight. The
+  // translucent panels are fitted by their c45 instead (IsScreenSampledHud).
+  const bool hud_full_width = FullWidthBackground(regs, vs, membase, video_texture);
+  uint32_t ui_fit = 0;  // 0: as the game drew it; 1: by the viewport; 2: by c45 (FitHudOrtho)
+  if (Upscaler::SceneHeight() != 720 && REXCVAR_GET(pgr4_native_fit_hud)) {
+    const uint32_t si = regs[XE_GPU_REG_RB_SURFACE_INFO];
+    if (Upscaler::IsScene(si)) {
+      ui_phase = ui_hud_seen = ui_armed = false;
+    } else if ((si & 0x3FFF) == 1280) {
+      // A full-frame pass after a HUD draw: the tone map, the interface not begun yet.
+      if (prim == xenos::PrimitiveType::kRectangleList && ui_hud_seen && scissor.offset[0] == 0 &&
+          scissor.extent[0] >= 1280) {
+        ui_armed = ui_rect_after_hud = true;
+        ui_phase = false;
+      }
+      if (!ui_phase && ReadsHudOrtho(regs, vs)) {
+        ui_hud_seen = true;
+        if (!ui_wait_rect || ui_armed) ui_phase = true;
+      }
+      // A rectangle list is a full-screen pass (the race's tone map composes the scene after its
+      // HUD has begun on another part of EDRAM): never fitted. The interface draws quads,
+      // triangles and strips.
+      // A draw in the world (its vertex shader's c4-c7 a perspective camera: the race's sprites
+      // over the scene) stays over the whole frame, as the scene does. The menus' track outlines
+      // read an orthographic c4-c7, which CameraFromClipRows does not take.
+      bool in_world = false;
+      if (vs) {
+        const Shader::ConstantRegisterMap& map = vs->constant_register_map();
+        if (((map.float_bitmap[0] >> 4) & 0xF) == 0xF) {
+          float rows[16];
+          for (uint32_t k = 0; k < 16; ++k)
+            rows[k] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * 4 + k);
+          FfxCamera camera;
+          in_world = CameraFromClipRows(rows, camera);
+        }
+      }
+      if (ui_phase && !hud_full_width && !in_world &&
+          prim != xenos::PrimitiveType::kRectangleList) {
+        const bool c45 = IsScreenSampledHud(vs) ? REXCVAR_GET(pgr4_native_fit_glass_c45)
+                                                : !REXCVAR_GET(pgr4_native_fit_ui_viewport);
+        ui_fit = c45 ? 2 : 1;
+      }
+    }
+  }
+  // The central 16:9: x scaled about 640 (a wider frame), y about the frame's middle (a taller).
+  const float ui_h = float(Upscaler::SceneHeight());
+  const float ui_kx = std::min(1.0f, ui_h / 720.0f), ui_ky = std::min(1.0f, 720.0f / ui_h);
+  const auto ui_fit_span = [](uint32_t& offset, uint32_t& extent, float center, float k,
+                              uint32_t min_extent) {
+    const auto at = [center, k](uint32_t v) {
+      return uint32_t(std::max(0L, std::lround(center + (float(v) - center) * k)));
+    };
+    const uint32_t a = at(offset), b = at(offset + extent);
+    offset = a;
+    extent = b > a ? b - a : min_extent;
+  };
+  if (ui_fit) {
+    ui_fit_span(scissor.offset[0], scissor.extent[0], 640.0f, ui_kx, 0);
+    ui_fit_span(scissor.offset[1], scissor.extent[1], ui_h * 0.5f, ui_ky, 0);
+  }
+  // Local change (pgr4 project): the videos' Bink frame (its YUV-to-RGB pixel shader) is drawn
+  // 1280x720 whole for the resolve that copies it into the texture the menus show; with a frame
+  // shorter than 720 (pgr4_hooks.cpp) its scissor came at the render height, the picture's bottom
+  // rows missing from the texture.
+  if (ps && ps->ucode_data_hash() == 0x0EB90A9B6A606BCCull) {
+    bink_drawn = true;  // its resolve gives the video's texture (LogResolve)
+    if (scissor.offset[1] == 0 && Upscaler::SceneHeight() < 720 &&
+        scissor.extent[1] == Upscaler::SceneHeight())
+      scissor.extent[1] = 720;
+  }
   ViewportInfo vp;
   HostViewportInfo(regs, ps && ps->writes_depth(), vp);
+  // Local change (pgr4 project): the interface's draws in the central 16:9 (ui_fit above); a
+  // viewport in pixels (clipping off) is left as it is.
+  if (ui_fit == 1 && !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
+    ui_fit_span(vp.xy_offset[0], vp.xy_extent[0], 640.0f, ui_kx, 1);
+    ui_fit_span(vp.xy_offset[1], vp.xy_extent[1], ui_h * 0.5f, ui_ky, 1);
+  }
   const uint32_t height = std::clamp(scissor.offset[1] + scissor.extent[1], 1u, 2048u);
   profile::Mark(profile::kSetup);
   // Local change (pgr4 project): the scene before the frame's first water draw, for its
@@ -5282,6 +5503,9 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
 
   // Float constants packed by the shaders' maps (UpdateBindings), compared and staged in place.
   PackFloats(cb_float_vs, vs, s.regs, XE_GPU_REG_SHADER_CONSTANT_000_X);
+  // Local change (pgr4 project): the render height's HUD; a menu's full-screen background keeps
+  // the game's width, stretched to the whole frame.
+  if (ui_fit == 2) FitHudOrtho(cb_float_vs, vs, hud_full_width);
   PackFloats(cb_float_ps, ps, s.regs, XE_GPU_REG_SHADER_CONSTANT_256_X);
   profile::Mark(profile::kPack);
 
@@ -5713,6 +5937,11 @@ void DrawRenderer::LogClear(const ClearCall& c) {
 }
 
 void DrawRenderer::LogResolve(const ResolveParams& p) {
+  // Local change (pgr4 project): the first resolve after a Bink frame is the video's texture.
+  if (impl_->bink_drawn) {
+    impl_->bink_drawn = false;
+    impl_->video_texture = p.dest_base;
+  }
   std::FILE* f = impl_->draw_log;
   if (!f) return;
   std::fprintf(f,
@@ -5816,6 +6045,9 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   impl_->frame_draws = 0;
   ++impl_->frame_count;
   impl_->road_seen = false;
+  impl_->ui_phase = false;
+  impl_->ui_wait_rect = impl_->ui_rect_after_hud;
+  impl_->ui_hud_seen = impl_->ui_armed = impl_->ui_rect_after_hud = false;
   impl_->frames_without_road = impl_->road_drawn ? 0 : impl_->frames_without_road + 1;
   impl_->rain_draws.clear();
   if (impl_->frames_without_road > kRainGoneFrames) impl_->rain[0] = impl_->rain[1] = 0.0f;

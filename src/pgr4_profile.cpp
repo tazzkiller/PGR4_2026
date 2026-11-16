@@ -34,6 +34,9 @@ REXCVAR_DEFINE_BOOL(pgr4_first_launch_done, false, "PGR4",
                     "The first launch's settings were made (definition from the screen, no "
                     "upscaler, no frame generation); false: made again at the next launch");
 REXCVAR_DECLARE(int32_t, pgr4_native_resolution_scale);
+namespace pgr4::native {
+uint32_t FfxSceneHeight();  // pgr4-native fidelityfx.cpp: the render height
+}
 REXCVAR_DECLARE(bool, pgr4_native_upscaler);
 REXCVAR_DECLARE(bool, pgr4_native_dlss_fg);
 REXCVAR_DECLARE(bool, pgr4_native_frame_generation);
@@ -264,18 +267,34 @@ void Pgr4DumpImage() {
   REXLOG_INFO("PGR4: image written to {} ({})", path, out ? "ok" : "failed");
 }
 
-// Pgr4App::OnPreLaunchModule, before the renderer reads its settings: at the first launch, the
-// definition from the screen (the smallest multiple of the game's 720p at least the screen's
-// height: 1080p screen -> 1440p, 2160p -> 2160p), no upscaler and no frame generation, kept in
-// pgr4.toml.
-void Pgr4FirstLaunchConfig() {
-  if (REXCVAR_GET(pgr4_first_launch_done)) return;
+namespace {
+
+// The main display's mode (1920x1080 when Windows does not say).
+void ScreenSize(uint32_t& width, uint32_t& height) {
   DEVMODEW mode = {};
   mode.dmSize = sizeof(mode);
-  uint32_t height = 1080;
-  if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsHeight)
+  width = 1920;
+  height = 1080;
+  if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsWidth &&
+      mode.dmPelsHeight) {
+    width = mode.dmPelsWidth;
     height = mode.dmPelsHeight;
-  const int32_t scale = std::clamp(int32_t((height + 719) / 720), 1, 4);
+  }
+}
+
+}  // namespace
+
+// Pgr4App::OnPreLaunchModule, before the renderer reads its settings: at the first launch, the
+// definition from the screen (the smallest multiple of the game's frame, 1280 x render height, at
+// least the screen's size: 1080p screen -> 1440p, 2160p -> 2160p), no upscaler and no frame
+// generation, kept in pgr4.toml.
+void Pgr4FirstLaunchConfig() {
+  if (REXCVAR_GET(pgr4_first_launch_done)) return;
+  uint32_t width, height;
+  ScreenSize(width, height);
+  const uint32_t rows = pgr4::native::FfxSceneHeight();  // pgr4_render_height, 0: the screen's
+  const uint32_t need = std::max((height + rows - 1) / rows, (width + 1279) / 1280);
+  const int32_t scale = std::clamp(int32_t(need), 1, 4);
   REXCVAR_SET(pgr4_native_resolution_scale, scale);
   REXCVAR_SET(pgr4_native_upscaler, false);
   REXCVAR_SET(pgr4_native_dlss_fg, false);
@@ -287,8 +306,8 @@ void Pgr4FirstLaunchConfig() {
   SaveSetting("pgr4_native_dlss_fg", "false", comment);
   SaveSetting("pgr4_native_frame_generation", "false", comment);
   SaveSetting("pgr4_first_launch_done", "true", comment);
-  REXLOG_INFO("PGR4 first launch: screen {}p, definition {}p, no upscaler, no frame generation",
-              height, 720 * scale);
+  REXLOG_INFO("PGR4 first launch: screen {}x{}, definition {}x{}, no upscaler, no frame "
+              "generation", width, height, 1280 * scale, rows * scale);
 }
 
 // --pgr4_unlock_all: every Cool Wall pack unlocked in the signed-in profiles, so every car and

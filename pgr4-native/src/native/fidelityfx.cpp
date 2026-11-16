@@ -13,8 +13,28 @@ REXCVAR_DECLARE(int32_t, pgr4_render_height);  // renderer.cpp
 
 namespace pgr4::native {
 
+// Local change (pgr4 project): 0 is the screen's shape, the game's 1280 columns and as many rows
+// as fill the main display (16:9 -> 720, 16:10 -> 800, 21:9 -> about 540), even, within 360
+// (32:9) and 800 (the tallest frame tested). Decided once: the setting takes a restart, and the
+// game's hooks ask it at every viewport.
 uint32_t FfxSceneHeight() {
-  return uint32_t(std::clamp<int32_t>(REXCVAR_GET(pgr4_render_height), 360, 2160));
+  static const uint32_t height = [] {
+    const int32_t set = REXCVAR_GET(pgr4_render_height);
+    if (set != 0) return uint32_t(std::clamp<int32_t>(set, 360, 2160));
+    DEVMODEW mode = {};
+    mode.dmSize = sizeof(mode);
+    uint32_t w = 1920, h = 1080;
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) && mode.dmPelsWidth &&
+        mode.dmPelsHeight) {
+      w = mode.dmPelsWidth;
+      h = mode.dmPelsHeight;
+    }
+    const int32_t rows = int32_t(std::lround(1280.0 * h / w / 2.0)) * 2;
+    const uint32_t r = uint32_t(std::clamp(rows, 360, 800));
+    REXLOG_INFO("PGR4 render height: {} (screen {}x{})", r, w, h);
+    return r;
+  }();
+  return height;
 }
 
 const FfxApi* LoadFfxApi() {
@@ -56,7 +76,9 @@ bool CameraFromClipRows(const float* m, FfxCamera& out) {
   const float fy = std::sqrt((y[0] * y[0] + y[1] * y[1] + y[2] * y[2]) / wn2);
   const float fx = std::sqrt((x[0] * x[0] + x[1] * x[1] + x[2] * x[2]) / wn2);
   const float fov_y = 2.0f * std::atan(1.0f / fy);
-  if (!(fov_y > 0.15f && fov_y < 2.6f && fy / fx > 1.2f && fy / fx < 2.6f)) return false;
+  // Local change (pgr4 project): fy / fx is the frame's aspect, up to 32:9 (3.56) since the
+  // game takes it from the render height (pgr4_hooks.cpp, Pgr4ApplyRenderAspect).
+  if (!(fov_y > 0.15f && fov_y < 2.6f && fy / fx > 1.2f && fy / fx < 4.0f)) return false;
   out = {near_plane, far_plane, fov_y};
   return true;
 }
