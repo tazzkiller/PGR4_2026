@@ -97,8 +97,8 @@ REXCVAR_DEFINE_DOUBLE(pgr4_native_xegtao_mip_offset, 3.3, "PGR4 native",
 // Its radius (5 m) is for the scenery; the cockpit, within about 1.5 m, saw it cover the whole
 // screen and darken all of it, over the shading its textures already have. Nothing else is that
 // near in a race's views (the car is 4 to 6 m away in the chase view); a close-up in the garage or
-// the photo mode is. Off by default, for comparisons.
-REXCVAR_DEFINE_BOOL(pgr4_native_xegtao_near_fade, false, "PGR4 native",
+// the photo mode is. On by default since V1.4 (19/11/2026, Tazz).
+REXCVAR_DEFINE_BOOL(pgr4_native_xegtao_near_fade, true, "PGR4 native",
                     "XeGTAO fades out near the eye (the cockpit view): none before "
                     "--pgr4_native_xegtao_near_start, all from --pgr4_native_xegtao_near_end");
 REXCVAR_DEFINE_DOUBLE(pgr4_native_xegtao_near_start, 1.0, "PGR4 native",
