@@ -26,6 +26,7 @@ The build expects these folders side by side:
   rexglue-sdk\                 ReXGlue SDK, commit bd833a2 + patches\rexglue-sdk.diff
   thirdparty\fidelityfx-sdk\   AMD FidelityFX SDK (FSR SDK 2.3.0)
   thirdparty\streamline\       NVIDIA Streamline SDK 2.14.16 (+ patch)
+  thirdparty\XeGTAO\           Intel XeGTAO (XeGTAO.h, XeGTAO.hlsli, LICENSE)
 ```
 
 ## Build
@@ -62,10 +63,15 @@ Run every command from a *x64 Native Tools Command Prompt for VS 2022* with LLVM
    `patches\streamline-sl_pcl-cxx23-to_underlying.diff` describes (`#if __cplusplus == 202302L`
    becomes `#if 0 && __cplusplus == 202302L`): the header does not compile in C++23 without it.
 
-4. **The game's executables**: copy the disc's `default.xex` and Title Update 2's
+4. **XeGTAO** (ambient occlusion, built into `pgr4.exe`): from
+   [GameTechDev/XeGTAO](https://github.com/GameTechDev/XeGTAO) (branch `master`), copy
+   `Source\Rendering\Shaders\XeGTAO.h`, `Source\Rendering\Shaders\XeGTAO.hlsli` and `LICENSE` into
+   `thirdparty\XeGTAO`.
+
+5. **The game's executables**: copy the disc's `default.xex` and Title Update 2's
    `default.xexp` into `pgr4\assets\`.
 
-5. **Code generation and build**:
+6. **Code generation and build**:
 
    ```
    cd pgr4
@@ -99,3 +105,15 @@ A controller is required.
 | `generated/rexglue.cmake` | the SDK's CMake boilerplate; the rest of `generated/` comes from codegen |
 
 The optional HD texture pack (`textures_hd.pak`) is not part of this repository.
+
+## Credits
+
+- [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk): the recompiler and runtime.
+- [pgr4-native](https://github.com/shaunsingh/pgr4-native) (MIT): the D3D12 renderer this one
+  started from.
+- [RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock) by dashdogy (MIT): DLSS Multi
+  Frame Generation on RTX 40 series GPUs (`pgr4-native/src/native/mfg_unlock*`).
+- [XeGTAO](https://github.com/GameTechDev/XeGTAO) by Intel (MIT): the ambient occlusion under DLSS
+  and FSR.
+- [PGR4-ReGPU](https://github.com/zer0ducksgiven/PGR4-ReGPU) (MIT): the cars' projected shadow fix
+  and the method of recording the driver's calls on their own thread.

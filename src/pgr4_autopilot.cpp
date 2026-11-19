@@ -52,6 +52,7 @@ extern float g_pgr4_camera_eye[3];  // pgr4-native draw.cpp: the road draws' eye
 extern int g_pgr4_weather_kind;  // pgr4-native draw.cpp
 extern const uint8_t* g_pgr4_guest_base;  // pgr4-native draw.cpp
 extern bool g_pgr4_light_rain;
+extern bool g_pgr4_race_loaded;  // pgr4-native draw.cpp
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -505,6 +506,7 @@ void Pgr4RaceWeather(const uint8_t* base) {
     }
     break;
   }
+  g_pgr4_race_loaded = g_pgr4_weather_kind >= 0;  // until a screen loads (src/pgr4_menu.cpp)
   REXLOG_INFO("PGR4 race: {} (CityID {}) route {} reverse {}, weather {} (kind {}, LightingID {}), Puddles {} "
               "RaceModeID {} WeatherScriptID {} TrackSurface {}",
               city_name, city, be32(kRace + 0xC), uint32_t(base[kRace + 0x10]), weather_name,

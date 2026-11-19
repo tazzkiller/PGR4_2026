@@ -66,6 +66,8 @@ class GpuTimer {
   // The end of a list submitted mid-frame (D3D12Device::Submit): its span runs to the first
   // timestamp in the next list, the GPU's wait for that list.
   static uint64_t KeySubmit();
+  // Local change (pgr4 project): the scene effects (SceneEffects::Apply, the GTAO).
+  static uint64_t KeyEffects(uint32_t step);  // 0 targets, 1 depth, 2 occlusion, 3 blur, 4 apply
 
   // --pgr4_native_gpu_timing_shaders: draws are timed per (vertex shader, pixel shader) pair on
   // a surface pitch and MSAA mode instead of per render target set (KeyDrawShaders), and all

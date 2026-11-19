@@ -27,6 +27,15 @@ static float xe_ray_occluded = 0.0;
 // caller: the wet roads, shorter steps not jumping over a sign's thin plate).
 static float xe_ray_growth = 0.0;
 static int xe_ray_steps = 0;
+// Local change (19/11/2026, Tazz: « regarde autour des motos y'a comme un flou bizarre »): behind
+// a vehicle (the copy's alpha under 1: the game's cars and bikes write alpha 0 there, its motion
+// blur's mask, the scenery 1; the copy is taken at the scene's first resolve, before that blur; its
+// texel averages 2x2 pixels' alpha but keeps the nearest one's depth, so one of them a vehicle's is
+// enough: at 0.5, a bike's edges kept the 1.5 m and a thin halo of it), a hit only up to
+// this many metres behind it (plus 1 % of its distance) instead of kReflectThickness: the rays
+// passing well behind a bike counted as hitting it, and mirrored it over a rectangle of road around
+// it. Further behind, the ray goes on. 0: as any surface (set by the caller: the wet roads).
+static float xe_ray_vehicle = 0.0;
 
 // The copy's texel (x, y), the host's inverted depth and the clip's w of the world point p.
 float4 XeProject(float3 p) {
@@ -113,6 +122,14 @@ float3 XeTraceScene(float3 origin, float3 dir, float3 normal, int streak, float 
     if (p.z < scene && t * dot(d, normal) > min_rise) {
       // Behind the scene's surface there: a hit if not far behind it (the last step's length).
       const float scene_w = B / max(scene - A, 1e-7);
+      // A vehicle there (xe_ray_vehicle): a hit only that close behind it; further, the ray passed
+      // behind it (a bike is a few tens of centimetres thick) and goes on to what lies beyond.
+      if (xe_ray_vehicle > 0.0 && colors.Load(int4(p.xy, 0, 0)).a < 0.999 &&
+          p.w - scene_w >= xe_ray_vehicle + 0.01 * p.w) {
+        before = t;
+        t *= xe_ray_growth > 0.0 ? xe_ray_growth : kReflectGrowth;
+        continue;
+      }
       const float thickness = max(kReflectThickness + 0.04 * p.w, (t - before) * 1.5);
       hit = scene_w < far && (p.w - scene_w < thickness || xe_ray_occluded > 0.0);
       depth_fade = max(1.0 - smoothstep(0.5, 1.0, (p.w - scene_w) / thickness), xe_ray_occluded);

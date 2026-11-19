@@ -65,18 +65,40 @@ target_link_libraries(pgr4 PRIVATE d3d12 dxgi dxguid d3dcompiler cabinet)  # cab
 # below does not undo it (native/overlay.cpp).
 target_compile_definitions(pgr4 PRIVATE PGR4_SOURCE_TOML="${CMAKE_CURRENT_SOURCE_DIR}/pgr4.toml"
     PGR4_BUILD_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+# Intel's XeGTAO (MIT, local addition 16/11/2026, native/scene_effects.cpp): the menu's second
+# ambient occlusion. Its header for the constants' layout, and its shaders embedded (#embed) and
+# compiled at run time as the other scene effects.
+set(PGR4_XEGTAO "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/XeGTAO")
+target_compile_definitions(pgr4 PRIVATE PGR4_XEGTAO_H="${PGR4_XEGTAO}/XeGTAO.h"
+    PGR4_XEGTAO_HLSLI="${PGR4_XEGTAO}/XeGTAO.hlsli")
+# Its MIT license with the game (licenses\, which tools\export_release.ps1 exports).
+add_custom_command(TARGET pgr4 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pgr4>/licenses"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PGR4_XEGTAO}/LICENSE"
+        "$<TARGET_FILE_DIR:pgr4>/licenses/XeGTAO-LICENSE.txt")
 include("${PGR4_NATIVE_SRC}/native/shader_xlate.cmake")
 target_link_libraries(pgr4 PRIVATE pgr4_shader_xlate)
 
 # Write pgr4.pdb (the recompiled code already carries -gline-tables-only) so profilers and cdb
 # can name the sub_XXXXXXXX functions.
 target_link_options(pgr4 PRIVATE -g)
+# Local change (18/11/2026): line tables for the renderer's and the hooks' sources too, as the
+# recompiled code has, so a profile (xperf, llvm-symbolizer) gives their lines. Debug information
+# only: the optimizations are the same.
+set_source_files_properties(${PGR4_NATIVE_SOURCES} "${PGR4_NATIVE_SRC}/pgr4_d3d_trace.cpp"
+    src/pgr4_hooks.cpp PROPERTIES COMPILE_OPTIONS "-gline-tables-only")
 
 # Replacement textures (textures\<hash>.bin, pgr4-native textures.cpp: the title screen's logo
 # with its 2026 tag, made by tools/logo_2026/make_logo.py), beside the executable.
 add_custom_command(TARGET pgr4 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/textures" "$<TARGET_FILE_DIR:pgr4>/textures")
+# HD textures shipped loose, outside the HD pack (textures_hd\<hash>.dds over the pack's:
+# pgr4-native textures.cpp Hd), so that one fixed texture does not mean a new pack to download
+# (18/11/2026: the photo mode's focus ring, 4F4F8FBFC959A3DE).
+add_custom_command(TARGET pgr4 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/textures_hd" "$<TARGET_FILE_DIR:pgr4>/textures_hd")
 
 # Replacement pixel shaders (shaders\<ucode hash>.ps.hlsl, pgr4-native shader_replace.h).
 add_custom_command(TARGET pgr4 POST_BUILD

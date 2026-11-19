@@ -60,6 +60,9 @@ struct SystemConstantsWithSun {
   // The cars' grime in slot 4 (car_paint_hooks.hlsli): x its amount forced (below 0: the game's c220.x),
   // y 1 under frost and snow (else the game's coordinates), z its size off the frost, w the frost's fine grain.
   float dirt[4];
+  // Local change (18/11/2026): the water's draws only (zero otherwise), with pgr4_native_water_live: the
+  // race's weather's water tuning and the waves' clock (water_hooks.hlsli pgr4_water, draw.cpp).
+  float water[24];
 };
 static_assert(sizeof(rex::graphics::DxbcShaderTranslator::SystemConstants) % 16 == 0);
 

@@ -8,8 +8,9 @@
 // the DLSS preset is pgr4_native_dlss_preset's, E), Lua source generated each time it opens with the current settings, made
 // like Options\General.lua (SetupVariableSpinner rows, UIButtons.AddItem/SetSelection).
 //
-// Saving (A) asks for the screen "Options\PN_<one digit per row>.lua": the find hook decodes the
-// digits, queues the settings for the renderer (NativeRenderer::QueueSettings), writes pgr4.toml,
+// Saving (A) asks for the screen "Options\PN_<one digit per row>.lua" (the upscaler's page:
+// then DLSS's and FSR's own quality, sharpening and frame generation, 17/11/2026): the find hook
+// decodes the digits, queues the settings for the renderer (NativeRenderer::QueueSettings), writes pgr4.toml,
 // and gives the game the real Options\MainMenu.lua under that name. The rows' texts are our own
 // text ids (kTextBase + n) that the text lookup sub_8289B1D0 resolves to UTF-16BE strings in
 // guest memory.
@@ -48,6 +49,7 @@
 
 REXCVAR_DECLARE(bool, pgr4_native_dlss);
 REXCVAR_DECLARE(std::string, pgr4_native_dlss_mode);
+REXCVAR_DECLARE(std::string, pgr4_native_fsr_mode);  // pgr4-native upscaler.cpp
 REXCVAR_DECLARE(std::string, pgr4_native_dlss_preset);
 REXCVAR_DECLARE(bool, pgr4_native_dlss_fg);
 REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_frames);
@@ -60,7 +62,9 @@ REXCVAR_DECLARE(bool, fullscreen);
 REXCVAR_DECLARE(bool, fullscreen_exclusive);
 REXCVAR_DECLARE(std::string, fullscreen_resolution);
 extern bool g_pgr4_race_screen;  // pgr4-native draw.cpp
+extern bool g_pgr4_race_loaded;  // pgr4-native draw.cpp: the race's weather read, no screen since
 REXCVAR_DECLARE(bool, pgr4_disable_motion_blur);
+REXCVAR_DECLARE(bool, pgr4_native_dlss_no_motion_blur);  // pgr4-native renderer.cpp
 REXCVAR_DECLARE(int32_t, pgr4_native_present_interval);
 REXCVAR_DECLARE(int32_t, pgr4_native_brightness);
 REXCVAR_DECLARE(std::string, pgr4_script_dump_dir);
@@ -237,7 +241,7 @@ const char16_t* const kTexts[kTextCount] = {
     nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr, nullptr,
     nullptr,  u"X2",    u"X3",    u"X4",    u"X5",    u"X6",    u"MSAA",
     u"DLSS FRAME GENERATION", u"FSR FRAME GENERATION", nullptr, u"60%", u"70%", u"80%", u"90%",
-    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.3 (TAZZ)",
+    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.4 (TAZZ)",
 };
 
 // The others, in each of the game's languages (the loc folders' order), every glyph one the game's
@@ -1063,7 +1067,10 @@ std::vector<ScreenMode> ScreenModes() {
     return a.width * a.height != b.width * b.height ? a.width * a.height < b.width * b.height
                                                     : a.width < b.width;
   });
-  while (modes.size() > 10) modes.erase(modes.begin());
+  // The ten largest, the desktop's among them (local change, 17/11/2026: with ten larger ones it
+  // was dropped, and the page showed and saved the largest instead).
+  while (modes.size() > 10)
+    modes.erase(modes.begin() + (modes.front() == desktop && modes.size() > 1 ? 1 : 0));
   std::lock_guard<std::mutex> lock(g_modes_mutex);
   g_modes = modes;
   return modes;
@@ -1177,7 +1184,16 @@ struct Row {
 
 // The page's values: the upscaler (0 native, 1 DLSS, 2 FSR) and the others as row indices.
 struct Values {
-  int upscaler = 0, mode = 0, framegen = 0, scale = 1, msaa = 1, aniso = 0;
+  int upscaler = 0, scale = 1, msaa = 1, aniso = 0;
+  // Local change (17/11/2026): each upscaler its own, [1] DLSS's and [2] FSR's ([0] unused): the
+  // quality mode (index in kModes), the frame generation (off / on) and the sharpening (0.00 to
+  // 1.00 in 0.05 steps, kSharp0..kSharp20). The page shows those of the upscaler chosen on it
+  // (ShownKind). Before, one quality mode served both (pgr4_native_dlss_mode), the frame
+  // generation row set DLSS-G and FSR's together, and the page showed the sharpening of the
+  // upscaler in use whichever it was shown for: a change for one changed the other.
+  int mode[3] = {0, 0, 0};
+  int framegen[3] = {0, 0, 0};
+  int sharp[3] = {3, 3, 3};
   int window = 1;  // windowed, borderless, exclusive fullscreen (the SDK's window cvars)
   int blur = 0;    // motion blur off / on (pgr4_disable_motion_blur)
   int res = 0;     // index in ScreenModes (fullscreen_resolution)
@@ -1185,12 +1201,10 @@ struct Values {
   int bright = 4;  // index in kBrightLevels (pgr4_native_brightness)
   int fps = 0;     // index in FpsChoices (pgr4_native_present_interval, pgr4_native_fps_limit)
   int vsync = 1;   // off / on (d3d12_present_vsync)
-  int gtao = 0;    // off / on (pgr4_native_gtao)
+  int gtao = 0;    // off / on (pgr4_native_gtao; the method follows the image: scene_effects.cpp)
   int hd = 1;      // HD textures off / on (pgr4_native_texture_hd)
   int reflect = 0;  // enhanced effects off / on (pgr4_native_enhanced_reflections)
   int details = 0;  // enhanced details: original, high, ultra (pgr4_native_details)
-  // The sharpening of the upscaler shown, 0.00 to 1.00 in 0.05 steps (kSharp0..kSharp20).
-  int sharp = 3;
   int aspect = 0;  // index in kAspects (pgr4_render_height): auto, 16:9, 16:10, 21:9, 32:9
 };
 
@@ -1205,12 +1219,16 @@ Values CurrentValues() {
   const bool dlss_ok = pgr4::native::streamline::Active();
   Values v;
   v.upscaler = !(r && r->upscaler_on()) ? 0 : (dlss_ok && REXCVAR_GET(pgr4_native_dlss) ? 1 : 2);
-  v.mode = ModeIndex(REXCVAR_GET(pgr4_native_dlss_mode));
-  v.framegen = (v.upscaler == 1 ? REXCVAR_GET(pgr4_native_dlss_fg)
-                                : REXCVAR_GET(pgr4_native_frame_generation))
-                   ? 1
-                   : 0;
-  v.dlssfg = REXCVAR_GET(pgr4_native_dlss_fg) ? int(pgr4::native::streamline::GeneratedFrames()) : 0;
+  v.mode[1] = ModeIndex(REXCVAR_GET(pgr4_native_dlss_mode));
+  v.mode[2] = ModeIndex(REXCVAR_GET(pgr4_native_fsr_mode));
+  v.framegen[1] = REXCVAR_GET(pgr4_native_dlss_fg) ? 1 : 0;
+  v.framegen[2] = REXCVAR_GET(pgr4_native_frame_generation) ? 1 : 0;
+  // As its row can show it (RowsFor: x2 to x6, up to the maximum), so that an unchanged row is
+  // not taken for a change (ApplyPage).
+  v.dlssfg = REXCVAR_GET(pgr4_native_dlss_fg)
+                 ? int(std::min({pgr4::native::streamline::GeneratedFrames(), 5u,
+                                 pgr4::native::streamline::MaxGeneratedFrames()}))
+                 : 0;
   v.scale = std::clamp(REXCVAR_GET(pgr4_native_resolution_scale), 1, 4) - 1;
   v.aspect = IndexOf(kAspects, int(REXCVAR_GET(pgr4_render_height)), 0);
   // The level nearest the setting.
@@ -1222,25 +1240,37 @@ Values CurrentValues() {
   v.aniso = IndexOf(kAniso, int(REXCVAR_GET(pgr4_native_anisotropy)), 0);
   v.window = !REXCVAR_GET(fullscreen) ? 0 : (REXCVAR_GET(fullscreen_exclusive) ? 2 : 1);
   v.blur = REXCVAR_GET(pgr4_disable_motion_blur) ? 0 : 1;
+  // Local change (18/11/2026): the blur is off while DLSS runs (NativeRenderer::
+  // ApplyMotionBlurRule): the row says so.
+  if (r && r->dlss_running() && REXCVAR_GET(pgr4_native_dlss_no_motion_blur)) v.blur = 0;
   const std::string vsync = rex::cvar::GetFlagByName("d3d12_present_vsync");
   v.vsync = vsync == "true" || vsync == "1" ? 1 : 0;
   v.gtao = REXCVAR_GET(pgr4_native_gtao) ? 1 : 0;
   v.hd = REXCVAR_GET(pgr4_native_texture_hd) ? 1 : 0;
   v.reflect = REXCVAR_GET(pgr4_native_enhanced_reflections) ? 1 : 0;
   v.details = std::clamp(REXCVAR_GET(pgr4_native_details), 0, 2);
-  // The upscaler's in use (FSR's when it is FSR, else DLSS's).
-  const double sharp = v.upscaler == 2 ? REXCVAR_GET(pgr4_native_sharpen_fsr)
-                                       : REXCVAR_GET(pgr4_native_sharpen_dlss);
-  v.sharp = std::clamp(int(std::lround(sharp * 20)), 0, 20);
+  v.sharp[1] = std::clamp(int(std::lround(REXCVAR_GET(pgr4_native_sharpen_dlss) * 20)), 0, 20);
+  v.sharp[2] = std::clamp(int(std::lround(REXCVAR_GET(pgr4_native_sharpen_fsr) * 20)), 0, 20);
   const std::vector<ScreenMode> modes = ScreenModes();
   const ScreenMode chosen = ChosenMode();
+  // A mode the list lacks (another screen's): the desktop's shown (local change, 17/11/2026; the
+  // largest before). Only shown: the page writes the row only when the player changes it.
   v.res = int(modes.size()) - 1;
+  for (size_t i = 0; i < modes.size(); ++i)
+    if (modes[i] == DesktopMode()) v.res = int(i);
   for (size_t i = 0; i < modes.size(); ++i)
     if (modes[i] == chosen) v.res = int(i);
   const std::vector<FpsChoice> fps = FpsChoices();
   const int limit = std::max(0, int(REXCVAR_GET(pgr4_native_fps_limit)));
   const FpsChoice now{limit ? 1 : int(REXCVAR_GET(pgr4_native_present_interval)), limit};
+  // A frame rate the list lacks (another screen's refresh rate, a limit set in pgr4.toml): the
+  // nearest shown (local change, 17/11/2026; the fastest before), the setting kept unless changed.
+  const int hz = g_screen_hz.load();
   v.fps = int(fps.size()) - 1;
+  for (size_t i = 0; i < fps.size(); ++i)
+    if (std::abs(FpsRate(fps[i], hz) - FpsRate(now, hz)) <
+        std::abs(FpsRate(fps[size_t(v.fps)], hz) - FpsRate(now, hz)))
+      v.fps = int(i);
   for (size_t i = 0; i < fps.size(); ++i)
     if (fps[i] == now) v.fps = int(i);
   return v;
@@ -1250,6 +1280,12 @@ Values CurrentValues() {
 bool MfgRow() {
   return pgr4::native::streamline::FrameGenerationActive() &&
          pgr4::native::streamline::MaxGeneratedFrames() > 1;
+}
+
+// The upscaler whose own values the page shows: the one chosen on it, else (MSAA, its rows hidden)
+// DLSS where it is available, FSR otherwise.
+int ShownKind(const Values& v) {
+  return v.upscaler ? v.upscaler : (pgr4::native::streamline::Active() ? 1 : 2);
 }
 
 // The page's rows, all of them: the page shows MSAA without an upscaler, the quality and frame
@@ -1287,6 +1323,8 @@ std::vector<Row> RowsFor(Page page, const Values& v) {
     rows.push_back({"details", kDetailsRow, {kDetailOriginal, kDetailHigh, kDetailUltra}, v.details});
     // GTAO (in races, the garage, replays and the photo mode): hidden on 03/11/2026 (1.3 ms a frame at
     // scale 3 for little to see), back on 14/11/2026 at Tazz's request; off by default (pgr4_native_gtao).
+    // One choice for both of the renderer's occlusions (16/11/2026): ours with MSAA, Intel's
+    // XeGTAO under an upscaler (pgr4-native scene_effects.cpp, pgr4_native_ao_method).
     rows.push_back({"ao", kAoRow, {kOff, kGtaoRow}, v.gtao});
     rows.push_back(
         {"aniso", kAnisoRow, {kAnisoGame, kAniso2, kAniso4, kAniso8, kAniso16}, v.aniso});
@@ -1297,23 +1335,25 @@ std::vector<Row> RowsFor(Page page, const Values& v) {
     rows.push_back({"upscaler", kUpscaler, {kUpscalerOff, kUpscalerDlss, kUpscalerFsr}, v.upscaler});
   else
     rows.push_back({"upscaler", kUpscaler, {kUpscalerOff, kUpscalerFsr}, v.upscaler ? 1 : 0});
-  // The quality mode, DLSS's or FSR's (Upscaler::Initialize); the DLSS preset is the setting's (E).
+  // The quality mode, DLSS's or FSR's (Upscaler::Initialize), each its own; the DLSS preset is the
+  // setting's (E).
+  const int kind = ShownKind(v);
   rows.push_back({"mode",
                   kQuality,
                   {kModeAuto, kModeDlaa, kModeQuality, kModeBalanced, kModePerformance,
                    kModeUltra},
-                  v.mode});
+                  v.mode[kind]});
   // The upscaler's sharpening (Upscaler::Sharpen, its CAS after DLSS or FSR), one per upscaler:
   // the one chosen on the page gets it. Restored 31/10/2026 (only in the overlay since the
   // per-upscaler settings, absent from both menus).
   {
     std::vector<Text> items;
     for (int i = 0; i <= 20; ++i) items.push_back(Text(kSharp0 + i));
-    rows.push_back({"sharp", kSharpRow, items, v.sharp});
+    rows.push_back({"sharp", kSharpRow, items, v.sharp[kind]});
   }
   // Frame generation with the upscaler's own: DLSS-G with DLSS, FidelityFX's with FSR.
   if (pgr4::native::streamline::FrameGenerationActive() || (r && r->CanFsrFrameGeneration()))
-    rows.push_back({"framegen", kFrameGen, {kOff, kOn}, v.framegen});
+    rows.push_back({"framegen", kFrameGen, {kOff, kOn}, v.framegen[kind]});
   // DLSS-G's multipliers in its place when it generates more than one frame (an RTX 50, or an
   // RTX 40 unlocked: mfg_unlock.h): off, x2 up to x(maximum + 1).
   if (MfgRow()) {
@@ -1350,8 +1390,8 @@ Values DecodePage(const std::string& digits) {
     if (d < 0 || d >= int(g_page_rows[i].items.size())) continue;
     const std::string_view name = g_page_rows[i].name;
     if (name == "upscaler" || name == "image") v.upscaler = dlss_ok ? d : (d ? 2 : 0);
-    else if (name == "mode") v.mode = d;
-    else if (name == "framegen") v.framegen = d;
+    else if (name == "mode") v.mode[ShownKind(v)] = d;
+    else if (name == "framegen") v.framegen[ShownKind(v)] = d;
     else if (name == "dlssfg") v.dlssfg = d;
     else if (name == "scale") v.scale = d;
     else if (name == "aspect") v.aspect = d;
@@ -1364,10 +1404,25 @@ Values DecodePage(const std::string& digits) {
     else if (name == "hd") v.hd = d;
     else if (name == "reflect") v.reflect = d;
     else if (name == "details") v.details = d;
-    else if (name == "sharp") v.sharp = d;
+    else if (name == "sharp") v.sharp[ShownKind(v)] = d;
     else if (name == "blur") v.blur = d;
     else if (name == "fps") v.fps = d;
     else if (name == "vsync") v.vsync = d;
+  }
+  // The upscaler's page: after its rows, DLSS's then FSR's quality mode, sharpening and frame
+  // generation (PN_Digits, PN_per), each as last chosen for it on the page.
+  if (g_page == kImagePage && digits.size() == g_page_rows.size() + 6) {
+    for (int kind = 1; kind <= 2; ++kind) {
+      int d[3];
+      for (int k = 0; k < 3; ++k) {
+        const char c = char(std::tolower(
+            static_cast<unsigned char>(digits[g_page_rows.size() + size_t(kind - 1) * 3 + k])));
+        d[k] = c >= 'a' && c <= 'z' ? c - 'a' + 10 : c - '0';
+      }
+      if (d[0] >= 0 && d[0] < int(std::size(kModes))) v.mode[kind] = d[0];
+      if (d[1] >= 0 && d[1] <= 20) v.sharp[kind] = d[1];
+      if (d[2] == 0 || d[2] == 1) v.framegen[kind] = d[2];
+    }
   }
   return v;
 }
@@ -1393,6 +1448,18 @@ std::string PageScript(Page page, const Values& values) {
   s += pgr4::native::streamline::Active() ? "PN_kinds = {[0] = 0, [1] = 1, [2] = 2}\n"
                                           : "PN_kinds = {[0] = 0, [1] = 2}\n";
   s += std::string("PN_mfg = ") + (MfgRow() ? "true" : "false") + "\n";
+  // The upscaler's page: each upscaler's own quality mode, sharpening and frame generation, put on
+  // the rows when it is chosen there (FrameUpdate) and sent after them (PN_Digits).
+  if (page == kImagePage) {
+    s += "PN_per = {";
+    for (int kind = 1; kind <= 2; ++kind)
+      s += "[" + std::to_string(kind) + "] = {" + std::to_string(values.mode[kind]) + ", " +
+           std::to_string(values.sharp[kind]) + ", " + std::to_string(values.framegen[kind]) +
+           "}, ";
+    s += "}\n";
+  } else {
+    s += "PN_per = nil\n";
+  }
   s += std::string("PN_fg = {[1] = ") +
        (pgr4::native::streamline::FrameGenerationActive() ? "true" : "false") + ", [2] = " +
        (r && r->CanFsrFrameGeneration() ? "true" : "false") + "}\n";
@@ -1588,20 +1655,45 @@ function PN_AskRestart()
 end
 -- One character per row: 0-9, then a, b, c... from 10 (the sharpening's 21 steps).
 PN_letters = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p"}
+function PN_Char(s)
+  if s >= 10 then return PN_letters[s - 9] end
+  return "" .. s
+end
+-- The rows of the upscaler `kind` (1 DLSS, 2 FSR) into PN_per, or PN_per's onto them.
+function PN_Keep(kind)
+  if PN_per == nil or PN_per[kind] == nil then return end
+  PN_per[kind][1] = UIButtons.GetSelection(GUI.mode_ID)
+  PN_per[kind][2] = UIButtons.GetSelection(GUI.sharp_ID)
+  if GUI.framegen_ID ~= nil then PN_per[kind][3] = UIButtons.GetSelection(GUI.framegen_ID) end
+end
+function PN_Load(kind)
+  if PN_per == nil or PN_per[kind] == nil then return end
+  UIButtons.SetSelection(GUI.mode_ID, PN_per[kind][1])
+  UIButtons.SetSelection(GUI.sharp_ID, PN_per[kind][2])
+  if GUI.framegen_ID ~= nil then UIButtons.SetSelection(GUI.framegen_ID, PN_per[kind][3]) end
+end
 function PN_Digits()
   local digits = ""
   for i = 1, #PN_rows do
-    local s = UIButtons.GetSelection(GUI[PN_rows[i]])
-    if s >= 10 then s = PN_letters[s - 9] end
-    digits = digits .. s
+    digits = digits .. PN_Char(UIButtons.GetSelection(GUI[PN_rows[i]]))
+  end
+  -- The upscaler's page: DLSS's then FSR's own values after the rows (DecodePage).
+  if PN_per ~= nil and GUI.upscaler_ID ~= nil then
+    PN_Keep(PN_kinds[UIButtons.GetSelection(GUI.upscaler_ID)] or 0)
+    for kind = 1, 2 do
+      digits = digits .. PN_Char(PN_per[kind][1]) .. PN_Char(PN_per[kind][2]) .. PN_Char(PN_per[kind][3])
+    end
   end
   return digits
 end
--- Another upscaler: its rows in place (nothing applied before A).
+-- Another upscaler: its rows in place, with its own quality, sharpening and frame generation
+-- (nothing applied before A).
 function FrameUpdate(a)
   if GUI.finished == true or GUI.upscaler_start == nil then return end
   local now = UIButtons.GetSelection(GUI.upscaler_ID)
   if now ~= GUI.upscaler_start then
+    PN_Keep(PN_kinds[GUI.upscaler_start] or 0)
+    PN_Load(PN_kinds[now] or 0)
     GUI.upscaler_start = now
     PN_Layout()
     ActivateOptions()
@@ -1644,45 +1736,105 @@ bool Pgr4RestartThroughLauncher() {
   return true;
 }
 
-void ApplyPage(const Values& want, bool restart = false) {
+// What the player changed on the page, `want` against `opened` (the values it opened with), for
+// the log: "row from -> to, ...", empty when nothing.
+std::string PageChanges(const Values& opened, const Values& want) {
+  std::string out;
+  const auto note = [&out](const char* name, int from, int to) {
+    if (from == to) return;
+    out += std::string(out.empty() ? "" : ", ") + name + " " + std::to_string(from) + " -> " +
+           std::to_string(to);
+  };
+  note("upscaler", opened.upscaler, want.upscaler);
+  note("dlss mode", opened.mode[1], want.mode[1]);
+  note("fsr mode", opened.mode[2], want.mode[2]);
+  note("dlss sharpening", opened.sharp[1], want.sharp[1]);
+  note("fsr sharpening", opened.sharp[2], want.sharp[2]);
+  note("dlss-g", opened.framegen[1], want.framegen[1]);
+  note("fsr frame generation", opened.framegen[2], want.framegen[2]);
+  note("dlss-g frames", opened.dlssfg, want.dlssfg);
+  note("scale", opened.scale, want.scale);
+  note("aspect", opened.aspect, want.aspect);
+  note("msaa", opened.msaa, want.msaa);
+  note("aniso", opened.aniso, want.aniso);
+  note("window", opened.window, want.window);
+  note("res", opened.res, want.res);
+  note("fps", opened.fps, want.fps);
+  note("vsync", opened.vsync, want.vsync);
+  note("brightness", opened.bright, want.bright);
+  note("ao", opened.gtao, want.gtao);
+  note("hd", opened.hd, want.hd);
+  note("reflections", opened.reflect, want.reflect);
+  note("details", opened.details, want.details);
+  note("blur", opened.blur, want.blur);
+  return out;
+}
+
+// Local change (17/11/2026): only the rows the player changed on the page (`want` against
+// `opened`, the values the page opened with: g_page_values), the others left as they are now.
+// Before, every save wrote every setting from the page's values: DISPLAY wrote GRAPHICS's and the
+// other way round, a value a row cannot show exactly (a brightness between its steps, a frame rate
+// limit or a screen mode it does not list) was replaced by the one it showed, and a change made
+// meanwhile elsewhere (the overlay) was undone.
+void ApplyPage(const Values& want, const Values& opened, bool restart = false) {
   NativeRenderer* r = NativeRenderer::Live();
   if (!r) return;
   const Values now = CurrentValues();
-  // The screen resolution: exclusive fullscreen's mode, which a mode other than the desktop's
-  // needs (borderless is at the desktop's; the window keeps its size).
-  const std::vector<ScreenMode> modes = ScreenModes();
-  const ScreenMode mode = modes[std::clamp(want.res, 0, int(modes.size()) - 1)];
-  const bool desktop = mode == DesktopMode();
-  const std::string res = desktop ? "" : ModeName(mode);
-  if (res != REXCVAR_GET(fullscreen_resolution))
-    rex::cvar::SetFlagByName("fullscreen_resolution", res);
-  const int window = !desktop && want.window == 1 ? 2 : want.window;
-  if (window != now.window) {
-    rex::cvar::SetFlagByName("fullscreen_exclusive", window == 2 ? "true" : "false");
-    rex::cvar::SetFlagByName("fullscreen", window != 0 ? "true" : "false");
+  const std::string changes = PageChanges(opened, want);
+  // The window and the screen resolution: exclusive fullscreen's mode, which a mode other than the
+  // desktop's needs (borderless is at the desktop's; the window keeps its size). Another resolution
+  // chosen in borderless: exclusive; borderless chosen alone: at the desktop's resolution (local
+  // change, 17/11/2026: it was turned back into exclusive without a word).
+  const bool res_changed = want.res != opened.res;
+  if (res_changed || want.window != opened.window) {
+    const std::vector<ScreenMode> modes = ScreenModes();
+    ScreenMode mode =
+        res_changed ? modes[std::clamp(want.res, 0, int(modes.size()) - 1)] : ChosenMode();
+    int window = want.window;
+    if (window == 1 && !(mode == DesktopMode())) {
+      if (res_changed)
+        window = 2;
+      else
+        mode = DesktopMode();
+    }
+    const std::string res = mode == DesktopMode() ? "" : ModeName(mode);
+    if (res != REXCVAR_GET(fullscreen_resolution))
+      rex::cvar::SetFlagByName("fullscreen_resolution", res);
+    if (window != now.window) {
+      rex::cvar::SetFlagByName("fullscreen_exclusive", window == 2 ? "true" : "false");
+      rex::cvar::SetFlagByName("fullscreen", window != 0 ? "true" : "false");
+    }
   }
   // Read where they act (the motion blur flag, the frame limiter): set as they are.
-  const std::vector<FpsChoice> fps = FpsChoices();
-  const FpsChoice& chosen = fps[std::clamp(want.fps, 0, int(fps.size()) - 1)];
-  REXCVAR_SET(pgr4_native_present_interval, chosen.interval);
-  REXCVAR_SET(pgr4_native_fps_limit, chosen.limit);
+  if (want.fps != opened.fps) {
+    const std::vector<FpsChoice> fps = FpsChoices();
+    const FpsChoice& chosen = fps[std::clamp(want.fps, 0, int(fps.size()) - 1)];
+    REXCVAR_SET(pgr4_native_present_interval, chosen.interval);
+    REXCVAR_SET(pgr4_native_fps_limit, chosen.limit);
+  }
   // Read at each frame.
-  rex::cvar::SetFlagByName("d3d12_present_vsync", want.vsync ? "true" : "false");
+  if (want.vsync != opened.vsync)
+    rex::cvar::SetFlagByName("d3d12_present_vsync", want.vsync ? "true" : "false");
   // Read at each present.
-  REXCVAR_SET(pgr4_native_brightness, kBrightLevels[std::clamp(want.bright, 0, 9)]);
+  if (want.bright != opened.bright)
+    REXCVAR_SET(pgr4_native_brightness, kBrightLevels[std::clamp(want.bright, 0, 9)]);
   // Read at each frame.
-  REXCVAR_SET(pgr4_native_gtao, want.gtao != 0);
-  REXCVAR_SET(pgr4_native_texture_hd, want.hd != 0);
-  REXCVAR_SET(pgr4_native_enhanced_reflections, want.reflect != 0);
-  REXCVAR_SET(pgr4_native_details, std::clamp(want.details, 0, 2));
+  if (want.gtao != opened.gtao) REXCVAR_SET(pgr4_native_gtao, want.gtao != 0);
+  if (want.hd != opened.hd) REXCVAR_SET(pgr4_native_texture_hd, want.hd != 0);
+  if (want.reflect != opened.reflect)
+    REXCVAR_SET(pgr4_native_enhanced_reflections, want.reflect != 0);
+  if (want.details != opened.details)
+    REXCVAR_SET(pgr4_native_details, std::clamp(want.details, 0, 2));
   // Read where the game's motion blur is set up (src/pgr4_hooks.cpp).
-  REXCVAR_SET(pgr4_disable_motion_blur, want.blur == 0);
-  // Read at each upscale: the sharpening of the upscaler chosen.
-  if (want.upscaler == 1) REXCVAR_SET(pgr4_native_sharpen_dlss, want.sharp * 0.05);
-  if (want.upscaler == 2) REXCVAR_SET(pgr4_native_sharpen_fsr, want.sharp * 0.05);
-  r->QueueSettings([r, want, now, restart] {
+  if (want.blur != opened.blur) REXCVAR_SET(pgr4_disable_motion_blur, want.blur == 0);
+  // Read at each upscale: each upscaler's own sharpening.
+  if (want.sharp[1] != opened.sharp[1])
+    REXCVAR_SET(pgr4_native_sharpen_dlss, want.sharp[1] * 0.05);
+  if (want.sharp[2] != opened.sharp[2])
+    REXCVAR_SET(pgr4_native_sharpen_fsr, want.sharp[2] * 0.05);
+  r->QueueSettings([r, want, opened, changes, restart] {
     bool recreate = false, rebuild = false, msaa = false;
-    if (want.upscaler != now.upscaler) {
+    if (want.upscaler != opened.upscaler) {
       if (want.upscaler) {
         const bool dlss = want.upscaler == 1;
         if (dlss != REXCVAR_GET(pgr4_native_dlss)) recreate = true;
@@ -1690,45 +1842,54 @@ void ApplyPage(const Values& want, bool restart = false) {
       }
       r->RequestUpscaler(want.upscaler != 0);
     }
-    if (want.upscaler) {
-      if (want.mode != now.mode) {
-        REXCVAR_SET(pgr4_native_dlss_mode, std::string(kModes[want.mode]));
-        recreate = true;
-      }
-      // Both frame generations follow the row, whichever upscaler it was shown for; DLSS-G its
-      // own with Multi Frame Generation.
-      if (MfgRow()) {
+    // Each upscaler its own quality mode (local change, 17/11/2026), the upscaler on or not; the
+    // one in use made again when its own changed.
+    if (want.mode[1] != opened.mode[1]) {
+      REXCVAR_SET(pgr4_native_dlss_mode, std::string(kModes[want.mode[1]]));
+      if (want.upscaler == 1) recreate = true;
+    }
+    if (want.mode[2] != opened.mode[2]) {
+      REXCVAR_SET(pgr4_native_fsr_mode, std::string(kModes[want.mode[2]]));
+      if (want.upscaler == 2) recreate = true;
+    }
+    // Each frame generation its own choice (local change, 17/11/2026; before, both followed the
+    // row whichever upscaler it was shown for): DLSS-G its row's, or its multiplier's with Multi
+    // Frame Generation, FSR's its own.
+    if (MfgRow()) {
+      if (want.dlssfg != opened.dlssfg) {
         REXCVAR_SET(pgr4_native_dlss_fg, want.dlssfg > 0);
         if (want.dlssfg > 0) REXCVAR_SET(pgr4_native_dlss_fg_frames, want.dlssfg);
-      } else {
-        REXCVAR_SET(pgr4_native_dlss_fg, want.framegen == 1);
       }
-      if (r->CanFsrFrameGeneration()) {
-        REXCVAR_SET(pgr4_native_frame_generation, want.framegen == 1);
-        r->RequestFsrFrameGeneration();
-      }
-    } else {
-      if (want.msaa != now.msaa) {
-        REXCVAR_SET(pgr4_native_msaa, kMsaa[want.msaa]);
-        msaa = true;
-      }
+    } else if (want.framegen[1] != opened.framegen[1]) {
+      REXCVAR_SET(pgr4_native_dlss_fg, want.framegen[1] == 1);
     }
-    if (want.scale != now.scale) {
+    if (want.framegen[2] != opened.framegen[2])
+      REXCVAR_SET(pgr4_native_frame_generation, want.framegen[2] == 1);
+    if (want.upscaler && r->CanFsrFrameGeneration()) r->RequestFsrFrameGeneration();
+    if (!want.upscaler && want.msaa != opened.msaa) {
+      REXCVAR_SET(pgr4_native_msaa, kMsaa[want.msaa]);
+      msaa = true;
+    }
+    if (want.scale != opened.scale) {
       REXCVAR_SET(pgr4_native_resolution_scale, want.scale + 1);
       rebuild = true;
     }
     // The image format: read at the start (pgr4-native fidelityfx.cpp), saved for the restart the
     // page asked for.
-    if (want.aspect != now.aspect)
+    if (want.aspect != opened.aspect)
       REXCVAR_SET(pgr4_render_height,
                   kAspects[std::clamp(want.aspect, 0, int(std::size(kAspects)) - 1)]);
-    if (want.aniso != now.aniso) {
+    if (want.aniso != opened.aniso) {
       REXCVAR_SET(pgr4_native_anisotropy, kAniso[want.aniso]);
       rebuild = true;
     }
     // The render scale asked for a restart: saved, the game started again (no launcher: live).
-    const std::string saved = pgr4::native::SaveRendererSettings(want.upscaler != 0);
-    REXLOG_INFO("PGR4 menu: settings applied; {}", saved);
+    // The upscaler as chosen, or as it is now when the page left it (its switch above is
+    // between frames, after this).
+    const std::string saved = pgr4::native::SaveRendererSettings(
+        want.upscaler != opened.upscaler ? want.upscaler != 0 : r->upscaler_on());
+    REXLOG_INFO("PGR4 menu: settings applied ({}); {}", changes.empty() ? "nothing changed" : changes,
+                saved);
     if (restart && Pgr4RestartThroughLauncher()) {
       REXLOG_INFO("PGR4 menu: restarting through the launcher");
       return;
@@ -2194,6 +2355,7 @@ REX_HOOK_RAW(sub_82883CC0) {
                                                       std::end(kSceneScreens),
                                                       rest) != std::end(kSceneScreens);
         g_pgr4_race_screen = g_gtao_screen;
+        g_pgr4_race_loaded = false;  // the screen says it from now on
       }
     }
   }
@@ -2311,7 +2473,7 @@ function EndLoop(a) return true end
   if (const size_t at = name.find("Intro\\PG_"); at != std::string::npos && EndsWith(name, ".lua")) {
     const size_t first = at + std::strlen("Intro\\PG_");
     const Values v = DecodePage(name.substr(first, name.size() - 4 - first));
-    ApplyPage(v);
+    ApplyPage(v, g_page_values);
     g_graphics_values = v;
     g_script = PageScript(kImagePage, v);
     return;
@@ -2320,7 +2482,7 @@ function EndLoop(a) return true end
   if (const size_t at = name.find("Intro\\PA_"); at != std::string::npos && EndsWith(name, ".lua")) {
     const size_t first = at + std::strlen("Intro\\PA_");
     const Values v = DecodePage(name.substr(first, name.size() - 4 - first));
-    ApplyPage(v);
+    ApplyPage(v, g_page_values);
     g_graphics_values = v;
     g_script = PageScript(kGraphicsPage, v);
     return;
@@ -2340,7 +2502,7 @@ function EndLoop(a) return true end
   if (const size_t at = name.find("Intro\\PX_"); at != std::string::npos && EndsWith(name, ".lua")) {
     const size_t first = at + std::strlen("Intro\\PX_");
     g_close_game = CloseGameWindow;
-    ApplyPage(DecodePage(name.substr(first, name.size() - 4 - first)), true);
+    ApplyPage(DecodePage(name.substr(first, name.size() - 4 - first)), g_page_values, true);
     g_script = kQuitScreen;
     return;
   }
@@ -2349,7 +2511,7 @@ function EndLoop(a) return true end
   if (at == std::string::npos) at = name.find("Intro\\PD_");
   if (at != std::string::npos && EndsWith(name, ".lua")) {
     const size_t first = at + std::strlen("Intro\\PN_");
-    ApplyPage(DecodePage(name.substr(first, name.size() - 4 - first)));
+    ApplyPage(DecodePage(name.substr(first, name.size() - 4 - first)), g_page_values);
     static uint32_t main_menu = 0;
     const std::string real =
         name.substr(0, at) + (g_from_pause ? "Ingame\\PauseMenu.lua" : "Intro\\MainMenu.lua");

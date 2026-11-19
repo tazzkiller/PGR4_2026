@@ -59,6 +59,12 @@ class ShaderReplacer {
     reflections_ = on;
   }
   uint64_t generation() const { return generation_.load(std::memory_order_acquire); }
+  // Local change (pgr4 project): changes whenever Has may answer otherwise (the files, on/off,
+  // the reflections, the decals' light): the draws' memo of their shaders' answers is keyed by it.
+  uint64_t stamp() const {
+    return generation() * 8 + (enabled_ ? 1 : 0) + (reflections_ ? 2 : 0) +
+           (decal_light_off_ ? 4 : 0) + uint64_t(files_.size()) * 0x100000000ull;
+  }
   ~ShaderReplacer();
   // The replacement bytecode for this translation of a pixel shader; nullptr: none (or its
   // compilation failed, logged once).
@@ -108,6 +114,7 @@ class ShaderReplacer {
   std::string tuning_;  // TuningDefines as last compiled with
   std::string tuning_wanted_;   // a changed tuning, applied once it held kTuningFrames
   uint32_t tuning_frames_ = 0;
+  int tuning_weather_ = -1;  // WaterWeather when tuning_ was taken
   static constexpr uint32_t kTuningFrames = 20;
   static std::string TuningDefines();
   std::unordered_map<uint64_t, std::filesystem::file_time_type> files_;
@@ -129,11 +136,30 @@ class ShaderReplacer {
     bool replace = false;  // a tuning's recompile: the code replaces the one in use when done
   };
   std::unordered_set<const void*> pending_;
+  std::unordered_set<const void*> stale_;  // pending when a tuning changed: compiled again once done
   std::deque<Job> jobs_;
   std::condition_variable jobs_cv_;
   std::vector<std::thread> workers_;
   bool stopping_ = false;
   void Work();
 };
+
+// Local change (17/11/2026, Tazz: the water glittered in heavy fog): the water's tuning
+// (water_hooks.hlsli), the general one (the pgr4_native_tune_wave_* cvars) or the race's weather's:
+// --pgr4_native_tune_water_<weather>, "key=value ..." over the general (keys: the fields' names),
+// empty for none. The water's shaders are compiled again when the weather changes it.
+struct WaterTuning {
+  float wave_strength, wave_steepness, wave_noise, wave_size, wave_speed, wind_angle,
+      water_reflect, sun_waves, haze;
+};
+// g_pgr4_weather_kind's 0 (clear) to 6 (heavy snow), then 7: light rain (its kind 3, a name with
+// "Light Rain": g_pgr4_light_rain), which takes the rain's tuning while it has none of its own.
+constexpr int kWaterWeathers = 8;
+int WaterWeather();  // the race's weather, -1 out of a race or unknown
+WaterTuning WaterGeneralTuning();
+void WaterSetGeneral(const WaterTuning& t);
+WaterTuning WaterTuningFor(int weather);  // the general one with the weather's overrides
+bool WaterHasOwn(int weather);
+void WaterSetOwn(int weather, const WaterTuning* t);  // nullptr: none (the general)
 
 }  // namespace pgr4::native

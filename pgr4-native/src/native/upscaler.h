@@ -266,4 +266,10 @@ class Upscaler {
   float dump_matrix_[16] = {};
 };
 
+// A camera cut the game made (--pgr4_native_game_camera_cuts), from its camera's update (the
+// game's thread): the first frame drawn from that eye (world, within 25 cm) restarts DLSS, FSR and
+// frame generation's history. why: a few words for the log. again: the camera updated again in
+// the frame of the last cut noted, whose eye becomes this one (the frame is drawn from the last).
+void NoteGameCameraCut(const float eye[3], const char* why, bool again = false);
+
 }  // namespace pgr4::native

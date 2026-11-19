@@ -52,6 +52,17 @@ enum Stage : uint32_t {
   kRecPso,   // SetPipelineState
   kRecRtv,   // the motion target and OMSetRenderTargets
   kRecDraw,  // the draw call, with its occlusion queries
+  // Local change (18/11/2026): nested inside kCbv: BindPreviousConstants (the motion vectors'
+  // previous constants: the matching draw of the previous frame).
+  kCbvMotion,
+  // Development (18/11/2026): the draws of the cars (vertex shaders vsCar*) and of the animated
+  // characters (vsSkinnedModel*), by shaders\shader_names.tsv (renderer.cpp VsFamily): their
+  // whole ExecuteDraw on the render thread, their QueueDraw on the guest thread. Not part of the
+  // Mark chain.
+  kDrawCar,
+  kDrawSkin,
+  kCapCar,
+  kCapSkin,
   kStageCount
 };
 
@@ -60,7 +71,8 @@ inline constexpr const char* kStageNames[kStageCount] = {
     "textures",   "sysconst", "pack",    "vertices",    "cbv",          "record",
     "submit",     "track",    "imm_vs",  "cap_shaders", "cap_vertices", "cap_record",
     "tex_miss",   "tex_get",  "tex_srv", "guest_d3d",   "upload_list",
-    "rec_pso",    "rec_rtv",  "rec_draw"};
+    "rec_pso",    "rec_rtv",  "rec_draw", "cbv_motion",
+    "draw_car",   "draw_skin", "cap_car",  "cap_skin"};
 
 // Per-frame event counts (CSV columns, reset every frame), counted while the profiler is on.
 enum Counter : uint32_t {
@@ -74,12 +86,15 @@ enum Counter : uint32_t {
   kGetMissChanged,   // same fetch dwords, texture changed
   kSrvMemoHit,       // SRV index from a memo (no XXH3 + map)
   kUploadSkipped,    // dirty texture not untiled: resolved images overwrite all of it
+  kDrawsCar,         // development (18/11/2026): the draws of kDrawCar
+  kDrawsSkin,        // and of kDrawSkin
   kCounterCount
 };
 
 inline constexpr const char* kCounterNames[kCounterCount] = {
     "bind_hit",    "bind_mru",       "bind_miss_empty",  "bind_miss_fetch", "bind_miss_tex",
-    "bind_nomemo", "get_miss_fetch", "get_miss_changed", "srv_memo_hit",    "tex_upload_skip"};
+    "bind_nomemo", "get_miss_fetch", "get_miss_changed", "srv_memo_hit",    "tex_upload_skip",
+    "draws_car",   "draws_skin"};
 
 // --pgr4_native_profile, set once by NativeRenderer::Initialize. Atomic because the hooks that
 // pass straight through read it on any guest thread without going through NativeRenderer::Get.

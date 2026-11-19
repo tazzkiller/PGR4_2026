@@ -40,6 +40,21 @@ uint32_t FfxSceneHeight();  // pgr4-native fidelityfx.cpp: the render height
 REXCVAR_DECLARE(bool, pgr4_native_upscaler);
 REXCVAR_DECLARE(bool, pgr4_native_dlss_fg);
 REXCVAR_DECLARE(bool, pgr4_native_frame_generation);
+REXCVAR_DECLARE(double, pgr4_native_gtao_radius);     // pgr4-native scene_effects.cpp
+REXCVAR_DECLARE(double, pgr4_native_gtao_intensity);
+REXCVAR_DECLARE(double, pgr4_native_gtao_distance);
+REXCVAR_DECLARE(bool, pgr4_native_gtao_full);
+REXCVAR_DECLARE(bool, pgr4_native_gpu_serialize_fg);  // pgr4-native d3d12_device.cpp
+REXCVAR_DECLARE(std::string, pgr4_native_dlss_mode);  // pgr4-native upscaler.cpp
+REXCVAR_DECLARE(std::string, pgr4_native_fsr_mode);
+REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_mvec_x);  // pgr4-native upscaler.cpp
+REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_mvec_y);
+// Local change (16/11/2026): the version of the settings in pgr4.toml, for Pgr4MigrateSettings.
+// A change of default reaches a pgr4.toml an earlier version wrote once, then the version is
+// raised: a value the player sets afterwards, the old default included, stays.
+REXCVAR_DEFINE_INT32(pgr4_settings_version, 0, "PGR4",
+                     "The version of the settings in pgr4.toml (0: written before V1.4); the game "
+                     "brings an older one up to date once");
 REXCVAR_DEFINE_STRING(pgr4_profile2_name, "", "PGR4",
                       "The second player's gamertag (split screen); empty: player 1's with \" 2\" "
                       "(made at the first launch)");
@@ -308,6 +323,89 @@ void Pgr4FirstLaunchConfig() {
   SaveSetting("pgr4_first_launch_done", "true", comment);
   REXLOG_INFO("PGR4 first launch: screen {}x{}, definition {}x{}, no upscaler, no frame "
               "generation", width, height, 1280 * scale, rows * scale);
+}
+
+// Pgr4App::OnPreLaunchModule, before the renderer reads its settings: settings whose defaults
+// changed, in a pgr4.toml an earlier version wrote. The game's Graphics page saves every renderer
+// setting (SaveRendererSettings), so a player who changed any of them has the GTAO's tuning too,
+// which only the developer overlay sets: its V1.3 defaults (radius 1 m, intensity 1, 300 m, half
+// size) exactly, all four, are taken for the old defaults and become the new ones (16/11/2026,
+// Tazz: 5 m, 0.15, 1500 m, full size). Any other value is a choice, kept.
+// Whether pgr4.toml beside the executable sets `key` (a line `key = ...`, not commented out).
+static bool HasSetting(const std::string& key) {
+  wchar_t exe[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  std::ifstream in(std::filesystem::path(exe).parent_path() / "pgr4.toml");
+  for (std::string line; std::getline(in, line);) {
+    const size_t start = line.find_first_not_of(" \t");
+    if (start == std::string::npos || line.compare(start, key.size(), key) != 0) continue;
+    const size_t eq = line.find_first_not_of(" \t", start + key.size());
+    if (eq != std::string::npos && line[eq] == '=') return true;
+  }
+  return false;
+}
+
+// Version 1 (V1.4): from V1.3's.
+static void MigrateToVersion1() {
+  // Local change (16/11/2026): a pgr4.toml written before the setting was in pgr4.default.toml
+  // gets it, with the value it already had (the built-in default), so the player can see it.
+  if (!HasSetting("pgr4_native_gpu_serialize_fg")) {
+    SaveSetting("pgr4_native_gpu_serialize_fg",
+                REXCVAR_GET(pgr4_native_gpu_serialize_fg) ? "true" : "false",
+                "# With DLSS Frame Generation, wait for the GPU at the end of every frame (CPU and "
+                "GPU in step):\n# against a wrong sky in the cars' reflections, at the cost of "
+                "some frames per second. Off.");
+    REXLOG_INFO("PGR4 settings: pgr4_native_gpu_serialize_fg added to pgr4.toml");
+  }
+  if (REXCVAR_GET(pgr4_native_gtao_radius) == 1.0 &&
+      REXCVAR_GET(pgr4_native_gtao_intensity) == 1.0 &&
+      REXCVAR_GET(pgr4_native_gtao_distance) == 300.0 && !REXCVAR_GET(pgr4_native_gtao_full)) {
+    REXCVAR_SET(pgr4_native_gtao_radius, 5.0);
+    REXCVAR_SET(pgr4_native_gtao_intensity, 0.15);
+    REXCVAR_SET(pgr4_native_gtao_distance, 1500.0);
+    REXCVAR_SET(pgr4_native_gtao_full, true);
+    const char* comment = "# Ambient occlusion's new defaults (src/pgr4_profile.cpp).";
+    SaveSetting("pgr4_native_gtao_radius", "5.000000", comment);
+    SaveSetting("pgr4_native_gtao_intensity", "0.150000", comment);
+    SaveSetting("pgr4_native_gtao_distance", "1500.000000", comment);
+    SaveSetting("pgr4_native_gtao_full", "true", comment);
+    REXLOG_INFO("PGR4 settings: the GTAO's old defaults in pgr4.toml replaced by the new ones");
+  }
+}
+
+void Pgr4MigrateSettings() {
+  // Local change (16/11/2026): each step once, for a pgr4.toml older than it (pgr4_settings_version;
+  // pgr4.default.toml has the current one). Before, the steps ran at every start: a player who
+  // chose the GTAO's old values again had them replaced at the next.
+  constexpr int32_t kSettingsVersion = 3;
+  const int32_t from = REXCVAR_GET(pgr4_settings_version);
+  if (from >= kSettingsVersion) return;
+  if (from < 1) MigrateToVersion1();
+  // Version 2 (17/11/2026): FSR's own quality mode (pgr4_native_fsr_mode), FSR having taken
+  // DLSS's until then: a pgr4.toml without it gets the one FSR used, DLSS's.
+  if (from < 2 && !HasSetting("pgr4_native_fsr_mode")) {
+    const std::string mode = REXCVAR_GET(pgr4_native_dlss_mode);
+    REXCVAR_SET(pgr4_native_fsr_mode, mode);
+    SaveSetting("pgr4_native_fsr_mode", "\"" + mode + "\"",
+                "# FSR's own quality mode (the same choices as DLSS's).");
+    REXLOG_INFO("PGR4 settings: pgr4_native_fsr_mode added to pgr4.toml ({}, DLSS's)", mode);
+  }
+  // Version 3 (19/11/2026, V1.4): DLSS-G's motion vectors as DLSS SR's (pgr4_native_dlss_fg_mvec_x
+  // and _y 1, with V1.4's motion vectors): a pgr4.toml holding V1.3's default (-1, -1) gets 1, 1;
+  // another value the player chose stays.
+  if (from < 3 && REXCVAR_GET(pgr4_native_dlss_fg_mvec_x) == -1 &&
+      REXCVAR_GET(pgr4_native_dlss_fg_mvec_y) == -1) {
+    REXCVAR_SET(pgr4_native_dlss_fg_mvec_x, 1);
+    REXCVAR_SET(pgr4_native_dlss_fg_mvec_y, 1);
+    const char* comment = "# DLSS Frame Generation's motion vectors as DLSS's (V1.4).";
+    SaveSetting("pgr4_native_dlss_fg_mvec_x", "1", comment);
+    SaveSetting("pgr4_native_dlss_fg_mvec_y", "1", comment);
+    REXLOG_INFO("PGR4 settings: DLSS-G's motion vectors in pgr4.toml from V1.3's -1 to 1");
+  }
+  REXCVAR_SET(pgr4_settings_version, kSettingsVersion);
+  SaveSetting("pgr4_settings_version", std::to_string(kSettingsVersion),
+              "# The version of these settings (src/pgr4_profile.cpp: brought up to date once).");
+  REXLOG_INFO("PGR4 settings: pgr4.toml brought up to version {}", kSettingsVersion);
 }
 
 // --pgr4_unlock_all: every Cool Wall pack unlocked in the signed-in profiles, so every car and

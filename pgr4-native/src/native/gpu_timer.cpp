@@ -28,9 +28,11 @@ constexpr uint32_t kMaxQueries = GpuTimer::kMaxSpans + 1;
 // the kind's fields from bit 8 in the order the Key* functions write them. Sample counts (1, 2,
 // 4) take 3 bits.
 // kShaders: draws keyed by their shader pair (per_shader_); counted as draws in the totals.
-enum Kind : uint32_t { kStart, kDraw, kClear, kResolve, kPresent, kShaders, kSubmit, kKindCount };
+enum Kind : uint32_t {
+  kStart, kDraw, kClear, kResolve, kPresent, kShaders, kSubmit, kEffects, kKindCount
+};
 constexpr const char* kKindNames[kKindCount] = {"start",   "draws",   "clears", "resolves",
-                                                "present", "shaders", "submits"};
+                                                "present", "shaders", "submits", "effects"};
 constexpr uint32_t kKindMask = 7;
 constexpr uint32_t kOccurrenceShift = 3, kOccurrenceMax = 31;
 constexpr uint32_t kFieldShift = 8;
@@ -132,6 +134,13 @@ std::string GpuTimer::Describe(uint64_t key) const {
       return "present blit";
     case kSubmit:
       return "submit  (the GPU waiting for the frame's next command list)";
+    case kEffects: {
+      static constexpr const char* kSteps[] = {"targets ready", "depth copy",
+                                               "occlusion", "blur", "apply to the scene"};
+      const uint32_t step = uint32_t(key >> kFieldShift) & 7;
+      std::snprintf(s, sizeof(s), "GTAO: %s", step < 5 ? kSteps[step] : "?");
+      return s;
+    }
     case kShaders: {
       const ShadersKey k = ReadShadersKey(key);
       const auto [vs, ps] = k.id < pairs_.size() ? pairs_[k.id] : std::pair<uint64_t, uint64_t>{};
@@ -338,6 +347,8 @@ uint64_t GpuTimer::KeyResolve(const ResolveParams& p, ResolvePhase phase) {
 uint64_t GpuTimer::KeyPresent() { return KeyWriter(kPresent).key(); }
 
 uint64_t GpuTimer::KeySubmit() { return KeyWriter(kSubmit).key(); }
+
+uint64_t GpuTimer::KeyEffects(uint32_t step) { return KeyWriter(kEffects).Put(step, 3).key(); }
 
 uint64_t GpuTimer::KeyDrawShaders(const uint32_t* regs, uint64_t vs_hash, uint64_t ps_hash) {
   const uint32_t surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO];

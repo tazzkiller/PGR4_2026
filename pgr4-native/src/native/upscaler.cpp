@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <mutex>
 #include <string>
 
 REXCVAR_DEFINE_BOOL(pgr4_native_upscaler, false, "PGR4 native",
@@ -70,10 +72,16 @@ REXCVAR_DEFINE_DOUBLE(pgr4_native_reactive_max, 0.8, "PGR4 native",
                       "transparents changed most is dropped)");
 // Local change (pgr4 project): DLSS Super Resolution's quality mode and preset.
 REXCVAR_DEFINE_STRING(pgr4_native_dlss_mode, "auto", "PGR4 native",
-                      "The upscaler's quality mode, DLSS's or FSR's: auto (the render size from "
+                      "DLSS's quality mode: auto (the render size from "
                       "--pgr4_native_upscaler_width/height), dlaa (native, antialiasing only), "
                       "quality, balanced, performance or ultra_performance (the render size from "
                       "the output's)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Local change (17/11/2026): FSR's own quality mode. Until then FSR took DLSS's
+// (pgr4_native_dlss_mode), and the game's page set one for both (src/pgr4_menu.cpp).
+REXCVAR_DEFINE_STRING(pgr4_native_fsr_mode, "auto", "PGR4 native",
+                      "FSR's quality mode, as pgr4_native_dlss_mode's: auto, dlaa (native), "
+                      "quality, balanced, performance or ultra_performance")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 // Local change (31/10/2026): E by default. The transformer models (J, K, and NVIDIA's default,
 // K in DLAA) smeared the road along its motion in races; E, the CNN model, keeps it sharp.
@@ -98,16 +106,40 @@ REXCVAR_DEFINE_INT32(pgr4_native_dlss_mvec_sign_y, 1, "PGR4 native",
 // DLSS-G reads the motion vectors DLSS SR takes (previous - current, UV) the other way round:
 // with them as they are, its generated frames double the scenery toward the screen's centre
 // (diagnosed 2026-10-28: the vectors, matrices, depth, cadence and timing all checked out).
-REXCVAR_DEFINE_INT32(pgr4_native_dlss_fg_mvec_x, -1, "PGR4 native",
+REXCVAR_DEFINE_INT32(pgr4_native_dlss_fg_mvec_x, 1, "PGR4 native",
                      "DLSS-G: factor (1, -1 or 0) of the motion vectors' x frame generation gets, "
                      "set after DLSS Super Resolution has run with its own");
-REXCVAR_DEFINE_INT32(pgr4_native_dlss_fg_mvec_y, -1, "PGR4 native",
+REXCVAR_DEFINE_INT32(pgr4_native_dlss_fg_mvec_y, 1, "PGR4 native",
                      "DLSS-G: factor (1, -1 or 0) of the motion vectors' y frame generation gets, "
                      "set after DLSS Super Resolution has run with its own");
+
+// Local addition (18/11/2026): the camera cuts the game makes (its camera's mode or sub-camera
+// changing, a replay's zone switching), not only the ones the picture shows (a quarter of the
+// screen moved in a frame, below): a cut between two cameras looking at the same place moves the
+// points less than that, and DLSS, FSR and frame generation then blend two views. The game notes
+// the eye of each cut (NoteGameCameraCut, from its camera's update); the first frame drawn from
+// that eye starts the history over, with the picture's cuts below. Compared in a replay (Quebec,
+// 18/11/2026): of the game's 6 cuts (all zone changes), 5 drawn from their eye exactly (0.00 m, up
+// to 2 frames later, one after a fade of 73 frames), 2 of them missed by the picture; the sixth is
+// drawn from another eye (a frame in between, then the camera; nearest 17.8 m) and the picture
+// takes it. The cut byte is read by sub_824D9A88 alone, on the game's thread (the road
+// reflections' plane): nothing on the drawing side to go by instead. On by default (Tazz).
+REXCVAR_DEFINE_BOOL(pgr4_native_game_camera_cuts, true, "PGR4 native",
+                    "Restart DLSS, FSR and frame generation's history at the game's own camera cuts");
 
 namespace pgr4::native {
 
 namespace {
+
+// The game's cuts not drawn yet: their eye, and the render frames they have waited.
+struct GameCut {
+  float eye[3];
+  uint32_t waited;
+  float nearest;  // the nearest drawn eye so far (m), for the log
+  char why[24];
+};
+std::mutex g_game_cuts_mutex;
+std::vector<GameCut> g_game_cuts;
 
 constexpr DXGI_FORMAT kOutputFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr D3D12_RESOURCE_STATES kInputState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -316,13 +348,15 @@ std::string Lower(std::string v) {
   for (char& ch : v) ch = char(std::tolower(static_cast<unsigned char>(ch)));
   return v;
 }
-// --pgr4_native_dlss_mode's, nullptr for auto.
-const DlssModeInfo* DlssModeSetting() {
-  const std::string v = Lower(REXCVAR_GET(pgr4_native_dlss_mode));
+// The quality mode of DLSS (--pgr4_native_dlss_mode) or of FSR (--pgr4_native_fsr_mode, local
+// change 17/11/2026), nullptr for auto.
+const DlssModeInfo* ModeSetting(bool dlss) {
+  const std::string v =
+      Lower(dlss ? REXCVAR_GET(pgr4_native_dlss_mode) : REXCVAR_GET(pgr4_native_fsr_mode));
   for (const DlssModeInfo& m : kDlssModes)
     if (v == m.name) return &m;
   if (v != "auto" && !v.empty())
-    PGR4_WARN_ONCE("PGR4 native DLSS: unknown mode '{}'; auto", v);
+    PGR4_WARN_ONCE("PGR4 native {}: unknown mode '{}'; auto", dlss ? "DLSS" : "FSR", v);
   return nullptr;
 }
 // --pgr4_native_dlss_preset's.
@@ -357,7 +391,8 @@ bool Upscaler::Initialize(ID3D12Device* device) {
   max_width_ = RenderExtent(REXCVAR_GET(pgr4_native_upscaler_width), kSceneWidth);
   max_height_ = RenderExtent(REXCVAR_GET(pgr4_native_upscaler_height), SceneHeight());
   // The quality mode (local change), DLSS's or FSR's: the render size from the output's.
-  if (const DlssModeInfo* m = DlssModeSetting()) {
+  const bool dlss = streamline::DlssRequested() && streamline::Active();
+  if (const DlssModeInfo* m = ModeSetting(dlss)) {
     max_width_ = RenderExtent(int32_t(std::lround(float(OutputWidth()) * m->ratio)), kSceneWidth);
     max_height_ =
         RenderExtent(int32_t(std::lround(float(OutputHeight()) * m->ratio)), SceneHeight());
@@ -370,7 +405,7 @@ bool Upscaler::Initialize(ID3D12Device* device) {
     dynamic_.emplace(min_level, uint64_t(1'000'000'000 / fps));
   }
   // DLSS through Streamline (local change): no FidelityFX context.
-  if (streamline::DlssRequested() && streamline::Active()) {
+  if (dlss) {
     dlss_ = true;
     REXLOG_INFO("PGR4 native upscaler: NVIDIA DLSS from {}x{}{} to {}x{}", max_width_, max_height_,
                 dynamic_ ? " or less" : "", OutputWidth(), OutputHeight());
@@ -595,6 +630,36 @@ void Upscaler::UpdateCamera() {
   camera_pos_[0] = view_to_world[3].x;
   camera_pos_[1] = view_to_world[3].y;
   camera_pos_[2] = view_to_world[3].z;
+  // A cut the game made, drawn now: its eye within 25 cm (the camera's shake is a few cm). A cut
+  // not drawn in 8 frames (another camera's, a view not drawn) is dropped.
+  if (REXCVAR_GET(pgr4_native_game_camera_cuts)) {
+    std::lock_guard lock(g_game_cuts_mutex);
+    static int game_cut_logged = 0;  // local diagnostic
+    for (size_t i = 0; i < g_game_cuts.size();) {
+      GameCut& c = g_game_cuts[i];
+      const float d = std::hypot(c.eye[0] - camera_pos_[0], c.eye[1] - camera_pos_[1],
+                                 c.eye[2] - camera_pos_[2]);
+      c.nearest = std::min(c.nearest, d);
+      if (d < 0.25f) {
+        reset_ = true;
+        if (game_cut_logged < 400) {
+          ++game_cut_logged;
+          REXLOG_INFO("PGR4 native camera diag: frame {} game camera cut ({}, eye {:.2f} m off, "
+                      "{} frames late)",
+                      frame_, c.why, d, c.waited);
+        }
+      } else if (++c.waited <= 8) {
+        ++i;
+        continue;
+      } else if (game_cut_logged < 400) {
+        ++game_cut_logged;
+        REXLOG_INFO("PGR4 native camera diag: frame {} game camera cut ({}) never drawn (nearest "
+                    "eye {:.2f} m)",
+                    frame_, c.why, c.nearest);
+      }
+      g_game_cuts.erase(g_game_cuts.begin() + ptrdiff_t(i));
+    }
+  }
   if (has_previous_view_projection_) {
     sl::float4x4 clip_to_world, to_prev, from_prev;
     sl::matrixFullInvert(clip_to_world, world_to_clip);
@@ -1332,7 +1397,7 @@ bool Upscaler::EvaluateDlss(ID3D12GraphicsCommandList* list, RenderTarget* depth
     const float ratio = std::max(float(OutputWidth()) / float(render_width_),
                                  float(OutputHeight()) / float(render_height_));
     sl::DLSSOptions o;
-    const DlssModeInfo* const setting = DlssModeSetting();
+    const DlssModeInfo* const setting = ModeSetting(true);
     o.mode = setting ? setting->mode
              : ratio <= 1.01f   ? sl::DLSSMode::eDLAA
              : ratio <= 1.55f ? sl::DLSSMode::eMaxQuality
@@ -1482,6 +1547,19 @@ bool Upscaler::EvaluateDlss(ID3D12GraphicsCommandList* list, RenderTarget* depth
   // DLSS-G generates from this frame's depth and motion (copied: eOnlyValidNow).
   streamline::MarkScene();
   return true;
+}
+
+void NoteGameCameraCut(const float eye[3], const char* why, bool again) {
+  if (!REXCVAR_GET(pgr4_native_game_camera_cuts)) return;
+  std::lock_guard lock(g_game_cuts_mutex);
+  if (again) {  // the camera updated again in the cut's frame: the eye it is drawn from
+    if (!g_game_cuts.empty()) std::copy(eye, eye + 3, g_game_cuts.back().eye);
+    return;
+  }
+  if (g_game_cuts.size() >= 16) g_game_cuts.erase(g_game_cuts.begin());
+  GameCut c = {{eye[0], eye[1], eye[2]}, 0, 1e9f, {}};
+  std::snprintf(c.why, sizeof(c.why), "%s", why);
+  g_game_cuts.push_back(c);
 }
 
 }  // namespace pgr4::native

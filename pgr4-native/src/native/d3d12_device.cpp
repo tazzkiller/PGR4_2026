@@ -35,6 +35,26 @@ REXCVAR_DEFINE_BOOL(pgr4_native_dred, false, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_gpu_serialize_fg, true, "PGR4 native",
                     "Wait for the GPU at the end of every frame while DLSS frame generation is on "
                     "(against a wrong sky on the cars' reflections when the GPU is saturated)");
+// Local addition (18/11/2026, Tazz): the draws' D3D12 calls replayed on a thread of their own
+// (command_recorder.h). On by default; off: the draw path calls the frame's list itself, as before.
+// Read at each frame's start.
+REXCVAR_DEFINE_BOOL(pgr4_native_record_list, true, "PGR4 native",
+                    "Record the draws' D3D12 calls and make them on the frame's list from a thread "
+                    "of their own (the render thread no longer waits on the driver)");
+// Local change (18/11/2026, Tazz: the render thread's load): the frame's submissions within it
+// (--pgr4_native_submit_draws) made by the recorder's replay thread (CommandRecorder::SubmitList):
+// the render thread submits the texture upload lists itself at once, ahead of the frame as they may
+// always run, and records the frame list's submission. Off: Submit drains and submits, as before.
+// Read at each frame's start.
+REXCVAR_DEFINE_BOOL(pgr4_native_record_submit, true, "PGR4 native",
+                    "Command recording: the submissions within a frame made by the replay thread");
+// Development (18/11/2026): the recorder's bytes between two publishes and its replay thread's spin
+// before it sleeps (0: the defaults, 4096 bytes and 10 us). Read at each frame's start.
+REXCVAR_DEFINE_INT32(pgr4_native_record_publish_bytes, 0, "PGR4 native",
+                     "Development: command recording, bytes recorded between two publishes (0: 4096)");
+REXCVAR_DEFINE_INT32(pgr4_native_record_worker_spin_us, 0, "PGR4 native",
+                     "Development: command recording, the replay thread's spin before it sleeps in "
+                     "us (0: 10)");
 REXCVAR_DEFINE_BOOL(pgr4_native_gpu_serialize, false, "PGR4 native",
                     "Debug: wait for the GPU at the end of every frame, so no frame is in flight "
                     "while the next one is recorded (slow)");
@@ -375,6 +395,7 @@ bool D3D12Device::Initialize(uint32_t width, uint32_t height, const wchar_t* tit
   list_->SetName(L"pgr4 native frame");
   if (!CreateBusyTimer()) return false;
   StampBusy();
+  UpdateRecording();  // local change
 
   BOOL tearing = FALSE;
   factory_->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing));
@@ -561,6 +582,9 @@ void D3D12Device::WaitIdle() {
   // A fence of its own: the frame fence's next value belongs to the frame still being recorded,
   // whose resources would count as done before it is submitted.
   if (!queue_ || !idle_fence_ || !idle_event_) return;
+  // Local change: what the draw path recorded is in the list, so nothing names a resource the
+  // caller frees after this.
+  if (recorder_) recorder_->Drain();
   const uint64_t v = ++idle_fence_value_;
   if (FAILED(queue_->Signal(idle_fence_.Get(), v)) || idle_fence_->GetCompletedValue() >= v) return;
   idle_fence_->SetEventOnCompletion(v, idle_event_.get());
@@ -568,6 +592,7 @@ void D3D12Device::WaitIdle() {
 }
 
 bool D3D12Device::EnableGpuTimer() {
+  if (recorder_) recorder_->Drain();  // local change: its first stamp after the recorded draws
   auto timer = std::make_unique<GpuTimer>();
   if (!timer->Initialize(device_.Get(), queue_.Get(), kFramesInFlight)) return false;
   timer->BeginFrame(list_.Get(), slot_);
@@ -619,7 +644,25 @@ bool D3D12Device::OpenList() {
     return false;
   StampBusy();
   if (gpu_timer_) gpu_timer_->BeginFrame(list_.Get(), slot_);
+  UpdateRecording();  // local change
   return true;
+}
+
+void D3D12Device::UpdateRecording() {
+  const bool want = REXCVAR_GET(pgr4_native_record_list);
+  if (want && !recorder_) {
+    auto recorder = std::make_unique<CommandRecorder>();
+    if (recorder->Start(list_.Get())) recorder_ = std::move(recorder);
+  }
+  const bool on = want && recorder_;
+  if (recorder_)
+    recorder_->SetTuning(uint32_t(std::max(REXCVAR_GET(pgr4_native_record_publish_bytes), 0)),
+                         uint32_t(std::max(REXCVAR_GET(pgr4_native_record_worker_spin_us), 0)) * 1000u);
+  submit_on_replay_ = on && REXCVAR_GET(pgr4_native_record_submit);
+  if (on != recording_)
+    REXLOG_INFO("PGR4 native: command recording {}",
+                on ? "on (the draws' D3D12 calls made from the replay thread)" : "off");
+  recording_ = on;
 }
 
 bool D3D12Device::CloseAndExecute(std::span<ID3D12CommandList* const> first) {
@@ -634,6 +677,24 @@ bool D3D12Device::CloseAndExecute(std::span<ID3D12CommandList* const> first) {
 }
 
 bool D3D12Device::Submit(std::span<ID3D12CommandList* const> first) {
+  // Local change (pgr4_native_record_submit): by the replay thread, after what was recorded before.
+  if (submit_on_replay_ && recording_ && !gpu_timer_) {
+    // The constant uploads are streaming stores, weakly ordered: visible before the GPU reads them.
+    simde_mm_sfence();
+    // The texture upload lists now, alone: they run ahead of the frame (TextureCache::
+    // CloseUploadLists), and their threads may reopen them before the replay would reach them.
+    if (!first.empty()) queue_->ExecuteCommandLists(UINT(first.size()), first.data());
+    const bool timed = busy_stamps_[slot_] + 3 <= kBusySpans * 2;
+    if (timed)
+      recorder_->EndQuery(busy_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                          slot_ * kBusySpans * 2 + busy_stamps_[slot_]++);
+    recorder_->SubmitList(queue_.Get(), allocators_[slot_].Get());
+    if (timed)
+      recorder_->EndQuery(busy_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                          slot_ * kBusySpans * 2 + busy_stamps_[slot_]++);
+    return !recorder_->failed();
+  }
+  if (recorder_) recorder_->Drain();  // local change: the draws recorded so far go too
   if (gpu_timer_) gpu_timer_->Pass(list_.Get(), GpuTimer::KeySubmit());
   // Room for this submission's end, the next one's start and the frame's end.
   const bool timed = busy_stamps_[slot_] + 3 <= kBusySpans * 2;
@@ -671,6 +732,13 @@ bool D3D12Device::Present() {
 }
 
 bool D3D12Device::EndFrame(bool present, std::span<ID3D12CommandList* const> first) {
+  if (recorder_) {
+    recorder_->Drain();  // local change: the frame's recorded draws (and submissions)
+    if (recorder_->failed()) {
+      REXLOG_ERROR("PGR4 native: a submission by the command recorder's replay thread failed");
+      return false;
+    }
+  }
   const uint64_t t0 = NowNs();
   streamline::Marker(sl::PCLMarker::eRenderSubmitStart);  // local change
   const bool shown = swapchain_ && present;

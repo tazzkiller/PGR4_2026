@@ -163,12 +163,13 @@ float4 XeStacked14(float3 uvw) {
 #else
 float4 XeStacked14(float3 uvw) { return 0.0; }
 #endif
-float4 Shade(XeInput i) {
+float4 XeWaterShade(XeInput i) {
   float ps = 0.0, xe_lod = 0.0;
   bool p0 = false;
   int xe_jump = 0;
   float4 xe_out = float4(0.0, 0.0, 0.0, 0.0);
   XeWaterBegin(i);
+  const float4 xe_c7 = c7 * xe_sun;
   float4 r0 = 0.0;
 #if XE_INTERPOLATORS > 0
   r0 = i.r0;
@@ -246,13 +247,13 @@ float4 Shade(XeInput i) {
   { float4 t65 = XeMul(r0.xxxx, c9.xyzz); float t66 = XeMul1(c10.w, ps); r0.x = t65.x; r0.y = t65.y; r0.z = t65.z; r2.x = t66; ps = t66; }
   { float4 t67 = (XeMul(r2.zzzz, c8.xyzz) + r0.xyzz); r0.x = t67.x; r0.y = t67.y; r0.z = t67.z; }
   { float4 t68 = XeMul(c10.xyzz, c95.wwww); float t69 = XeLog(r1.x); r3.x = t68.x; r3.y = t68.y; r3.z = t68.z; r1.x = t69; ps = t69; }
-  { float4 t70 = XeMul(c6.yyyy, c7.xyzz); float t71 = XeMul1(c93.y, r1.x); r5.x = t70.x; r5.y = t70.y; r5.z = t70.z; r2.z = t71; ps = t71; }
+  { float4 t70 = XeMul(c6.yyyy, xe_c7.xyzz); float t71 = XeMul1(c93.y, r1.x); r5.x = t70.x; r5.y = t70.y; r5.z = t70.z; r2.z = t71; ps = t71; }
   { float4 t72 = (XeMul(r5.zxyy, r2.wwww) + r0.zxyy); r0.x = t72.x; r0.y = t72.y; r0.z = t72.z; }
   { float4 t73 = XeMul(r1.xyzw, c94.yzzz); float t74 = exp2(r2.z); r1.x = t73.x; r1.y = t73.y; r1.z = t73.z; r1.w = t73.w; r2.z = t74; ps = t74; }
   { float4 t75 = XeMul(r2.zzzz, c93.xxxx); float t76 = exp2(r1.x); r2.z = t75.z; r3.w = t76; ps = t76; }
   { float4 t77 = XeMul(r3.wwww, c94.xxxx); float t78 = XeMul1(c95.x, r0.y); r3.w = t77.w; r5.x = t78; ps = t78; }
-  { float4 t79 = XeMul(r3.wwww, c7.xyzz); float t80 = XeMul1(c95.y, r0.z); r6.x = t79.x; r6.y = t79.y; r6.z = t79.z; r5.y = t80; ps = t80; }
-  { float4 t81 = (XeMul(r2.zzzz, c7.xyzz) + r6.xyzz); r6.x = t81.x; r6.y = t81.y; r6.z = t81.z; }
+  { float4 t79 = XeMul(r3.wwww, xe_c7.xyzz); float t80 = XeMul1(c95.y, r0.z); r6.x = t79.x; r6.y = t79.y; r6.z = t79.z; r5.y = t80; ps = t80; }
+  { float4 t81 = (XeMul(r2.zzzz, xe_c7.xyzz) + r6.xyzz); r6.x = t81.x; r6.y = t81.y; r6.z = t81.z; }
   { float4 t82 = (XeMul(r6.xyzz, r2.wwww) + r1.yzww); r1.x = t82.x; r1.y = t82.y; r1.z = t82.z; }
   { float4 t83 = XeMul(r1.xyzz, r2.yyyy); float t84 = XeMul1(c95.z, r0.x); r1.x = t83.x; r1.y = t83.y; r1.z = t83.z; r5.z = t84; ps = t84; }
   { float4 t85 = (XeMul(r5.xyzz, c95.wwww) + r1.xyzz); r1.x = t85.x; r1.y = t85.y; r1.z = t85.z; }
@@ -267,10 +268,33 @@ float4 Shade(XeInput i) {
   { float4 t96 = XeMul(r0.xxxx, r4.wwww); r0.w = t96.w; }
   { float4 t97 = XeMul(r0.wwww, r1.wwww); r0.x = t97.x; }
   { float4 t98 = XeSelect((-r0.yyyy) > 0.0, r0.xxxx, r0.zzzz); r0.w = t98.w; }
-  { float4 t99 = (XeMul((-r0.wwww), c11.yyyy) + r2.xxxx); r0.x = t99.x; }
+  { float4 t99 = (XeMul((-r0.wwww), c11.yyyy) + r2.xxxx) * kWaterFog; r0.x = t99.x; }
   { float t100 = XeMul1(c253.w, r0.x); r0.x = t100; ps = t100; }
   { float4 t101 = (r1.xxyz + (-r3.xxyz)); float t102 = exp2(r0.x); r0.y = t101.y; r0.z = t101.z; r0.w = t101.w; r0.x = t102; ps = t102; }
   { float4 t103 = (XeMul(r0.yzww, r0.xxxx) + r3.xyzz); r0.x = t103.x; r0.y = t103.y; r0.z = t103.z; }
   { float4 t104 = XeMul(r0.xyzz, c12.yyyy); float t105 = max(c95.w, c95.w); xe_out.x = t104.x; xe_out.y = t104.y; xe_out.z = t104.z; xe_out.w = t105; ps = t105; }
   return XeFinish(xe_out);
+}
+// Local change (17/11/2026): the sun on the fine waves or on the game's smooth water
+// (water_hooks.hlsli kSunWaves). The output is affine in the sun's light (c7): what the sun adds is
+// the body with it less the body without it, the scenery's reflection left out of both (it cancels
+// out). kSunWaves 1: the body once, as before.
+float4 Shade(XeInput i) {
+  xe_sun = 1.0; xe_waves = 1.0; xe_scene = true;
+  if (kSunWaves >= 1.0) return XeWaterShade(i);
+  xe_sun = 0.0;
+  float4 color = XeWaterShade(i);
+  xe_scene = false;
+  if (kSunWaves > 0.0) {
+    xe_sun = 1.0;
+    const float4 lit = XeWaterShade(i);
+    xe_sun = 0.0;
+    color.rgb += kSunWaves * (lit.rgb - XeWaterShade(i).rgb);
+  }
+  xe_waves = 0.0;
+  xe_sun = 1.0;
+  const float4 smooth_lit = XeWaterShade(i);
+  xe_sun = 0.0;
+  color.rgb += (1.0 - kSunWaves) * (smooth_lit.rgb - XeWaterShade(i).rgb);
+  return color;
 }

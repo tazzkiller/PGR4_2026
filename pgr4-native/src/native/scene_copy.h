@@ -50,6 +50,11 @@ class SceneCopy {
   uint32_t height() const { return height_; }
   // Bumped when the copies are made again (their views must be too).
   uint32_t generation() const { return generation_; }
+  // Local change (19/11/2026): the depth copy's texel (x, y), R32_FLOAT, into the first 4 bytes of
+  // `buffer` (a readback buffer of 256 bytes at least), after this frame's Take: the photo mode's
+  // focus (draw.cpp OnSceneEnd).
+  void CopyDepthTexel(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer, uint32_t x,
+                      uint32_t y);
 
  private:
   template <typename T>

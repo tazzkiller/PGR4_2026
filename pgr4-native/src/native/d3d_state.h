@@ -119,6 +119,10 @@ struct ShaderRef {
   const uint32_t* immediate = nullptr;
   uint32_t immediate_seq = 0;
   uint64_t binding = 0;
+  // Local change (pgr4 project, perf-cpu): XXH3 of the program as the GPU loaded it, taken by the
+  // tracker at the load (the console's GPU copies the ucode into its instruction memory then, so
+  // later writes at the address do not change what it runs until the next load). 0: not taken.
+  uint64_t content = 0;
 };
 
 struct DrawState {

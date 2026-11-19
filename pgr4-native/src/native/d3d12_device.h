@@ -34,6 +34,7 @@
 #include <thread>
 #include <vector>
 
+#include "command_recorder.h"
 #include "win_handle.h"
 
 namespace pgr4::native {
@@ -92,7 +93,22 @@ class D3D12Device {
   // Local change (pgr4 project): the window presented into (the game's or the debug one).
   HWND window() const { return game_window_ ? game_window_ : hwnd_.load(); }
   ID3D12CommandQueue* command_queue() const { return queue_.Get(); }
-  ID3D12GraphicsCommandList* command_list() const { return list_.Get(); }
+  // The frame's list, with everything the draw path recorded before it in it (local change:
+  // CommandRecorder drained).
+  ID3D12GraphicsCommandList* command_list() const {
+    if (recorder_) recorder_->Drain();
+    return list_.Get();
+  }
+  // Local change (pgr4 project, 18/11/2026): the draw path's list, the recorder (command_recorder.h)
+  // while --pgr4_native_record_list is on (read at each frame's start), else the frame's list.
+  ID3D12GraphicsCommandList* recording_list() const {
+    return recording_ ? static_cast<ID3D12GraphicsCommandList*>(recorder_.get()) : list_.Get();
+  }
+  bool recording() const { return recording_; }
+  // The recorder's counts since the last call (the CSV's rec_* columns).
+  CommandRecorder::Stats TakeRecorderStats() {
+    return recorder_ ? recorder_->TakeStats() : CommandRecorder::Stats{};
+  }
 
   // The swapchain's current back buffer (state PRESENT outside EndFrame) and its RTV, or the
   // frame's image (SetFrameImage).
@@ -181,6 +197,8 @@ class D3D12Device {
   // Switches the new swapchain to HDR10 if wanted and supported, else to kBackBufferFormat.
   bool SetUpColorSpace();
   bool OpenList();
+  // Local change: --pgr4_native_record_list applied, between frames (nothing recorded).
+  void UpdateRecording();
   bool CloseAndExecute(std::span<ID3D12CommandList* const> first);
   // gpu_busy_ns: the timestamps around the frame's submissions. False (logged) on failure.
   bool CreateBusyTimer();
@@ -211,6 +229,10 @@ class D3D12Device {
   uint64_t slot_fence_[kFramesInFlight] = {};
   uint32_t slot_ = 0;
   ComPtr<ID3D12GraphicsCommandList> list_;
+  // Local change: after list_, so it goes first (its replay thread ends before the list does).
+  std::unique_ptr<CommandRecorder> recorder_;
+  bool recording_ = false;
+  bool submit_on_replay_ = false;  // pgr4_native_record_submit (Submit)
   std::vector<ID3D12CommandList*> submit_lists_;  // CloseAndExecute's
   EndFrameTimes end_frame_times_;
 

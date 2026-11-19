@@ -349,15 +349,17 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
       vs_imm_.swap(vs_imm_pending_);
       vs_ = vs_imm_pending_ref_;
       vs_.immediate = vs_imm_.data();
+      vs_.content = XXH3_64bits(vs_imm_.data(), size_t(vs_.dwords) * 4);
     } else if (vs_.immediate ? (rebind & kVsRebind) != 0 : shader_load || vs != vs_.object) {
       // IM_LOAD of the object's variant. After an immediate load the D3D reloads the VS only
       // under the VS rebind bit. Variant 1 is used without a pixel shader when the object has
       // one (flag 0x20).
       const uint32_t variant = (!ps && (Load32(base, vs + 872) & 0x20)) ? 1 : 0;
       const uint32_t sub = vs + Load32(base, vs + 896 + variant * 8);
-      vs_ = {vs, GpuAddress(Load32(base, vs + 32) + Load32(base, sub + 872)),
-             Load32(base, sub + 876) >> 2};
+      const uint32_t ucode = Load32(base, vs + 32) + Load32(base, sub + 872);
+      vs_ = {vs, GpuAddress(ucode), Load32(base, sub + 876) >> 2};
       vs_.binding = XXH3_64bits(HostPtr(base, vs + 416 * variant + 40), 24);
+      vs_.content = XXH3_64bits(HostPtr(base, ucode), size_t(vs_.dwords) * 4);
     }
     if (vs && (rebind & (kVsRebind | kPsRebind)))
       LoadLiterals(base, vs + 872, Load32(base, vs + 32));
@@ -365,8 +367,9 @@ void GuestStateTracker::AfterCall(const uint8_t* base, uint32_t fn_addr, const C
       ps_ = {};
     } else if (shader_load || ps != ps_.object) {
       const uint32_t sub = ps + Load32(base, ps + 64);
-      ps_ = {ps, GpuAddress(Load32(base, ps + 24) + Load32(base, sub + 40)),
-             Load32(base, sub + 44) >> 2};
+      const uint32_t ucode = Load32(base, ps + 24) + Load32(base, sub + 40);
+      ps_ = {ps, GpuAddress(ucode), Load32(base, sub + 44) >> 2};
+      ps_.content = XXH3_64bits(HostPtr(base, ucode), size_t(ps_.dwords) * 4);
     }
     if (ps && (rebind & kPsRebind)) LoadLiterals(base, ps + 40, Load32(base, ps + 24));
   }

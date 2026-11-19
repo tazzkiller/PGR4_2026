@@ -89,7 +89,14 @@ class PipelineStore {
   // cache that covers the whole game (about 700 pipelines a city). Finite only so the pipelines
   // of shader versions no longer made (a tuning value tried once) leave in the end.
   static constexpr uint32_t kKeepSessions = 1000, kHotSessions = 1000;
-  static constexpr size_t kPrewarmMax = 16384;
+  // Local change (18/11/2026, Tazz: mini-freezes switching to the cockpit view): 65536 (16384
+  // before). The launcher's precompile puts every recorded pipeline in the library, but a run
+  // prewarmed 16384 of 18040: the other 1656, the least used (a view seldom driven in, as the
+  // cockpit of a car), were made at their first draw, dozens at once at a change of view. All of
+  // them now, in the background as before: about a second more of prewarm and some 20 to 60 MB
+  // of the driver's memory (the library: 213 MB for 17 700 pipelines). Still finite for a store
+  // that would grow without end.
+  static constexpr size_t kPrewarmMax = 65536;  // TEST (18/11): the flicker's cause, measured
 
  private:
   // The record's identity: over the hashes, modifications and key, not the session.

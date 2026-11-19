@@ -12,6 +12,7 @@ void Pgr4SetupProfile(rex::Runtime* runtime);
 // src/pgr4_profile.cpp: the first launch's renderer settings (definition from the screen).
 void Pgr4DumpImage();
 void Pgr4FirstLaunchConfig();
+void Pgr4MigrateSettings();  // src/pgr4_profile.cpp: settings whose defaults changed
 // src/pgr4_menu.cpp: the game's window brought to the front (the launcher allows it).
 void Pgr4BringWindowToFront();
 // src/pgr4_profile.cpp: started by the launcher to compile the shaders only.
@@ -60,6 +61,7 @@ class Pgr4App : public rex::ReXApp {
     Pgr4ApplyRenderAspect();
     Pgr4DumpImage();
     Pgr4FirstLaunchConfig();
+    Pgr4MigrateSettings();
     Pgr4SetupProfile(runtime());
   }
 

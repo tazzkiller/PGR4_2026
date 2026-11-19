@@ -10,6 +10,8 @@
 // for ReXGlue; adapted here for the native renderer.
 #include "draw.h"
 
+#include "command_recorder.h"
+
 #include "geometry_shader.h"
 #include "log.h"
 #include "motion_history.h"
@@ -19,6 +21,7 @@
 #include "render_targets.h"
 #include "renderer.h"
 #include "road_reflect_list.h"
+#include "scene_diffuse_list.h"
 #include "scene_copy.h"
 #include "resolve.h"
 #include "shader_cache.h"
@@ -71,6 +74,33 @@
 #include <vector>
 
 
+// Local change (pgr4 project, 17/11/2026): a moving draw matched with the previous frame's by its
+// whole transform, predicted, and among the same transform by its rank in its group
+// (BindPreviousConstants, MotionHistory::Predict), instead of by its origin. On 4 frames of the
+// menu (draw logs 29985-29988), of 1026 draws matched by order, 27 differ: the blurred rims'
+// slices 2 to 4, which by their origin all took slice 1's. On by default since Tazz kept it.
+REXCVAR_DEFINE_BOOL(pgr4_native_motion_transform_match, true, "PGR4 native",
+                    "Motion vectors: every moving draw with a placement matched by its whole "
+                    "transform instead of its origin");
+// Diagnostic (19/11/2026, Tazz: the brake lights flicker in replays as they come on): the cars'
+// lit lamps overlay (vs 1F133756316FDF1C, psCarLightOverlay0, its own motion vectors) logged each
+// frame: its index buffer, count, rank and how its previous frame's draw was found.
+REXCVAR_DEFINE_BOOL(pgr4_native_light_motion_probe, false, "PGR4 native",
+                    "Log the cars' lit lamps overlay draws' motion match every frame (diagnostic)");
+REXCVAR_DEFINE_BOOL(pgr4_native_motion_spin_axle, true, "PGR4 native",
+                    "Motion vectors: a part spinning fast about its own axis (tyres, rims, "
+                    "hubcaps) gets its axle's motion, not its spin (BindPreviousConstants)");
+// Local change (18/11/2026, Tazz: the render thread's load): the motion history's slots of the
+// next draws read ahead (MotionHistory::PrefetchNext), the same answers. Off: no prefetch, as
+// before. Read at each frame's start.
+REXCVAR_DEFINE_BOOL(pgr4_native_motion_prefetch, true, "PGR4 native",
+                    "Motion vectors: read the previous frame's draws ahead of their lookups "
+                    "(same results, fewer waits on memory)");
+// Local change (18/11/2026): with pgr4_native_motion_prefetch, the slots written read ahead whole
+// (four lines) instead of their first line. Read at each frame's start.
+REXCVAR_DEFINE_BOOL(pgr4_native_motion_prefetch_whole, true, "PGR4 native",
+                    "Motion vectors: the prefetch reads the slots written whole (off: their first "
+                    "line)");
 REXCVAR_DEFINE_BOOL(pgr4_native_motion_current_fetch, true, "PGR4 native",
                     "Motion vectors: the previous position from this frame's vertex streams with "
                     "the previous frame's constants (local change; instanced props' streams are "
@@ -117,8 +147,28 @@ REXCVAR_DEFINE_BOOL(pgr4_native_dynamic_depth_bias, true, "PGR4 native",
 REXCVAR_DEFINE_INT32(pgr4_native_debug_checker_frames, 0, "PGR4 native",
                      "Debug: log the start line checker draw's pixel constants for this many frames");
 float g_pgr4_camera_eye[3] = {};  // Local change (pgr4 project): the eye, for src/pgr4_autopilot.cpp
+// Local change (pgr4 project): the scene's fog density (its draws' c10.w, per metre), for the GTAO.
+std::atomic<float> g_pgr4_fog_density{0.0f};
+// Local change (16/11/2026): and its color (c10.rgb), the rest of a fogged pixel (scene_effects.cpp).
+std::atomic<float> g_pgr4_fog_color[3] = {};
 // The game's clock stands still (the pause, the photo mode; src/pgr4_hooks.cpp): our shaders' clocks too.
 bool g_pgr4_game_paused = false;
+// Local change (19/11/2026, Tazz: « le mode focus du mode photo est inversé »): the photo mode's
+// focus reads the scene's depth at the screen's centre on the CPU (sub_824B8CE0, from a depth
+// resolve this renderer never reads back: guest memory kept an old value). While the photo mode's
+// camera runs (Pgr4PhotoModeActive, src/pgr4_hooks.cpp), OnSceneEnd copies that texel of the
+// scene copy's depth to a readback buffer; read once the GPU is done (EndFrame), the value and the
+// frame it came in, for src/pgr4_hooks.cpp's hook of sub_824B8CE0 (Pgr4PhotoFocusDepth).
+bool Pgr4PhotoModeActive();
+std::atomic<float> g_pgr4_photo_focus_depth{0.0f};
+std::atomic<uint64_t> g_pgr4_photo_focus_frame{0};
+std::atomic<uint64_t> g_pgr4_draw_frame{0};
+bool Pgr4PhotoFocusDepth(float* depth) {
+  const uint64_t f = g_pgr4_photo_focus_frame.load(std::memory_order_acquire);
+  if (!f || g_pgr4_draw_frame.load(std::memory_order_relaxed) > f + 8) return false;
+  *depth = g_pgr4_photo_focus_depth.load(std::memory_order_relaxed);
+  return true;
+}
 float g_pgr4_car_speed = 0.0f;    // the speed of the car the camera is on, m/s (src/pgr4_hooks.cpp)
 float g_pgr4_car_side[3] = {};    // in a bend, the way the running drops lean (src/pgr4_hooks.cpp)
 float g_pgr4_car_yaw_rate = 0.0f;
@@ -131,6 +181,9 @@ const uint8_t* g_pgr4_guest_base = nullptr;  // development: the rain's log, End
 bool g_pgr4_light_rain = false;  // its record's name has "Light Rain": half the running drops
 // On a race's screens (src/pgr4_menu.cpp): the garages and the menus keep the last race's weather otherwise.
 bool g_pgr4_race_screen = false;
+// Local change (18/11/2026): the race's weather read (src/pgr4_autopilot.cpp, at the race's load) and no
+// screen loaded since (src/pgr4_menu.cpp): the load before its first screen, the intro's camera's.
+bool g_pgr4_race_loaded = false;
 // The car the camera is on (src/pgr4_hooks.cpp: the record nearest the eye, as for the drops' speed): its
 // position; far away when there is none. The running drops and the wiper are for it alone (they cost too
 // much for all). Read by the game's thread a frame or more before the draws: the margin grows with the speed.
@@ -197,6 +250,9 @@ REXCVAR_DEFINE_BOOL(pgr4_native_drops_glide_log, false, "PGR4 native",
 REXCVAR_DEFINE_DOUBLE(pgr4_native_coplanar_bias, 0.0, "PGR4 native",
                       "Test: the scene's draws testing depth without writing it, without a polygon "
                       "offset, pulled toward the camera by this many depth units (0: none)");
+REXCVAR_DEFINE_BOOL(pgr4_native_photo_focus_depth, true, "PGR4 native",
+                    "The photo mode's focus reads the scene's depth at the screen's centre from "
+                    "the GPU (it read an old value: the focus did not follow)");
 REXCVAR_DEFINE_BOOL(pgr4_native_alpha_to_coverage, false, "PGR4 native",
                     "The scene's alpha-tested draws with alpha to coverage under MSAA (their "
                     "edges smoothed by the samples)");
@@ -222,6 +278,15 @@ REXCVAR_DEFINE_BOOL(pgr4_native_coherency_check, false, "PGR4 native",
                     "(stale pages: a write the page watch missed; late pages: data rewritten after "
                     "a draw of the frame read it), and check copy segments against every read. "
                     "Slow (512 MB of host memory, a memcmp of every range read)");
+REXCVAR_DEFINE_BOOL(pgr4_native_draw_memo, true, "PGR4 native",
+                    "Test: perf-cpu's draw path memo (each pixel shader's answers worked out once, "
+                    "each program's hash taken at its load); off: at every draw, as before");
+// Local change (18/11/2026): the texture binding memo's size, 2 x 2^bits entries (BindMemo; was
+// 2^11 sets: about 170 misses a frame on a still scene of 5 900 draws). Read at each frame's
+// start; a change empties it.
+REXCVAR_DEFINE_INT32(pgr4_native_bind_memo_bits, 13, "PGR4 native",
+                     "The texture binding memo's size: 2 x 2^n entries (11 to 15)")
+    .range(11, 15);
 REXCVAR_DEFINE_INT32(pgr4_native_draw_log_from, -1, "PGR4 native",
                      "Debug: from this native frame on, log the draws of each frame to "
                      "<capture dir>/draws-f<frame>.txt, as bit 16 of <capture dir>/draw-debug.txt "
@@ -246,6 +311,7 @@ REXCVAR_DEFINE_INT32(pgr4_native_anisotropy, 1, "PGR4 native",
                      "at least this many samples per pixel (2, 4, 8 or 16; 1: the game's own)");
 REXCVAR_DECLARE(std::string, pgr4_native_capture_dir);
 REXCVAR_DECLARE(bool, pgr4_native_decal_light_off);  // shader_replace.cpp
+REXCVAR_DECLARE(bool, pgr4_native_water_live);       // shader_replace.cpp
 // Local change (pgr4 project): the cars' grime, at will (the overlay's Tests tab).
 REXCVAR_DEFINE_DOUBLE(pgr4_native_dirt_force, -1.0, "PGR4 native",
                       "The cars' grime forced to this amount (below 0: the game's, c220.x)");
@@ -345,6 +411,13 @@ bool IsSkyShader(uint64_t ps_hash) {
 // (road_reflect_list.h, shaders/road_reflect_hooks.hlsli).
 bool IsRoadReflectShader(uint64_t ps_hash) {
   return std::binary_search(std::begin(kRoadReflectShaders), std::end(kRoadReflectShaders),
+                            ps_hash);
+}
+// Local change (pgr4 project, 16/11/2026): the game's world scenery shaders (psSceneDiffuse and
+// its variants: scene_diffuse_list.h, tools/scene_diffuse_list.py), whose blended draws (the
+// scenery faded in with the distance) write their motion (Draw).
+bool IsSceneDiffuseShader(uint64_t ps_hash) {
+  return std::binary_search(std::begin(kSceneDiffuseShaders), std::end(kSceneDiffuseShaders),
                             ps_hash);
 }
 // Local change (pgr4 project): the water plane (vsWaterPlane's 4 vertices, float3 positions first)
@@ -1252,10 +1325,18 @@ struct DrawRenderer::Impl {
     uint32_t data[kMaxSlots * 6 + kMaxIndices + kMaxBound];
     TextureHandle entry[kMaxBound];
   };
-  static constexpr uint32_t kBindMemoSetBits = 11;
+  // Local change: the set bits from --pgr4_native_bind_memo_bits (ResizeBindMemo).
+  uint32_t bind_memo_bits = 11;
   std::unique_ptr<BindMemo[]> bind_memo =
-      std::make_unique<BindMemo[]>(size_t(2) << kBindMemoSetBits);
+      std::make_unique<BindMemo[]>(size_t(2) << bind_memo_bits);
   uint64_t bind_clock = 0;
+  // A new, empty memo of 2 x 2^bits entries; the shader slots' last entries pointed into the old.
+  void ResizeBindMemo(uint32_t bits) {
+    bind_memo_bits = bits;
+    bind_memo = std::make_unique<BindMemo[]>(size_t(2) << bits);
+    for (ShaderSlots& ss : shader_slots) ss.last = nullptr;
+    REXLOG_INFO("PGR4 native draw: texture binding memo of {} entries", size_t(2) << bits);
+  }
 
   // Pipelines by PipelineKey hash. With --pgr4_native_async_pipelines new ones compile on
   // pso_threads and the draws that need them are skipped until they are ready
@@ -1277,6 +1358,11 @@ struct DrawRenderer::Impl {
     // The store record the pipeline was prewarmed from: the first draw that uses it touches the
     // record (it survives another kKeepSessions), then this is kNoEntry again (draw thread only).
     uint32_t store_entry = PipelineStore::kNoEntry;
+    // Development (18/11/2026, a flicker with every recorded pipeline prewarmed): the record it
+    // was prewarmed from (kNoEntry: made for a draw), whether its pixel shader was ours when it
+    // was made, and whether its first use was logged.
+    uint32_t prewarm_entry = PipelineStore::kNoEntry;
+    bool made_with_ours = false, prewarm_logged = false;
     bool prewarm = false;  // its job was queued in prewarm_jobs (draw thread only)
     // A specialization whose draws use their unspecialized shaders' pipeline until it is ready
     // (draw thread only).
@@ -1481,6 +1567,12 @@ struct DrawRenderer::Impl {
   double particles_seen = 0.0, shelter_began = 0.0, shelter_ended = 0.0;
   static constexpr double kShelterSeconds = 0.2;
   float clock_s = 0.0f;
+  // Local change (18/11/2026, pgr4_native_water_live): the water's draws' constants
+  // (SystemConstantsWithSun::water), set once a frame: the race's weather's tuning, the eight waves'
+  // phases (radians, wrapped at 2 pi) and the two noise layers' drift (cells, wrapped at 1024), each
+  // advanced by the frame's time times the waves' speed (water_hooks.hlsli).
+  float water[24] = {};
+  double water_phase[8] = {}, water_drift[4] = {};
   // Local change (pgr4 project): the weather's rain (SystemConstantsWithSun::time.yz), for the wet
   // roads (road_reflect_hooks.hlsli): the settings the game gives its rain's shader (kRainShader)
   // from the weather it chose at the race's load (its VS's c209.x: 0.075 in light rain, 0.1 in heavy
@@ -1509,6 +1601,13 @@ struct DrawRenderer::Impl {
   };
   History history[1];
   float road_clip[16] = {}, road_view[12] = {};  // this frame's, from its last road draw
+  // The photo mode's focus texel (g_pgr4_photo_focus_depth): readback buffers in flight.
+  struct FocusReadback {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    uint64_t fence = 0, frame = 0;
+    bool pending = false;
+  };
+  FocusReadback focus_readback[4];
   void UpdateDropsGlide() {
     const auto now = std::chrono::steady_clock::now();
     const double dt = std::min(
@@ -1804,10 +1903,56 @@ struct DrawRenderer::Impl {
   // prewarm job waits behind every draw's job).
   // Local change: what a replaced pixel shader's pipelines' hash is XORed with (the replacer's
   // generation, plus one: never 0, which is the game's shader's), 0 for the others.
-  uint64_t ReplacedTag(const DxbcShader* ps) const {
-    return ps && replacer.Has(ps->ucode_data_hash())
-               ? (replacer.generation() + 1) * 0x9E3779B97F4A7C15ull
-               : 0;
+  uint64_t ReplacedTag(const DxbcShader* ps) const { return ps ? Traits(ps).replaced_tag : 0; }
+  // Local change (pgr4 project, perf-cpu): what the draws ask about a pixel shader, worked out
+  // once per shader and state of the replacer (ShaderReplacer::stamp) instead of at every draw:
+  // whether a file of ours replaces it (Has: up to three hash tables), its pipelines' tag, whether
+  // it is a wet road's (a binary search in some 470 hashes, up to five times a draw). A small
+  // table by ucode hash; a slot taken by another shader is worked out again.
+  struct PsTraits {
+    uint64_t hash = 0, stamp = 0;  // stamp 0: empty
+    uint64_t replaced_tag = 0;
+    bool replaced = false, road = false, paint_checked = false;
+    uint32_t capture_period = UINT32_MAX;  // the capture dir's logging (SelectPipeline)
+  };
+  mutable std::array<PsTraits, 512> ps_traits;
+  PsTraits& Traits(const DxbcShader* ps) const {
+    const uint64_t hash = ps->ucode_data_hash();
+    const uint64_t stamp = replacer.stamp() + 1;
+    PsTraits& t = ps_traits[(hash ^ (hash >> 29)) & (ps_traits.size() - 1)];
+    // memo_on false (--pgr4_native_draw_memo): worked out at every draw, as before perf-cpu.
+    if (!memo_on || t.hash != hash || t.stamp != stamp) {
+      t = {};
+      t.hash = hash;
+      t.stamp = stamp;
+      t.replaced = replacer.Has(hash);
+      t.replaced_tag = t.replaced ? (replacer.generation() + 1) * 0x9E3779B97F4A7C15ull : 0;
+      t.road = IsRoadReflectShader(hash);
+    }
+    return t;
+  }
+  // Once per frame (Draw): whether the capture dir is set (a string cvar read), and the 2 s period
+  // of SelectPipeline's car shader logging.
+  uint64_t flags_frame = UINT64_MAX;
+  bool capture_on = false;
+  uint32_t capture_period = 0;
+  // Test (18/11/2026): perf-cpu's draw path changes (9086eed: the pixel shaders' answers, the
+  // programs' hash taken at their load, the capture dir read once a frame, the viewport worked
+  // out once a draw, BindTextures' return for no texture) on or off, to measure them on testing.
+  bool memo_on = true;
+  void RefreshFrameFlags() {
+    if (flags_frame == frame_count) return;
+    flags_frame = frame_count;
+    memo_on = REXCVAR_GET(pgr4_native_draw_memo);
+    // Local change (18/11/2026), live.
+    if (const uint32_t bits = uint32_t(std::clamp(REXCVAR_GET(pgr4_native_bind_memo_bits), 11, 15));
+        bits != bind_memo_bits)
+      ResizeBindMemo(bits);
+    capture_on = !REXCVAR_GET(pgr4_native_capture_dir).empty();
+    capture_period = uint32_t(std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count() /
+                              2);
   }
   Pipeline* CreatePipeline(uint64_t hash, const PipelineKey& key, const DxbcShader::Translation& vs,
                            const DxbcShader::Translation* ps, bool prewarm,
@@ -2912,32 +3057,233 @@ bool DrawRenderer::Impl::CommitCbv(CachedCbv& cb, uint32_t root_index,
   return true;
 }
 
+namespace {
+// Local change (pgr4 project, 16/11/2026): the crowd's vertex shaders (their motion: the camera's,
+// Draw).
+bool CrowdVertexShader(uint64_t vs_hash) {
+  return vs_hash == 0x72EE8062BF5E764Aull || vs_hash == 0x9A50B766C7D5C8EEull ||  // OneBone
+         vs_hash == 0x01BD899300E132E4ull || vs_hash == 0x5919164FE3FF8DF6ull;    // TwoBone
+}
+
+// Local change (pgr4 project, 16/11/2026): the first register of a vertex shader's placement (its
+// object-to-world matrix, three registers, translation in .w) for BindPreviousConstants, from the
+// shaders' disassembly (work/shaders): c0-c3 in the scene's shaders; c48 in the animated
+// characters'. (The crowd's, a palette, is not matched: CrowdVertexShader.)
+uint32_t PlacementRegister(uint64_t vs_hash) {
+  switch (vs_hash) {
+    case 0x09E714771FA3E70Bull:  // vsSkinnedModel_NoShadow_NoBump_UV2
+    case 0xD86D9A7071D7C833ull:
+    case 0x10A597BFA73277C4ull:  // vsSkinnedModel_NoShadow_Bump_UV2
+    case 0x438D84266A7D64BFull:  // vsSkinnedModel_NoShadow_Bump_UV1
+    case 0x5DD7312CFE2CD191ull:  // vsSkinnedModel_NoShadow_NoBump_UV1
+    case 0xFC40DDD14E7EB051ull:
+    case 0x1DE756F11D611EEBull:  // vsSkinnedModel_Shadow_NoBump_UV1
+    case 0x6FC24D9D5FB015F4ull:  // vsSkinnedModel_Shadow_Bump_UV2
+    case 0xB274E36DBE9EDD2Cull:  // vsSkinnedModel_Shadow_Bump_UV1
+    case 0xE20D0283509F88DBull:  // vsSkinnedModel_Shadow_NoBump_UV2
+      return 48;
+    default:
+      return 0;
+  }
+}
+}  // namespace
+
 void DrawRenderer::Impl::BindPreviousConstants(const DrawState& s, const DxbcShader& vs_generic,
                                                const DxbcShader* vs,
                                                ID3D12GraphicsCommandList* list) {
+  motion_history.PrefetchNext();  // local change: the draws a few places later (same results)
   const uint64_t identity = vs_generic.ucode_data_hash() ^
                             (uint64_t(s.index_address) << 32 | s.count) ^
                             (uint64_t(s.primitive) << 58);
-  const uint64_t key = motion_history.Key(identity);
+  uint32_t occurrence = 0;
+  const uint64_t key = motion_history.Key(identity, &occurrence);
   // Local change (pgr4 project): matched first by the draw's placement too (c0-c3, the object's
   // transform in PGR4's scene shaders). The game culls its instanced props (signs, barriers) by
   // group, so as the camera turns a group's order among draws of the same mesh shifts and the
   // order alone gave it another group's previous transform: wrong motion, jumps in DLSS. A
   // static group keeps its placement, so it finds its own; a moving object (cars) falls back
   // to the order.
-  const uint64_t placed_key = motion_history.Key(
-      identity ^ 0x9E3779B97F4A7C15ull * (1 | XXH3_64bits(s.regs + XE_GPU_REG_SHADER_CONSTANT_000_X,
-                                                          16 * sizeof(uint32_t))));
-  const MotionHistory::Constants now = {vs, cb_float_vs.gpu, cb_fetch.gpu};
+  // Local change (pgr4 project, 16/11/2026): the animated characters' (vsSkinnedModel_*: the
+  // drivers, marshals, the race control's staff) read their placement at c48-c50, their bones
+  // from a vertex stream.
+  const uint32_t placement_register = PlacementRegister(vs_generic.ucode_data_hash());
+  const uint32_t* const placement =
+      s.regs + XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * placement_register;
+  uint32_t group = 0;
+  const uint64_t placed_identity =
+      identity ^ 0x9E3779B97F4A7C15ull *
+                     (1 | XXH3_64bits(placement, (placement_register ? 12 : 16) * sizeof(uint32_t)));
+  const uint64_t placed_key = motion_history.Key(placed_identity, &group);
+  motion_history.LogHomes(identity, placed_identity, key, placed_key);  // local change
+  MotionHistory::Constants now = {vs, cb_float_vs.gpu, cb_fetch.gpu};
+  {
+    float c[12];
+    std::memcpy(c, placement, sizeof(c));
+    now.pos[0] = c[3];
+    now.pos[1] = c[7];
+    now.pos[2] = c[11];
+    // Local change (17/11/2026): the whole transform, for the match by transform below.
+    if (!placement_register) {
+      std::memcpy(now.xf, c, sizeof(c));
+      now.has_xf = true;
+    }
+  }
+  now.group = group;
+  const bool transform_match = REXCVAR_GET(pgr4_native_motion_transform_match);
+  const uint64_t mesh =
+      vs_generic.ucode_data_hash() ^ (uint64_t(s.count) << 8) ^ (uint64_t(s.primitive) << 58);
   const MotionHistory::Constants* previous = motion_history.Previous(placed_key);
   const bool by_place = previous && previous->vs == vs;
-  if (!by_place) previous = motion_history.Previous(key);
-  const bool by_order = !by_place && previous && previous->vs == vs;
+  // Local change (pgr4 project, 16/11/2026): a moving draw (no placement match: the cars) takes,
+  // among the previous frame's draws of the same mesh near its rank, the one nearest to where it
+  // went (its position plus its own motion of the frame before, MotionHistory::Constants::vel).
+  // By its rank alone, two identical parts that swapped places in the order (two wheels, two
+  // mirrors, two cars of the same model) took each other's previous transform: a motion of the
+  // whole distance between them, which frame generation followed. The animated characters
+  // (placement_register): dozens share a mesh and their order changes, so the nearest is looked
+  // for where they stand, by ground cell (MotionHistory::NearestInCells).
+  if (!by_place && placement_register) previous = motion_history.NearestInCells(mesh, now.pos, vs);
+  if (!by_place && !previous) {
+    float best = 0.0f;
+    const uint32_t first = occurrence > 4 ? occurrence - 4 : 0;
+    for (uint32_t k = first; k <= occurrence + 4; ++k) {
+      const MotionHistory::Constants* p = motion_history.Previous(MotionHistory::KeyAt(identity, k));
+      if (!p) {
+        if (k > occurrence) break;  // the previous frame had fewer of them
+        continue;
+      }
+      if (p->vs != vs) continue;
+      float d;
+      if (transform_match && now.has_xf && p->has_xf) {
+        // Local change (17/11/2026): by where its whole transform went (MotionHistory::Predict),
+        // and among the same transform (the passes of one object) by its rank in its group.
+        float predicted[12];
+        MotionHistory::Predict(*p, predicted);
+        d = MotionHistory::Distance(predicted, now.xf);
+        if (previous && std::abs(d - best) <= 1e-6f * (1.0f + best)) {
+          if (p->group == now.group && previous->group != now.group) previous = p, best = d;
+          continue;
+        }
+      } else {
+        const float dx = p->pos[0] + p->vel[0] - now.pos[0],
+                    dy = p->pos[1] + p->vel[1] - now.pos[1], dz = p->pos[2] + p->vel[2] - now.pos[2];
+        d = dx * dx + dy * dy + dz * dz;
+      }
+      if (!previous || d < best) {
+        previous = p;
+        best = d;
+      }
+    }
+  }
+  const bool by_order = !by_place && previous;
   if (!by_place && !by_order) previous = &now;
+  // Its motion for the next frame's match (a jump past any car's, a mismatch or a teleport such
+  // as a replay's cut, is not kept).
+  if (by_order) {
+    float v[3], v2 = 0.0f;
+    for (int i = 0; i < 3; ++i) {
+      v[i] = now.pos[i] - previous->pos[i];
+      v2 += v[i] * v[i];
+    }
+    constexpr float kMaxStep = 6.0f;  // world units (metres) a frame: 360 m/s at 60 frames a second
+    if (v2 <= kMaxStep * kMaxStep) std::memcpy(now.vel, v, sizeof(v));
+    // Local change (17/11/2026): its whole transform's change (MotionHistory::Constants::delta),
+    // kept as the velocity is: not past a car's step at the origin or a metre along its axes.
+    if (transform_match && now.has_xf && previous->has_xf) {
+      float inverse[12], delta[12];
+      if (MotionHistory::Inverse(previous->xf, inverse)) {
+        MotionHistory::Compose(now.xf, inverse, delta);
+        static constexpr float kIdentity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+        if (MotionHistory::Distance(delta, kIdentity) <= 4.0f * kMaxStep * kMaxStep)
+          std::memcpy(now.delta, delta, sizeof(delta));
+      }
+    }
+  }
+  // Local change (pgr4 project, 18/11/2026, Tazz: a doubled tyre and hubcap in the generated
+  // frames): a part spinning fast about its own x axis (a wheel's tyre, rim, hubcap, disc: found
+  // by its transform's change, not by its shader) gets its axle's motion, not its spin. Its spin
+  // between two computed frames (58 to 117 degrees for a drifting car at 44 frames a second) is
+  // more than its pattern shows (a spoke follows a spoke, the game blurs the tread and the rims),
+  // and frame generation, sent half of it, blended two images of it. Its previous transform is
+  // then its own with this frame's spin: W_prev T(c) R_x(angle) T(-c), c its axle (the fixed
+  // point of the model-space change, averaged over frames), in a copy of its previous frame's
+  // constants (MotionHistory::StoreBlob).
+  D3D12_GPU_VIRTUAL_ADDRESS spin_previous = 0;
+  if (transform_match && by_order && now.has_xf && previous->has_xf && vs &&
+      REXCVAR_GET(pgr4_native_motion_spin_axle)) {
+    // Past the game's own switch to its blurred rims (10 rad/s, 13 degrees a frame at 44).
+    constexpr float kSpinPerFrame = 0.23f;
+    float inverse[12], m[12];
+    if (MotionHistory::Inverse(previous->xf, inverse)) {
+      MotionHistory::Compose(inverse, now.xf, m);  // in its model: the previous frame's to this one
+      const float angle = std::atan2(m[9] - m[6], m[5] + m[10]);
+      if (std::abs(m[0]) > 0.98f && std::abs(angle) >= kSpinPerFrame) {
+        const float a = 1.0f - m[5], b = -m[6], c = -m[9], d = 1.0f - m[10];
+        const float det = a * d - b * c;
+        if (std::abs(det) > 1e-4f) {
+          float cy = (d * m[7] - b * m[11]) / det, cz = (a * m[11] - c * m[7]) / det;
+          if (previous->has_axle && std::abs(cy - previous->axle[0]) < 0.5f &&
+              std::abs(cz - previous->axle[1]) < 0.5f) {
+            cy = previous->axle[0] + 0.25f * (cy - previous->axle[0]);
+            cz = previous->axle[1] + 0.25f * (cz - previous->axle[1]);
+          }
+          now.axle[0] = cy;
+          now.axle[1] = cz;
+          now.has_axle = true;
+          now.blob = motion_history.StoreBlob(cb_float_vs.last, cb_float_vs.size);
+          now.blob_size = now.blob == UINT32_MAX ? 0 : cb_float_vs.size;
+          const float co = std::cos(angle), si = std::sin(angle);
+          const float spin[12] = {1, 0,  0,   0,
+                                  0, co, -si, cy - co * cy + si * cz,
+                                  0, si, co,  cz - si * cy - co * cz};
+          float hub[12];
+          MotionHistory::Compose(previous->xf, spin, hub);
+          const uint8_t* old = motion_history.PreviousBlob(previous->blob, previous->blob_size);
+          const uint64_t bits = vs->constant_register_map().float_bitmap[0];
+          if (old && (bits & 7) == 7 && previous->blob_size <= CachedCbv::kMaxSize) {
+            alignas(16) static uint8_t patched[CachedCbv::kMaxSize];
+            std::memcpy(patched, old, previous->blob_size);
+            std::memcpy(patched, hub, sizeof(hub));  // registers 0-2, packed first
+            const uint32_t bytes = (previous->blob_size + 15) / 16 * 16;
+            UploadPool::Alloc alloc;
+            if (constant_upload.Allocate(bytes, 256, r.frame_fence(), &alloc)) {
+              std::memcpy(alloc.cpu, patched, bytes);
+              spin_previous = alloc.gpu;
+            }
+          }
+        }
+      }
+    }
+  }
+  // pgr4_native_light_motion_probe (above): one line a frame, the overlay's draws as
+  // index-address/count#rank:P (by placement), O (by order, the step to the previous draw's
+  // position) or N (none: no motion of its own, not even the camera's).
+  if (vs_generic.ucode_data_hash() == 0x1F133756316FDF1Cull &&
+      REXCVAR_GET(pgr4_native_light_motion_probe)) {
+    static uint64_t line_frame = 0;
+    static std::string line;
+    const uint64_t frame = r.frame_index();
+    if (frame != line_frame) {
+      if (!line.empty()) REXLOG_INFO("PGR4 light motion: frame {}:{}", line_frame, line);
+      line.clear();
+      line_frame = frame;
+    }
+    char item[96];
+    if (by_place || !by_order) {
+      std::snprintf(item, sizeof(item), " %08X/%u#%u:%c", s.index_address, s.count, occurrence,
+                    by_place ? 'P' : 'N');
+    } else {
+      const float dx = now.pos[0] - previous->pos[0], dy = now.pos[1] - previous->pos[1],
+                  dz = now.pos[2] - previous->pos[2];
+      std::snprintf(item, sizeof(item), " %08X/%u#%u:O%.2f", s.index_address, s.count, occurrence,
+                    std::sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    line += item;
+  }
   // Development (capture dir set): how many draws found their previous constants by their placement, by their
   // order, or none (no motion of their own then, not even the camera's: ghosts in generated frames if it lasts),
   // every 300 frames (14/11/2026).
-  if (!REXCVAR_GET(pgr4_native_capture_dir).empty()) {
+  if (capture_on) {
     static uint64_t place = 0, order = 0, none = 0, first_frame = 0;
     (by_place ? place : by_order ? order : none)++;
     const uint64_t frame = r.frame_index();
@@ -2952,10 +3298,12 @@ void DrawRenderer::Impl::BindPreviousConstants(const DrawState& s, const DxbcSha
       first_frame = frame;
     }
   }
-  if (bound_previous_float != previous->float_constants) {
+  const D3D12_GPU_VIRTUAL_ADDRESS previous_float =
+      spin_previous ? spin_previous : previous->float_constants;
+  if (bound_previous_float != previous_float) {
     list->SetGraphicsRootConstantBufferView(kBindlessRoot_PreviousFloatConstantsVertex,
-                                            previous->float_constants);
-    bound_previous_float = previous->float_constants;
+                                            previous_float);
+    bound_previous_float = previous_float;
   }
   // Local change (pgr4 project): with --pgr4_native_motion_current_fetch the previous position
   // reads this frame's vertex streams. PGR4 rewrites instanced props' transforms (lamp posts,
@@ -2972,6 +3320,7 @@ void DrawRenderer::Impl::BindPreviousConstants(const DrawState& s, const DxbcSha
   }
   motion_history.Record(key, now);
   motion_history.Record(placed_key, now);
+  if (placement_register) motion_history.RecordCell(mesh, now.pos, now);
 }
 
 uint32_t DrawRenderer::Impl::TextureDescriptor(const TextureBinding& b,
@@ -3118,6 +3467,7 @@ void DrawRenderer::Impl::ResumeAwaiting(Pipeline* p) {
   p->await_desc.PS.pShaderBytecode = code->data();
   p->await_desc.PS.BytecodeLength = code->size();
   p->awaiting_hlsl = false;
+  p->made_with_ours = code != &p->await_ps->translated_binary();
   if (!pso_threads.empty()) {
     {
       std::lock_guard<std::mutex> lock(pso_mutex);
@@ -3293,9 +3643,15 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(
     b.LogicOp = D3D12_LOGIC_OP_NOOP;
     b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN;
   }
+  const bool emplaced = !pipelines.count(hash);
   Pipeline* p = pipelines.emplace(hash, std::make_unique<Pipeline>()).first->second.get();
+  if (!emplaced)
+    PGR4_LOG_FIRST(50, WARN, "PGR4 native pipelines: {:016X} made again over an existing one "
+                             "(prewarm {}, entry {})", hash, prewarm, store_entry);
   p->ps_ucode_hash = ps ? ps->shader().ucode_data_hash() : 0;
   p->store_entry = store_entry;
+  p->prewarm_entry = prewarm ? store_entry : PipelineStore::kNoEntry;
+  p->made_with_ours = ps && !key.disable_raster && d.PS.pShaderBytecode != ps->translated_binary().data();
   if (awaiting) {
     p->awaiting_hlsl = true;
     p->await_ps = ps;
@@ -3662,9 +4018,12 @@ DxbcShader* DrawRenderer::Impl::LoadShader(ShaderMemo* table, ShaderMemo*& last,
   // Declaration-patched vertex shaders (IM_LOAD_IMMEDIATE) come from the tracker's copy.
   const uint32_t* ucode =
       ref.immediate ? ref.immediate : reinterpret_cast<const uint32_t*>(membase + ref.ucode);
-  // Local change: the whole program checked (XXH3, about a kilobyte per draw), the previous
-  // draw's shader again included.
-  const uint64_t content = XXH3_64bits(ucode, size_t(ref.dwords) * sizeof(uint32_t));
+  // Local change: the whole program checked (XXH3), the previous draw's shader again included;
+  // taken once at its load by the tracker (ShaderRef::content, perf-cpu) rather than at every
+  // draw (about 2 KB hashed a draw), as the GPU runs what it loaded.
+  const uint64_t content =
+      ref.content && memo_on ? ref.content
+                             : XXH3_64bits(ucode, size_t(ref.dwords) * sizeof(uint32_t));
   // The previous draw's shader again (most draws), as before the table.
   if (last && last->shader && last->ucode == ref.ucode && last->dwords == ref.dwords &&
       last->immediate_seq == ref.immediate_seq && last->binding == ref.binding &&
@@ -3865,7 +4224,8 @@ void DrawRenderer::Impl::SyncListFrame() {
   for (CachedCbv* cb : Cbvs()) cb->Reset();
   // The motion vector pass reads the previous frame's constants where that frame uploaded them.
   constant_upload.set_keep_previous_frame(r.upscaler() != nullptr);
-  motion_history.BeginFrame(list_frame);
+  motion_history.BeginFrame(list_frame, REXCVAR_GET(pgr4_native_motion_prefetch),
+                            REXCVAR_GET(pgr4_native_motion_prefetch_whole));
 }
 
 DxbcShader::Translation* DrawRenderer::Impl::Translated(DxbcShader& shader, uint64_t modification) {
@@ -4125,22 +4485,28 @@ ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
   uint64_t key_hash = XXH3_64bits(&key, sizeof(key));
   // Local change: a replaced pixel shader's pipelines are made again at each reload of its file
   // (ShaderReplacer::generation).
-  const uint64_t replaced = ReplacedTag(ps);
+  PsTraits* const traits = ps ? &Traits(ps) : nullptr;
+  const uint64_t replaced = traits ? traits->replaced_tag : 0;
   key_hash ^= replaced;
-  if (replaced && ps && paints_seen.insert(ps->ucode_data_hash()).second && replacer.IsCarPaint(ps->ucode_data_hash()))
-    paints_to_prepare.push_back(ps);
+  if (replaced && !traits->paint_checked) {
+    traits->paint_checked = true;
+    if (paints_seen.insert(ps->ucode_data_hash()).second && replacer.IsCarPaint(ps->ucode_data_hash()))
+      paints_to_prepare.push_back(ps);
+  }
   // Each car shader's first draw, ours or the game's, again every 2 s (the vehicles menu's car, named by the
   // VehiclePvsData file the game asks for as it shows it: tools/car_shaders.py), and any pixel shader with no name
-  // yet (shader_names.tsv to make again).
-  if (ps && !REXCVAR_GET(pgr4_native_capture_dir).empty()) {
-    static auto since = std::chrono::steady_clock::now();
-    if (const auto now = std::chrono::steady_clock::now(); now - since > std::chrono::seconds(2)) {
-      since = now;
+  // yet (shader_names.tsv to make again). The set is looked at once per shader and period (PsTraits).
+  bool capture_check = false;
+  if (traits && capture_on && traits->capture_period != capture_period) {
+    traits->capture_period = capture_period;
+    static uint32_t cleared_period = UINT32_MAX;
+    if (cleared_period != capture_period) {
+      cleared_period = capture_period;
       car_unreplaced_seen.clear();
     }
+    capture_check = true;
   }
-  if (ps && !REXCVAR_GET(pgr4_native_capture_dir).empty() &&
-      car_unreplaced_seen.insert(ps->ucode_data_hash()).second) {
+  if (capture_check && car_unreplaced_seen.insert(ps->ucode_data_hash()).second) {
     if (!shader_names_read) {
       shader_names_read = true;
       wchar_t exe[MAX_PATH] = {};
@@ -4219,6 +4585,21 @@ ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
   if (!use) use = p ? p : GetPipeline(key_hash, key, vst, pst, variant);
   // The store's record of a prewarmed pipeline ages with its first use (the pso memo above and
   // the pipelines map's hits reach no GetPipeline), so it stays while the player plays it.
+  if (use->prewarm_entry != PipelineStore::kNoEntry && use->prewarm_entry >= 16384 &&
+      !use->prewarm_logged) {
+    use->prewarm_logged = true;
+    const std::vector<uint8_t>* ours = pst ? replacer.Get(*pst) : nullptr;
+    PGR4_LOG_FIRST(400, INFO,
+                   "PGR4 native prewarm use: frame {} entry {} hash {:016X} vs {:016X}/{:X} ps "
+                   "{:016X}/{:X} replaced {} made with ours {} ours now {} state {} awaiting {} "
+                   "variant {}",
+                   r.frame_index(), use->prewarm_entry, key_hash,
+                   vst.shader().ucode_data_hash(), vst.modification(),
+                   pst ? pst->shader().ucode_data_hash() : 0, pst ? pst->modification() : 0,
+                   int(replaced != 0), int(use->made_with_ours), ours ? int(ours->size()) : -1,
+                   int(use->state.load(std::memory_order_relaxed)), int(use->awaiting_hlsl),
+                   variant);
+  }
   if (use->store_entry != PipelineStore::kNoEntry) {
     store.TouchEntry(use->store_entry);
     use->store_entry = PipelineStore::kNoEntry;
@@ -4312,6 +4693,12 @@ uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const D
   uint8_t* const signs = ctx.signs;
   const auto& tex = shader.GetTextureBindingsAfterTranslation();
   const auto& smp = shader.GetSamplerBindingsAfterTranslation();
+  // Local change (pgr4 project, perf-cpu): no texture and no sampler (most vertex shaders): the
+  // one-entry table of zeros the memo would give (ShaderSlots::Assign: n = 1), without it.
+  if (memo_on && tex.empty() && smp.empty()) {
+    indices[0] = 0;
+    return 1;
+  }
   ShaderSlots& ss = shader_slots[(reinterpret_cast<uintptr_t>(&shader) >> 6) & 511];
   if (ss.shader != &shader) ss.Assign(shader);
   const uint32_t n = ss.n;
@@ -4346,7 +4733,7 @@ uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const D
         std::memcpy(&c, f + 4, 8);
         h = (h ^ a ^ std::rotl(b, 21) ^ std::rotl(c, 42)) * 0x9E3779B97F4A7C15ull;
       }
-      BindMemo* set = &bind_memo[size_t(h >> (64 - kBindMemoSetBits)) << 1];
+      BindMemo* set = &bind_memo[size_t(h >> (64 - bind_memo_bits)) << 1];
       for (uint32_t way = 0; way < 2 && !found; ++way) {
         if (same_fetch(set[way])) {
           bm = &set[way];
@@ -4416,11 +4803,14 @@ uint32_t DrawRenderer::Impl::BindTextures(const TextureBindContext& ctx, const D
       if (REXCVAR_GET(pgr4_native_texture_catalog)) catalog.insert(e);
     }
     if (draw_log)
-      std::fprintf(draw_log, "  tf%u %08X fmt=%u %ux%ux%u dim=%u tiled=%u mips=%u%s%s\n",
+      std::fprintf(draw_log,
+                   "  tf%u %08X fmt=%u %ux%ux%u dim=%u tiled=%u mips=%u%s%s mip_page=%08X "
+                   "packed=%u\n",
                    tb.fetch_constant, b.key.base_page << 12, uint32_t(b.key.format), b.key.width,
                    b.key.height, b.key.depth_or_array_size, uint32_t(b.key.dimension),
                    uint32_t(b.key.tiled), b.key.mip_levels(), got ? "" : " missing",
-                   got && b.aliased ? " alias" : "");
+                   got && b.aliased ? " alias" : "", b.key.mip_page << 12,
+                   uint32_t(b.key.packed_mips));  // development: the mips' address (18/11/2026)
     if (got) {
       profile::Scope srv_scope(profile::kTexSrv);
       stale += b.stale;
@@ -4627,8 +5017,12 @@ void DrawRenderer::Impl::FillSystemConstants(const DrawState& s, const RegisterF
 }
 
 void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
-  ID3D12GraphicsCommandList* list = r.command_list();
+  // Local change (18/11/2026): the recorder while it is on (command_recorder.h).
+  ID3D12GraphicsCommandList* list = r.recording_list();
   SyncListFrame();
+  // With the memo off, the capture dir is read again at every draw, as before perf-cpu.
+  if (!memo_on) flags_frame = UINT64_MAX;
+  RefreshFrameFlags();
   if (prep && prep->regs_hash[0]) {
     uint64_t now[5];
     HashRegisterBlocks(s.regs, now);
@@ -4680,7 +5074,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   if (bool_specialize) {
     const uint32_t* bools = &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
     vs = vs_bools.Get(vs, bools);
-    if (!ps || !replacer.Has(ps->ucode_data_hash())) ps = ps_bools.Get(ps, bools);
+    if (!ps || !Traits(ps).replaced) ps = ps_bools.Get(ps, bools);
   }
 
   // SelectModifications reads only prim_type; the index count would defeat mods_memo.
@@ -4719,15 +5113,27 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   // The upscaler's scene: the draws that write depth write their motion too.
   const Upscaler* const scene_upscaler =
       Upscaler::IsScene(sdr.rb_surface_info) ? r.upscaler() : nullptr;
+  // Local change (pgr4 project, 16/11/2026): and the world scenery the game fades in with the
+  // distance (IsSceneDiffuseShader, blended over the scene, depth tested but not written).
+  // Without its own motion its pixels kept what is behind it, the sky's or the fog's: in fog,
+  // where the game fades whole facades in at a short distance, DLSS below native blurred and
+  // sharpened them by turns, and they flickered (Tazz, 16/11/2026). The motion target is never
+  // blended (CreatePipeline): it takes the scenery's motion, the color keeps the game's blend.
+  const bool scenery_fade = !depth_control.z_write_enable && ps_generic &&
+                            IsSceneDiffuseShader(ps_generic->ucode_data_hash());
   bool motion = mods.pixel_shader_used && depth_control.z_enable &&
-                depth_control.z_write_enable && scene_upscaler;
+                (depth_control.z_write_enable || scenery_fade) && scene_upscaler;
   // Local change (pgr4 project): only the scene's own draws, across its whole width, as the
   // jitter (FillSystemConstants): the rear-view mirror renders into a corner of the same surface
   // with its own camera, and its motion there would be the main view's in the upscaler's and
   // frame generation's inputs (ghosts of what the mirror shows, flickering in generated frames).
+  // The viewport worked out here is kept for the draw's own below (perf-cpu).
+  ViewportInfo motion_vp;
+  bool motion_vp_depth = false, motion_vp_known = false;
   if (motion) {
-    ViewportInfo motion_vp;
-    HostViewportInfo(regs, ps && ps->writes_depth(), motion_vp);
+    motion_vp_depth = ps && ps->writes_depth();
+    HostViewportInfo(regs, motion_vp_depth, motion_vp);
+    motion_vp_known = true;
     motion = Upscaler::IsSceneWidth(int32_t(motion_vp.xy_offset[0]),
                                     int32_t(motion_vp.xy_offset[0] + motion_vp.xy_extent[0]));
   }
@@ -4921,7 +5327,10 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       scissor.extent[1] = 720;
   }
   ViewportInfo vp;
-  HostViewportInfo(regs, ps && ps->writes_depth(), vp);
+  if (const bool vp_depth = ps && ps->writes_depth(); memo_on && motion_vp_known && motion_vp_depth == vp_depth)
+    vp = motion_vp;
+  else
+    HostViewportInfo(regs, vp_depth, vp);
   // Local change (pgr4 project): the interface's draws in the central 16:9 (ui_fit above); a
   // viewport in pixels (clipping off) is left as it is.
   if (ui_fit == 1 && !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
@@ -4967,7 +5376,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   const History* road_history = nullptr;
   uint32_t road_slot = 0;
   if (ps && scene_copy_ready && EnhancedReflections() && Upscaler::IsScene(sdr.rb_surface_info) &&
-      IsRoadReflectShader(ps->ucode_data_hash())) {
+      Traits(ps).road) {
     road_seen = true;
     History& h = history[0];
     if (h.valid && h.copy.color()) {
@@ -5053,7 +5462,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     rain[1] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 210 * 4);
     particles_drawn = true;
   }
-  if (ps_generic && IsRoadReflectShader(ps_generic->ucode_data_hash())) road_drawn = true;
+  if (ps_generic && Traits(ps_generic).road) road_drawn = true;
   // Local change (pgr4 project): the scene's color before its transparents, for the upscaler's
   // reactive mask (Upscaler::SnapshotOpaque): at the first blended draw without depth writes
   // after a draw that wrote depth.
@@ -5319,10 +5728,39 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       }
     }
   }
+  // Local change (pgr4 project): the scene's distance fog for the GTAO (scene_effects.cpp): the
+  // game's shaders keep exp(-distance x c10.w) of the surface, the rest the fog's color (c10.rgb).
+  if (ps && Upscaler::IsScene(sdr.rb_surface_info)) {
+    const Shader::ConstantRegisterMap& pmap = ps->constant_register_map();
+    if (!pmap.float_dynamic_addressing && ((pmap.float_bitmap[0] >> 10) & 1)) {
+      const float density = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 10 * 4 + 3);
+      if (density >= 0.0f && density < 1.0f)
+        for (int i = 0; i < 3; ++i)
+          g_pgr4_fog_color[i].store(regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 10 * 4 + i),
+                                    std::memory_order_relaxed);
+      if (density >= 0.0f && density < 1.0f &&
+          g_pgr4_fog_density.exchange(density, std::memory_order_relaxed) != density) {
+        static float logged = -1.0f;
+        if (std::abs(density - logged) > 0.25f * std::max(logged, 1e-5f)) {
+          logged = density;
+          REXLOG_INFO("PGR4 fog: density {:.5f} per metre (half the surface at {:.0f} m)", density,
+                      density > 0.0f ? 0.6931f / density : 0.0f);
+        }
+      }
+    }
+  }
   SystemConstantsWithSun sys_sun;
   DxbcShaderTranslator::SystemConstants& sys = sys_sun.sys;
   FillSystemConstants(s, regs, prim, polygonal, index_endian, vp, used_textures, signs, targets,
                       sys);
+  // Local change (pgr4 project, 16/11/2026): the crowd's motion is the camera's at each of its
+  // pixels (FillMotion, from the pixel's depth). Each crowd draw is a batch of members whose
+  // matrices the game puts in a palette (c[52 + a0]) built anew each frame from its stack, a member
+  // not keeping its slot: the previous frame's palette gave a vertex another member's place
+  // (17 to 100 render pixels of wrong motion measured on 16/11/2026). The members stand still in
+  // the world; their gestures are not followed.
+  if (motion && CrowdVertexShader(vs_generic->ucode_data_hash()))
+    sys.flags |= DxbcShaderTranslator::kSysFlag_MotionCameraOnly;
   std::memcpy(sys_sun.sun_direction, sun.direction, sizeof(sun.direction));
   std::memcpy(sys_sun.sun_color, sun.color, sizeof(sun.color));
   sys_sun.time[0] = clock_s;
@@ -5367,7 +5805,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     std::memcpy(sys_sun.view, view, sizeof(view));
   }
   std::memset(sys_sun.camera, 0, sizeof(sys_sun.camera));
-  if (ps && Upscaler::IsScene(sdr.rb_surface_info) && IsRoadReflectShader(ps->ucode_data_hash())) {
+  if (ps && Upscaler::IsScene(sdr.rb_surface_info) && Traits(ps).road) {
     if (!drops_eye_fresh) {
       for (uint32_t k = 0; k < 3; ++k)
         drops_eye[k] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 24 * 4 + k);
@@ -5385,6 +5823,12 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   sys_sun.dirt[1] = frost_weather ? 1.0f : 0.0f;
   sys_sun.dirt[2] = 0.0f;
   sys_sun.dirt[3] = float(REXCVAR_GET(pgr4_native_dirt_fine));
+  // The water's (all its draws, its reflection maps' too), with pgr4_native_water_live; zero for the
+  // others, whose system constants then stay the same.
+  if (ps && REXCVAR_GET(pgr4_native_water_live) && IsWaterShader(ps->ucode_data_hash()))
+    std::memcpy(sys_sun.water, water, sizeof(sys_sun.water));
+  else
+    std::memset(sys_sun.water, 0, sizeof(sys_sun.water));
   std::memset(sys_sun.wiper, 0, sizeof(sys_sun.wiper));
   std::memset(sys_sun.wiper_blade, 0, sizeof(sys_sun.wiper_blade));
   std::memset(sys_sun.wiper_mask, 0, sizeof(sys_sun.wiper_mask));
@@ -5446,12 +5890,12 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   // car the camera is on.
   sys_sun.camera[3] =
       (snow_falling && !water_draw &&
-               !(ps && IsRoadReflectShader(ps->ucode_data_hash()))
+               !(ps && Traits(ps).road)
            ? 1.0f
            : 0.0f) +
       (our_car ? 2.0f : 0.0f);
   if (road_seen && ps && Upscaler::IsScene(sdr.rb_surface_info) &&
-      IsRoadReflectShader(ps->ucode_data_hash())) {
+      Traits(ps).road) {
     // This frame's world to clip for its copy at the scene's end: the road VS's object to clip
     // (c4-c7) times the inverse of its object to world (c0-c2, affine), and the viewport mapping.
     auto vc = [&](uint32_t c, uint32_t k) {
@@ -5565,7 +6009,10 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     ++stats.failed;
     return;
   }
-  if (motion) BindPreviousConstants(s, *vs_generic, vs, list);
+  if (motion) {
+    profile::Scope motion_scope(profile::kCbvMotion);  // local change
+    BindPreviousConstants(s, *vs_generic, vs, list);
+  }
   profile::Mark(profile::kCbv);
   if (bound_pso != pso) {
     profile::Scope rec_pso(profile::kRecPso);  // local change
@@ -5605,12 +6052,18 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     }
   }
   if (dynamic_depth_bias && (depth_bias != bound_depth_bias || slope_bias != bound_slope_bias)) {
-    if (list9_of != list) {
-      list9.Reset();
-      list->QueryInterface(IID_PPV_ARGS(&list9));
-      list9_of = list;
+    // Local change: recorded with the recorder, whose replay makes it on the real list's
+    // ID3D12GraphicsCommandList9 in order (a List9 of the real list here would go before).
+    if (CommandRecorder* recorder = CommandRecorder::From(list)) {
+      recorder->RSSetDepthBias(depth_bias, 0.0f, slope_bias);
+    } else {
+      if (list9_of != list) {
+        list9.Reset();
+        list->QueryInterface(IID_PPV_ARGS(&list9));
+        list9_of = list;
+      }
+      if (list9) list9->RSSetDepthBias(depth_bias, 0.0f, slope_bias);
     }
-    if (list9) list9->RSSetDepthBias(depth_bias, 0.0f, slope_bias);
     bound_depth_bias = depth_bias;
     bound_slope_bias = slope_bias;
   }
@@ -5799,12 +6252,30 @@ bool DrawRenderer::Initialize() { return impl_->Initialize(); }
 bool DrawRenderer::OnSceneEnd(ID3D12GraphicsCommandList* list, RenderTargets& targets,
                               const SurfaceRegs& regs) {
   Impl& m = *impl_;
-  if (!m.road_seen || !m.scene_copy_ready) return false;
+  // Local change (19/11/2026): also in the photo mode, for its focus (g_pgr4_photo_focus_depth).
+  const bool focus = REXCVAR_GET(pgr4_native_photo_focus_depth) && Pgr4PhotoModeActive();
+  if (!(m.road_seen || focus) || !m.scene_copy_ready) return false;
   Impl::History& h = m.history[0];
   if (!h.copy.Take(list, targets, regs, Upscaler::SceneHeight(), m.frame_count)) return false;
   std::memcpy(h.clip, m.road_clip, sizeof(h.clip));
   std::memcpy(h.view, m.road_view, sizeof(h.view));
   h.valid = true;
+  if (focus) {
+    // The texel at the copy's centre (the game reads its depth resolve's, width / 2, height / 2),
+    // read back once the GPU is done (EndFrame).
+    Impl::FocusReadback& f = m.focus_readback[m.frame_count % std::size(m.focus_readback)];
+    if (!f.pending) {
+      if (!f.buffer)
+        CreateBuffer(m.device, D3D12_HEAP_TYPE_READBACK, 256, D3D12_RESOURCE_STATE_COPY_DEST,
+                     "photo focus", &f.buffer);
+      if (f.buffer) {
+        h.copy.CopyDepthTexel(list, f.buffer.Get(), h.copy.width() / 2, h.copy.height() / 2);
+        f.fence = m.r.frame_fence();
+        f.frame = m.frame_count;
+        f.pending = true;
+      }
+    }
+  }
   m.ResetListState();
   return true;
 }
@@ -6018,7 +6489,7 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   if (impl_->view_heap_overflow) [[unlikely]] {
     impl_->view_heap_overflow = false;
     for (size_t i = 0; i < (size_t(1) << Impl::kSrvMemoBits); ++i) impl_->srv_memo[i] = Impl::SrvMemo{};
-    for (size_t i = 0; i < (size_t(2) << Impl::kBindMemoSetBits); ++i) impl_->bind_memo[i].shader = nullptr;
+    for (size_t i = 0; i < (size_t(2) << impl_->bind_memo_bits); ++i) impl_->bind_memo[i].shader = nullptr;
   }
   stats_.watch_faults = impl_->watch_faults.exchange(0, std::memory_order_relaxed);
   stats_.watch_arms = impl_->watch_arms.exchange(0, std::memory_order_relaxed);
@@ -6054,10 +6525,44 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   impl_->road_drawn = false;
   {
     const auto clock_now = std::chrono::steady_clock::now();
-    if (!g_pgr4_game_paused)
-      impl_->clock_total += std::chrono::duration<double>(clock_now - impl_->clock_last).count();
+    const double dt = g_pgr4_game_paused
+                          ? 0.0
+                          : std::chrono::duration<double>(clock_now - impl_->clock_last).count();
+    impl_->clock_total += dt;
     impl_->clock_last = clock_now;
     impl_->clock_s = float(std::fmod(impl_->clock_total, 3600.0));
+    if (REXCVAR_GET(pgr4_native_water_live)) {
+      // As water_hooks.hlsli's XeWaveSlope: wave k's length 7 * 0.66^k * size metres, its phase's
+      // rate the wavenumber times deep water's speed; the noise drifting with the wind at 0.35 and
+      // 0.75 metres a second, in its cells (0.55 and 1.9 per metre over the size).
+      const WaterTuning t = WaterTuningFor(WaterWeather());
+      const double size = std::max(double(t.wave_size), 1e-3), run = dt * double(t.wave_speed);
+      constexpr double kTwoPi = 6.283185307179586;
+      for (int k = 0; k < 8; ++k) {
+        const double wavenumber = 6.2832 / (7.0 * std::pow(0.66, k) * size);
+        double& phase = impl_->water_phase[k];
+        phase = std::fmod(phase + run * wavenumber * std::sqrt(9.81 / wavenumber), kTwoPi);
+        if (phase < 0.0) phase += kTwoPi;
+      }
+      const double wind[2] = {std::cos(double(t.wind_angle)), std::sin(double(t.wind_angle))};
+      for (int n = 0; n < 2; ++n) {
+        const double cells = run * (0.35 + 0.4 * n) * (n == 0 ? 0.55 : 1.9) / size;
+        for (int a = 0; a < 2; ++a) {
+          double& drift = impl_->water_drift[2 * n + a];
+          drift += wind[a] * cells;
+          drift -= 1024.0 * std::floor(drift / 1024.0);
+        }
+      }
+      const float values[24] = {
+          t.wave_strength, t.wave_steepness, t.wave_noise, float(size),
+          t.wind_angle, t.water_reflect, t.sun_waves, t.haze,
+          float(impl_->water_phase[0]), float(impl_->water_phase[1]), float(impl_->water_phase[2]),
+          float(impl_->water_phase[3]), float(impl_->water_phase[4]), float(impl_->water_phase[5]),
+          float(impl_->water_phase[6]), float(impl_->water_phase[7]),
+          float(impl_->water_drift[0]), float(impl_->water_drift[1]), float(impl_->water_drift[2]),
+          float(impl_->water_drift[3]), 1.0f, 0.0f, 0.0f, 0.0f};
+      std::memcpy(impl_->water, values, sizeof(values));
+    }
     if (impl_->particles_drawn) {
       if (impl_->sheltered) impl_->shelter_ended = impl_->clock_total;
       impl_->sheltered = false;
@@ -6073,6 +6578,23 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   impl_->UpdateDropsGlide();
   impl_->replacer.Poll();
   impl_->WriteSnapshots(completed_fence);
+  // Local change (19/11/2026): the photo mode's focus texels the GPU is done with, the newest kept.
+  for (Impl::FocusReadback& f : impl_->focus_readback) {
+    if (!f.pending || f.fence > completed_fence) continue;
+    f.pending = false;
+    void* data = nullptr;
+    const D3D12_RANGE read = {0, sizeof(float)};
+    if (FAILED(f.buffer->Map(0, &read, &data))) continue;
+    float depth = 0.0f;
+    std::memcpy(&depth, data, sizeof(depth));
+    const D3D12_RANGE written = {0, 0};
+    f.buffer->Unmap(0, &written);
+    if (f.frame + 1 > g_pgr4_photo_focus_frame.load(std::memory_order_relaxed)) {
+      g_pgr4_photo_focus_depth.store(depth, std::memory_order_relaxed);
+      g_pgr4_photo_focus_frame.store(f.frame + 1, std::memory_order_release);
+    }
+  }
+  g_pgr4_draw_frame.store(impl_->frame_count + 1, std::memory_order_relaxed);
   // Debug: the cube's sky's geometry read back (Draw), hashed.
   for (uint32_t s = 0; s < 8; ++s) {
     auto& p = impl_->geometry_probe[s];

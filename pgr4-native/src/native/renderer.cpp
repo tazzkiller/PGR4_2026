@@ -27,6 +27,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/logging.h>
+#include <fmt/format.h>
 #include <rex/system/xfile.h>
 #include <rex/runtime.h>
 #include <rex/system/interfaces/graphics.h>
@@ -50,6 +51,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 // patches/0025 (xam_input.cpp): what user 0's XamInputGetState calls returned
@@ -86,6 +88,23 @@ REXCVAR_DEFINE_STRING(pgr4_native_csv, "", "PGR4 native",
                       "Per-frame CSV of the native path: counts and CPU time per hook class");
 REXCVAR_DEFINE_INT32(pgr4_native_width, 1280, "PGR4 native", "Debug window width");
 REXCVAR_DEFINE_INT32(pgr4_native_height, 720, "PGR4 native", "Debug window height");
+// Local change (18/11/2026, Tazz: "a prerequisite of DLSS"): the game's motion blur off while DLSS
+// runs (ApplyMotionBlurRule), whatever the menu's FLOU DE MOUVEMENT (pgr4_disable_motion_blur,
+// which applies at the game's start); without DLSS, the menu's choice. Read at each frame.
+REXCVAR_DEFINE_BOOL(pgr4_native_dlss_no_motion_blur, true, "PGR4 native",
+                    "The game's motion blur off while DLSS runs (its prerequisite)");
+// Local change (19/11/2026, Tazz: « le flou qui doit se désactiver c'est celui dans les options
+// seulement »): the rule above held the byte at 0 in the photo mode too, so its view lost its
+// motion blur under DLSS. The photo mode (its camera, sub_827D2400, ran in the last frames) gets the
+// menu's choice back, as without DLSS. Read at each frame.
+REXCVAR_DEFINE_BOOL(pgr4_native_dlss_blur_in_photo_mode, true, "PGR4 native",
+                    "Under DLSS, the photo mode keeps the game's motion blur (the menu's choice)");
+// The same for the pause (19/11/2026, Tazz: « active le je vais te dire »): the game's clock still
+// for 6 frames (g_pgr4_game_paused, src/pgr4_hooks.cpp: the pause and the photo mode). Read at each
+// frame.
+REXCVAR_DEFINE_BOOL(pgr4_native_dlss_blur_in_pause, true, "PGR4 native",
+                    "Under DLSS, the pause keeps the game's motion blur (the menu's choice)");
+REXCVAR_DECLARE(bool, pgr4_disable_motion_blur);  // src/pgr4_hooks.cpp
 REXCVAR_DEFINE_BOOL(pgr4_native_profile, false, "PGR4 native",
                     "Per-stage CPU time of the draw path (RDTSC), appended to the native CSV as "
                     "st_<stage>_us columns and to the stats log line");
@@ -149,6 +168,10 @@ REXCVAR_DEFINE_INT32(
 REXCVAR_DECLARE(std::string, pgr4_native_capture_dir);
 // The last screen the game loaded was a race's (games/pgr4/src/pgr4_menu.cpp).
 bool Pgr4InGameScreen();
+// The photo mode's camera ran in the last frames (src/pgr4_hooks.cpp).
+bool Pgr4PhotoModeActive();
+// The game's clock stands still (the pause, the photo mode; draw.cpp, set by src/pgr4_hooks.cpp).
+extern bool g_pgr4_game_paused;
 REXCVAR_DECLARE(int32_t, pgr4_d3d_stats_frames);
 REXCVAR_DECLARE(bool, pgr4_native_luma_probe);
 REXCVAR_DECLARE(bool, pgr4_native_dlss);
@@ -158,6 +181,10 @@ REXCVAR_DECLARE(bool, pgr4_native_dlss_fg);
 REXCVAR_DEFINE_BOOL(pgr4_native_dlss_fg_hudless, true, "PGR4 native",
                     "Debug: give DLSS-G the HUD-less image (hudless.h)");
 REXCVAR_DECLARE(bool, pgr4_native_frame_generation);
+// Local change (18/11/2026): LimitFrameRate by the upscaler running (else by the settings, as before).
+REXCVAR_DEFINE_BOOL(pgr4_native_pace_by_upscaler, true, "PGR4 native",
+                    "Frame generation's pacing by the upscaler running (DLSS or FSR), not by "
+                    "the settings");
 REXCVAR_DEFINE_INT32(pgr4_native_test_fps_cap, 0, "PGR4 native",
                      "Development: frames per second at most, by a sleep (0: none)");
 // Local change (pgr4 project): the game's PC DISPLAY page's frame rate.
@@ -604,6 +631,7 @@ bool NativeRenderer::Initialize() {
   }
   csv_ = std::make_unique<Csv>();
   profile::enabled.store(REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
+  if (profile::On()) LoadShaderFamilies();  // local change
   const std::string path = REXCVAR_GET(pgr4_native_csv).empty()
                                ? std::string()
                                : UnusedPath(REXCVAR_GET(pgr4_native_csv));
@@ -613,7 +641,8 @@ bool NativeRenderer::Initialize() {
       csv_->luma = REXCVAR_GET(pgr4_native_luma_probe);
       std::string header;
       AppendCsvColumns(FrameStats{}, 0, true, &header);
-      if (profile::On()) AppendCsvProfileColumns(true, &header);
+      csv_profile_ = profile::On();  // local change
+      if (csv_profile_) AppendCsvProfileColumns(true, &header);
       if (csv_->luma) AppendCsvLumaColumns(true, &header);
       header += '\n';
       csv_->file->Append(header);
@@ -758,6 +787,50 @@ void NativeRenderer::ApplyMsaa() {
 ID3D12Device* NativeRenderer::d3d12() const { return device_->device(); }
 ID3D12CommandQueue* NativeRenderer::command_queue() const { return device_->command_queue(); }
 ID3D12GraphicsCommandList* NativeRenderer::command_list() const { return device_->command_list(); }
+
+namespace {
+// Development (--pgr4_native_profile, 18/11/2026): the vertex shaders of the cars (names vsCar*)
+// and of the animated characters (vsSkinnedModel*) from shaders\shader_names.tsv beside the
+// executable (hash, stage, name...), for the CSV's draw_car / cap_car / draws_car columns (and
+// _skin). Read-only once loaded: both threads look them up.
+std::unordered_set<uint64_t> g_car_vs, g_skin_vs;
+std::unordered_map<uint64_t, std::string> g_shader_names;  // every shader's (LogPasses)
+}  // namespace
+
+void NativeRenderer::LoadShaderFamilies() {
+  wchar_t exe[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  const std::filesystem::path path =
+      std::filesystem::path(exe).parent_path() / "shaders" / "shader_names.tsv";
+  std::ifstream in(path);
+  std::string line;
+  while (std::getline(in, line)) {
+    const size_t a = line.find('\t'), b = a == std::string::npos ? a : line.find('\t', a + 1);
+    if (b == std::string::npos) continue;
+    if (line.compare(a + 1, b - a - 1, "vs") != 0) {
+      // The pixel shaders' names too (LogPasses).
+      g_shader_names[std::strtoull(line.substr(0, a).c_str(), nullptr, 16)] =
+          line.substr(b + 1, line.find('\t', b + 1) - b - 1);
+      continue;
+    }
+    const std::string name = line.substr(b + 1, line.find('\t', b + 1) - b - 1);
+    const uint64_t hash = std::strtoull(line.substr(0, a).c_str(), nullptr, 16);
+    g_shader_names[hash] = name;
+    if (name.rfind("vsCar", 0) == 0) g_car_vs.insert(hash);
+    else if (name.rfind("vsSkinnedModel", 0) == 0) g_skin_vs.insert(hash);
+  }
+  REXLOG_INFO("PGR4 native profile: {} car and {} character vertex shaders from {}",
+              g_car_vs.size(), g_skin_vs.size(), path.string());
+}
+
+int NativeRenderer::VsFamily(const DrawPrep* prep) {
+  if (!prep || !prep->vs) return 0;
+  const uint64_t hash = DrawRenderer::ShaderHashes(*prep).first;
+  return g_car_vs.count(hash) ? 1 : g_skin_vs.count(hash) ? 2 : 0;
+}
+ID3D12GraphicsCommandList* NativeRenderer::recording_list() const {
+  return device_->recording_list();
+}
 uint64_t NativeRenderer::frame_fence() const { return device_->frame_fence(); }
 
 void NativeRenderer::SwitchUpscaler(bool on) {
@@ -992,6 +1065,11 @@ void NativeRenderer::QueueDraw(const uint8_t* base, const HookArgs& args) {
     d.state.vs.immediate = d.state.ps.immediate = nullptr;  // Prepare loaded the shaders
     q.Push(Queue::kDraw, uint32_t(b.draws.size() - 1));
     profile::Mark(profile::kCapRecord);
+    // Development: the cars' and characters' share of the guest thread (profile.h kCapCar).
+    if (profile::On()) [[unlikely]] {
+      if (const int family = VsFamily(&d.prep))
+        profile::g.ticks[family == 1 ? profile::kCapCar : profile::kCapSkin] += Ticks() - t0;
+    }
   }
   q.AddHook(Ticks() - t0);
 }
@@ -1163,7 +1241,32 @@ void NativeRenderer::OnResolve(const uint8_t* base, const HookArgs& args) {
   }
 }
 
+// The game's own switch, Render.PostProcess.MotionBlur.Enable (a byte at 0x82C98CA4, its engine
+// variable: work/rea/variables_moteur.tsv), which its post-processing (sub_8285A848) reads at each
+// frame before its blur pass, and which the photo mode's shutter (sub_824B86F8) saves, sets to 0
+// for its sub-frames and puts back. While DLSS runs, out of the photo mode: 0 at each frame. When
+// DLSS stops or the photo mode starts: the menu's choice, once, and nothing after (the photo mode's
+// shutter keeps its own saving and putting back). Guest thread, at the Swap, before the next frame's
+// post-processing.
+void NativeRenderer::ApplyMotionBlurRule(uint8_t* base) {
+  constexpr uint32_t kMotionBlurEnable = 0x82C98CA4;
+  uint8_t& enable = base[kMotionBlurEnable];
+  const bool photo = (REXCVAR_GET(pgr4_native_dlss_blur_in_photo_mode) && Pgr4PhotoModeActive()) ||
+                     (REXCVAR_GET(pgr4_native_dlss_blur_in_pause) && g_pgr4_game_paused);
+  if (dlss_running() && REXCVAR_GET(pgr4_native_dlss_no_motion_blur) && !photo) {
+    if (!blur_held_off_) REXLOG_INFO("PGR4 native: the game's motion blur off while DLSS runs");
+    enable = 0;
+    blur_held_off_ = true;
+  } else if (blur_held_off_) {
+    enable = REXCVAR_GET(pgr4_disable_motion_blur) ? 0 : 1;
+    blur_held_off_ = false;
+    REXLOG_INFO("PGR4 native: the game's motion blur back to the menu's choice ({}){}",
+                enable ? "on" : "off", photo ? ", the photo mode or the pause" : "");
+  }
+}
+
 void NativeRenderer::OnSwap(uint8_t* base, const HookArgs& args) {
+  ApplyMotionBlurRule(base);  // local change
   if (queue_) return QueueSwap(base, args);
   if (g_failed) [[unlikely]]
     return HandOver(base, args.device);
@@ -1255,20 +1358,72 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
     } else {
       key = GpuTimer::KeyDraw(state.regs);
     }
-    gpu_timer_->Pass(device_->command_list(), key);
+    gpu_timer_->Pass(device_->recording_list(), key);
   }
   if (camera_scan_ && (upscaler_ || frame_generation_ || SceneEffects::Enabled()))
     FindCamera(state);
   if (REXCVAR_GET(pgr4_native_camera_diag)) DiagCamera(state);
   if (frame_generation_ &&
-      frame_generation_->BeforeDraw(device_->command_list(), frame_index_, state.regs))
+      frame_generation_->BeforeDraw(device_->recording_list(), frame_index_, state.regs))
     draw_->InvalidateListState();
   if (hudless_capture_ && streamline::FrameGenerationActive() &&
-      hudless_capture_->BeforeDraw(device_->command_list(), frame_index_, state.regs))
+      hudless_capture_->BeforeDraw(device_->recording_list(), frame_index_, state.regs))
     draw_->InvalidateListState();
   draw_->OnDraw(state, prep);
   SubmitEarly();
-  draw_ticks_ += Ticks() - t0;
+  const uint64_t dt = Ticks() - t0;
+  draw_ticks_ += dt;
+  // Development: the cars' and characters' share (profile.h kDrawCar).
+  if (profile::On()) [[unlikely]] {
+    const int family = VsFamily(prep);
+    if (family) {
+      profile::g.ticks[family == 1 ? profile::kDrawCar : profile::kDrawSkin] += dt;
+      profile::Count(family == 1 ? profile::kDrawsCar : profile::kDrawsSkin);
+    }
+    PassCount& p = passes_[state.regs[rex::graphics::XE_GPU_REG_RB_SURFACE_INFO]];
+    ++p.draws;
+    p.car += family == 1;
+    p.ticks += dt;
+    if (prep) {
+      const auto [vs_hash, ps_hash] = DrawRenderer::ShaderHashes(*prep);
+      ++p.vs[vs_hash];
+      ++p.ps[ps_hash];
+    }
+  }
+}
+
+void NativeRenderer::LogPasses() {
+  if (!profile::On() || ++passes_frames_ < 300) return;
+  std::vector<std::pair<uint32_t, PassCount>> v(passes_.begin(), passes_.end());
+  std::sort(v.begin(), v.end(),
+            [](const auto& a, const auto& b) { return a.second.ticks > b.second.ticks; });
+  std::string s;
+  const double n = double(passes_frames_);
+  for (size_t i = 0; i < v.size() && i < 10; ++i) {
+    const uint32_t info = v[i].first;
+    s += fmt::format(" | {:08X} pitch {} x{}: {:.0f} draws ({:.0f} car) {:.0f} us", info,
+                     info & 0x3FFF, 1u << ((info >> 16) & 3), double(v[i].second.draws) / n,
+                     double(v[i].second.car) / n, TicksToNs(v[i].second.ticks) / 1000.0 / n);
+  }
+  REXLOG_INFO("PGR4 native passes (a frame, by render thread time):{}", s);
+  // The four heaviest passes' most drawn shaders, by name (shaders\shader_names.tsv).
+  auto top = [&](const std::unordered_map<uint64_t, uint32_t>& m) {
+    std::vector<std::pair<uint64_t, uint32_t>> w(m.begin(), m.end());
+    std::sort(w.begin(), w.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string out;
+    for (size_t i = 0; i < w.size() && i < 8; ++i) {
+      const auto it = g_shader_names.find(w[i].first);
+      out += fmt::format(" {} {:.0f},",
+                         it != g_shader_names.end() ? it->second : fmt::format("{:016X}", w[i].first),
+                         double(w[i].second) / n);
+    }
+    return out;
+  };
+  for (size_t i = 0; i < v.size() && i < 4; ++i)
+    REXLOG_INFO("PGR4 native pass {:08X}: vs{} | ps{}", v[i].first, top(v[i].second.vs),
+                top(v[i].second.ps));
+  passes_.clear();
+  passes_frames_ = 0;
 }
 
 void NativeRenderer::DiagCamera(const DrawState& state) {
@@ -1516,20 +1671,30 @@ uint64_t NativeRenderer::LimitFrameRate() {
   // Multi Frame Generation; 1 for FSR's).
   const uint32_t refreshes = uint32_t(std::clamp(REXCVAR_GET(pgr4_native_present_interval), 1, 4));
   // Not while the game plays a video: it has no frame generation then (upscaler.cpp, streamline.cpp).
+  // Local change (18/11/2026, Tazz: each upscaler on its own): by the upscaler running, not by the
+  // settings (with DLSS asked but unavailable FSR runs): DLSS-G with DLSS only, FSR's frame
+  // generation with FSR only.
+  const bool by_running = REXCVAR_GET(pgr4_native_pace_by_upscaler);
+  const bool dlss_running = by_running ? upscaler_on_ && upscaler_ && upscaler_->dlss()
+                                       : upscaler_on_ && REXCVAR_GET(pgr4_native_dlss);
+  const bool fsr_running = by_running
+                               ? upscaler_on_ && upscaler_ && !upscaler_->dlss()
+                               : upscaler_on_ && !REXCVAR_GET(pgr4_native_dlss);
   const bool generating =
-      upscaler_on_ && rex::system::XFile::OpenMovies() == 0 && (REXCVAR_GET(pgr4_native_dlss)
-                           ? REXCVAR_GET(pgr4_native_dlss_fg) && streamline::FrameGenerationActive()
-                           : REXCVAR_GET(pgr4_native_frame_generation) && CanFsrFrameGeneration());
+      rex::system::XFile::OpenMovies() == 0 &&
+      (dlss_running ? REXCVAR_GET(pgr4_native_dlss_fg) && streamline::FrameGenerationActive()
+                    : fsr_running && REXCVAR_GET(pgr4_native_frame_generation) &&
+                          CanFsrFrameGeneration());
   device_->set_present_interval(generating ? 1 : refreshes);
   // Local change (pgr4 project): the display page's VSYNC row, read at each frame.
   device_->set_vsync(FlagOn("d3d12_present_vsync"));
   const double shown =
       !generating ? 1.0
-                  : 1.0 + (REXCVAR_GET(pgr4_native_dlss) ? streamline::GeneratedFrames() : 1u);
+                  : 1.0 + (dlss_running ? streamline::GeneratedFrames() : 1u);
   // At the screen's own rate (one refresh), DLSS-G keeps to the refresh rate by itself; FSR's
   // frame generation went past it (its presents are not held to the vsync), so its game frames
   // are paced too.
-  if (generating && (refreshes > 1 || !REXCVAR_GET(pgr4_native_dlss))) {
+  if (generating && (refreshes > 1 || !dlss_running)) {
     interval =
         std::max(interval, uint64_t(shown * 1e9 * refreshes / DisplayHz(device_->window())));
   }
@@ -1547,7 +1712,7 @@ uint64_t NativeRenderer::LimitFrameRate() {
     interval = std::max(interval, uint64_t(1e9 * 1001.0 / 30000.0));
   // FSR's generated frame and the drawn one, half the limit's interval apart (DLSS-G paces its
   // own); without a limit the game keeps to half the refresh rate and vsync spaces them.
-  device_->set_generated_spacing(generating && limit > 0 && !REXCVAR_GET(pgr4_native_dlss)
+  device_->set_generated_spacing(generating && limit > 0 && !dlss_running
                                      ? interval / 2
                                      : 0);
   // Development: a plain frame rate cap (frames per second, 0: none), for tests.
@@ -1558,6 +1723,8 @@ uint64_t NativeRenderer::LimitFrameRate() {
 
 void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   const uint64_t t0 = NowNs();
+  // Local change: for the guest thread's ApplyMotionBlurRule.
+  dlss_running_.store(upscaler_on_ && upscaler_ && upscaler_->dlss(), std::memory_order_relaxed);
   TunablesApply();  // local change (development): the game's settings forced (tunables.h)
   // Local change (pgr4 project): a frame with a 3D scene (a pass of the scene's surface, counted
   // until SplitScreenUpscaler below), or a race's screen (the game's InGame\ scripts), is not
@@ -1707,7 +1874,18 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   draw_ticks_ = clear_ticks_ = resolve_ticks_ = 0;
   if (!queue_)
     stats_.hook_ns = stats_.draw_ns + stats_.clear_ns + stats_.resolve_ns + stats_.swap_ns;
+  {
+    // Local change: the command recorder's frame (command_recorder.h).
+    const CommandRecorder::Stats rec = d.TakeRecorderStats();
+    stats_.rec_on = d.recording() ? 1 : 0;
+    stats_.rec_wait_ns = rec.wait_ns;
+    stats_.rec_drains = rec.drains;
+    stats_.rec_replay_ns = rec.replay_ns;
+    stats_.rec_bytes = rec.bytes;
+    stats_.rec_forwarded = rec.forwarded;
+  }
   WriteCsvRow(stats_, t1 - frame_start_ns_);
+  LogPasses();  // local change, development
   AddToStatsLog(stats_, t1 - frame_start_ns_);
   ResetFrameCounters();
   frame_start_ns_ = t1;
@@ -1788,6 +1966,13 @@ void NativeRenderer::AppendCsvColumns(const FrameStats& s, uint64_t frame_ns, bo
       Uint("present", s.present),
       Fix3("gpu_busy_ms", device_->gpu_busy_ns() / 1e6),
       Uint("render_height", upscaler() ? upscaler()->render_height() : 0),
+      // Local change (18/11/2026): the command recorder.
+      Uint("rec_on", s.rec_on),
+      Fix1("rec_wait_us", s.rec_wait_ns / 1000.0),
+      Uint("rec_drains", s.rec_drains),
+      Fix1("rec_replay_us", s.rec_replay_ns / 1000.0),
+      Fix1("rec_kb", s.rec_bytes / 1024.0),
+      Uint("rec_forwarded", s.rec_forwarded),
   };
   AppendCsvCells(cells, header, false, line);
 }
@@ -1849,7 +2034,7 @@ void NativeRenderer::WriteCsvRow(const FrameStats& s, uint64_t frame_ns) {
   c.evicted_prev = textures_->stats().evicted;
   c.evict_ns_prev = textures_->stats().evict_ns;
   c.occ_unknown_prev = occlusion_ ? occlusion_->unknown_pairs() : 0;
-  if (profile::On()) {
+  if (csv_profile_) {  // local change: the header's columns, profiler on or off
     AppendCsvProfileColumns(false, &c.line);
     c.tex_prev = textures_->stats();
   }
@@ -1906,7 +2091,10 @@ void NativeRenderer::AddToStatsLog(const FrameStats& s, uint64_t frame_ns) {
 
 void NativeRenderer::ResetFrameCounters() {
   draw_->ResetStats();
-  if (profile::On()) {
+  // Local change: the profiler switched live (csv_profile_), between two frames.
+  if (csv_profile_)
+    profile::enabled.store(REXCVAR_GET(pgr4_native_profile), std::memory_order_relaxed);
+  if (csv_profile_) {
     for (uint64_t& t : profile::g.ticks) t = 0;
     profile::g.track_calls = 0;
     for (uint64_t& c : profile::g.counters) c = 0;

@@ -140,6 +140,29 @@ name = "Pgr4PresentationIntervalHook"
 registers = ["r10"]
 after_instruction = true
 
+# A car's drawn pose (sub_82445CB8): the bounds of its fraction's range (0.001, 0.999), loaded
+# before each is compared with the fraction (f31), moved out of the way to let the game's mix run
+# past its range (pgr4_vehicle_pose_extend, src/pgr4_hooks.cpp).
+[[midasm_hook]]
+address = 0x82445DE8  # lfs f0,-30100(r11)
+name = "Pgr4PoseLowBoundHook"
+registers = ["f0"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82445E2C  # lfs f0,-17216(r11)
+name = "Pgr4PoseHighBoundHook"
+registers = ["f0"]
+after_instruction = true
+
+# A ragdoll's step (sub_824B6438): the 30 of its fixed 1 / (N x 30) s (0x821AC658), made 1 / the
+# frame's time it is given in f1 (pgr4_character_ragdoll_time, src/pgr4_hooks.cpp).
+[[midasm_hook]]
+address = 0x824B6480  # lfs f0,-14760(r10)
+name = "Pgr4RagdollRateHook"
+registers = ["f0", "f1"]
+after_instruction = true
+
 # Motion blur pass (sub_82859FC0): fmuls f0,f0,f13 is the per-sample step (c159), tuned for 30 FPS.
 [[midasm_hook]]
 address = 0x8285A758

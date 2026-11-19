@@ -27,7 +27,9 @@
 #include <string>
 #include <cstring>
 #include <map>
+#include <set>
 #include <mutex>
+#include <thread>
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -329,6 +331,16 @@ void PutBeF(uint8_t* p, float f) {
   for (int i = 0; i < 4; ++i) p[i] = uint8_t(v >> (24 - 8 * i));
 }
 uint64_t g_frame_no = 0;  // the game's frames (sub_824C6FD8)
+// sub_824C6FD8: the game frames' lengths (Pgr4FrameSeconds) in console frames, carried over, one
+// at most a game frame. For what the console did once per frame (the kudos counter's tick).
+double g_console_credit = 0.0;
+// This game frame starts a console frame (g_console_credit reached 1): the audio's once-a-console-
+// frame events (the collisions, the crowd's delay after a fall) go out on those frames only.
+std::atomic<bool> g_console_frame_start{true};
+// The kudos counter's tick asked for during a console frame (sub_826A03A8, index 5), played at
+// the start of the next (sub_824C6FD8): its sound object (sub_826A03A8's r3), 0 for none.
+std::atomic<uint32_t> g_kudos_tick_object{0};
+thread_local bool g_kudos_tick_playing = false;  // sub_826A03A8 called for it: played, not kept
 std::unordered_map<uint32_t, uint64_t> g_drawn_records;  // vehicle record -> the frame it was drawn in
 }  // namespace
 void Pgr4EyeFollowsBody(uint8_t* base, uint32_t camera);
@@ -376,8 +388,31 @@ REXCVAR_DEFINE_BOOL(pgr4_ui_clock_probe, false, "PGR4",
                     "Development: the UI's frame time and the game clock's, in the log");
 void Pgr4BringWindowToFront();  // src/pgr4_menu.cpp
 bool Pgr4Precompiling();       // src/pgr4_profile.cpp
+REX_EXTERN(sub_826A03A8);  // a UI sound (object, index): hooked below
+void Pgr4CadenceFrame(const uint8_t* base);  // below: the frame-rate audit's counts
 REX_HOOK_RAW(sub_824C6FD8) {
   ++g_frame_no;
+  {
+    // A frame of 1/30 s, give or take 3 %, is one console frame (at a 30 FPS limit, every frame).
+    const double step = std::clamp(double(Pgr4FrameSeconds()) * 30.0, 0.0, 1.0);
+    g_console_credit += step > 0.97 ? 1.0 : step;
+    g_console_frame_start.store(g_console_credit >= 1.0, std::memory_order_relaxed);
+    if (g_console_credit >= 1.0) {
+      g_console_credit = std::min(g_console_credit - 1.0, 0.999);
+      // A console frame starts: the kudos tick asked for during the last one, once. This thread
+      // plays UI sounds through sub_826A03A8 itself (EnableMusic, every frame).
+      if (const uint32_t object = g_kudos_tick_object.exchange(0)) {
+        const PPCContext saved = ctx;
+        ctx.r3.u64 = object;
+        ctx.r4.u64 = 5;
+        g_kudos_tick_playing = true;
+        sub_826A03A8(ctx, base);
+        g_kudos_tick_playing = false;
+        ctx = saved;
+      }
+    }
+  }
+  Pgr4CadenceFrame(base);  // development: the frame-rate audit's counts
   __imp__sub_824C6FD8(ctx, base);
   // The game's clock (seconds, stands still in the pause and the photo mode; measured 04/11/2026):
   // unchanged for some frames, paused.
@@ -538,8 +573,10 @@ void CarryTurnTo(uint8_t* out, uint8_t* base, uint32_t record, const uint8_t* st
     st.has_last = true;
   }
   const double h = BeF(base + 0x82001170);  // the physics step, 1/60 s
-  if (!st.has_prev || !(h > 0) || !(ahead > 0)) return;
-  const double frac = std::min(double(ahead) / h, 2.0);
+  // Local change (18/11/2026): back as well (ahead < 0: the physics ahead of the game's time, as
+  // in a race's last step of a frame; pgr4_vehicle_pose_ahead).
+  if (!st.has_prev || !(h > 0) || ahead == 0.0f) return;
+  const double frac = std::clamp(double(ahead) / h, -2.0, 2.0);
   // R = A^T (columns: the axes); the last step's turn D = R_last R_prev^T as an axis and an angle,
   // applied for frac of a step: R_out = D^frac R_last.
   double d[3][3];
@@ -654,9 +691,698 @@ void HoldFrozenCar(uint8_t* base, uint32_t record) {
   }
 }
 }  // namespace
+// Development (17/11/2026, the menu's drifting car moving by whole 1/60 s steps at 44 frames a
+// second): which of the two functions makes each car's drawn pose, and with what time past the
+// step, in the log for 120 calls from when it is switched on.
+REXCVAR_DEFINE_BOOL(pgr4_vehicle_pedal_watch, false, "PGR4",
+                    "Development, with pgr4_vehicle_lights_probe: note for 60 s which code writes a "
+                    "car's controls from its first braking in a replay (page watch)");
+REXCVAR_DEFINE_BOOL(pgr4_vehicle_lights_probe, false, "PGR4",
+                    "Development: log what each car's brake and reverse lights are based on at each "
+                    "sub_82445CB8 call (mode, pedal, average, flag, gear, steps)");
+REXCVAR_DEFINE_BOOL(pgr4_vehicle_pose_probe, false, "PGR4",
+                    "Development: log which function draws each car's pose (extrapolated or the "
+                    "step's) and the time past the step");
+namespace {
+int g_pose_probe_left = 0;
+// With the physics clock (sub_824C6398: steps of 0x82001170 while (n - 1) h <= t - x, x and n at
+// 0x82A17640 and +4, the game's time t at 0x82A8131C + 24) and the caller.
+void PoseProbe(const uint8_t* base, const char* what, uint32_t record, double ahead, uint64_t lr) {
+  static bool was = false;
+  const bool on = REXCVAR_GET(pgr4_vehicle_pose_probe);
+  if (on && !was) g_pose_probe_left = 120;
+  was = on;
+  if (!on || g_pose_probe_left <= 0) return;
+  --g_pose_probe_left;
+  const float x = BeF(base + 0x82A17640), t = BeF(base + 0x82A8131C + 24),
+              h = BeF(base + 0x82001170);
+  const uint8_t* np = base + 0x82A17644;
+  const int32_t n = int32_t(uint32_t(np[0]) << 24 | uint32_t(np[1]) << 16 | uint32_t(np[2]) << 8 | np[3]);
+  REXLOG_INFO("PGR4 pose probe: frame {} car {:08X} {} ahead {:.5f} s, frame {:.5f} s, caller {:08X}, "
+              "physics x {:.6f} n {} t {:.5f} h {:.6f}: x + (n-1)h - t = {:.5f}",
+              g_frame_no, record, what, ahead, Pgr4FrameSeconds(), uint32_t(lr), x, n, t, h,
+              x + (n - 1) * h - t);
+}
+}  // namespace
+// Local change (18/11/2026, Tazz: the cars jerking at 44 frames a second, the menu's drifting car
+// gripping and spinning by turns): the physics steps 1/60 s at a time (sub_824C6398, step count n
+// at 0x82A17644, the game's time t at 0x82A8131C + 24), and every car's drawn pose was its last
+// step's (sub_82437C18 -> sub_82416BA0 without a pose; measured in the menus and in a race): one
+// step a frame, two every third at 44 frames a second, 0.074 / 0.073 / 0.147 m and a rear wheel's
+// 58 / 58 / 117 degrees. The game's own extrapolation, sub_82417B50 (the pose carried forward by
+// the car's velocities, as its photo shutter's sub-frames use it), now makes it, carried by the
+// time since the pose the game wrote (g_pose_time): every car drawn at the game's time. On by
+// default (Tazz, 18/11/2026).
+REXCVAR_DEFINE_BOOL(pgr4_vehicle_pose_extend, true, "PGR4",
+                    "The game's own mix of a car's last two physics steps carried on past its range "
+                    "to the game's time, instead of the velocity carry");
+REXCVAR_DEFINE_BOOL(pgr4_vehicle_pose_ahead, true, "PGR4",
+                    "Every car's drawn pose carried from the game's pose to the game's time "
+                    "(smooth at frame rates other than 60 and 30)");
+namespace {
+bool g_pose_carrying = false;  // sub_82417B50 called from sub_82416BA0's hook below
+// The r5 of the update's own sub_82416BA0 call, for the carried one. sub_82417B50 (the photo
+// shutter's) passes 1, a preview: sub_82416BA0 then returns after placing the car, before the
+// rest of the frame's car update (skid marks and the like: they vanished with the carry, Tazz,
+// 18/11/2026). The update passes 0 (0x82437C78).
+uint64_t g_carry_r5 = 0;
+// The game's time of the pose sub_82445CB8 last wrote at each address (a car record's +736), and
+// the frame it wrote it in. It writes one of three (read 18/11/2026): below its range (fraction
+// (x + (n - 1) h - t) / x under 0x82258A6C's 0.001, or 0 when Dynamics.AllowAdjustToFramerate at
+// 0x82A81378 is 0) the body's last step pose (its vfunc +120), of time x + (n - 1) h; above it
+// (over 0x8218BCC0's 0.999) the step before (+128), of time (n - 1) h; between, the two mixed by
+// the fraction (sub_822C4340), of time t itself. The carry below takes the pose from that time to
+// t: none for a mixed pose (a race's, every frame), a step's carried. Before, the carry assumed a
+// step's pose at n h: a mixed one (the menus mix one frame in a few between 60 and 120 frames a
+// second) was carried a second time, up to 2 cm behind (probe, 18/11/2026), and a car the game
+// mixed in the last 30 frames was not carried at all (its cars stepped again at 81 frames a
+// second, Tazz, 18/11/2026).
+// The target is the game's time at that call, not at the car's update: in the menus the mix comes
+// first in the frame and both are the same, in a race the car's update comes first and draws the
+// pose mixed at the end of the frame before (a frame behind, smooth: the game's own), so carried to
+// the update's time every car of a race was moved a frame on by its velocities (seen 18/11/2026).
+struct PoseTime {
+  double time, target;
+  uint64_t frame;
+};
+std::unordered_map<uint32_t, PoseTime> g_pose_time;
+// pgr4_vehicle_pose_extend (18/11/2026; on by default, Tazz: « c'est parfait », the front wheels no
+// longer jump): the game's mix let past its range,
+// for a fraction within [kExtendLow, kExtendHigh]: its straight line between the two steps carried
+// on to the game's time (sub_822C4340: positions (1 - f) A + f B, rotations a normalized linear
+// mix, both fine out of 0..1), the range's bounds loaded at 0x82445DE8 and 0x82445E2C taken out
+// (Pgr4PoseLowBoundHook, Pgr4PoseHighBoundHook). Everything the function then derives from the
+// pose (+800, which the wheels start from, and the rest) and the car's own update are the game's.
+// The velocity carry below left the frame where a new step comes in 6 % short in the menus, the
+// car's velocities not landing where the next step puts it (an every-frame carry from the step,
+// tried the same day, was worse: 4.07 to 4.85 m/s for 4.12 to 4.52).
+constexpr float kExtendLow = -1.0f, kExtendHigh = 2.0f;
+thread_local bool t_pose_extend = false;  // set around sub_82445CB8's call
+// Local change (18/11/2026, Tazz: the hubcaps flicker, seen in DLSS-G's Depth/MVec Alignment view
+// once every 8 frames at 68 frames a second): sub_82445CB8 mixes a car's body between its last two
+// physics steps (sub_822C4340, fraction f), then, for a car (physics +16 == 0), copies each
+// wheel's values from the physics as they are (loop at 0x824460F8: physics wheels at +1240, 368
+// bytes each; drawn wheels at *(pose + 960), 160 bytes each, *(pose + 968) of them), its steering
+// angle (+0 into +80: 0.52 rad held through the menu car's drift, probe) and its spin angle (-8
+// into +84) among them, which sub_82441040 turns the wheel by, the steering about the axis at the
+// wheel's +144, then the spin about its axle (lfs f0,84(r24), the rotation about +656). The
+// body followed the game's time, the wheels' spin only the steps: in a frame without a step
+// (frames past 60 a second: one in 8 at 68, one in 2 at 120) they stood still and turned twice as
+// far in the next, against the body (and a wheel's motion vectors with it). pgr4_vehicle_wheel_spin_mix
+// mixes the spin angle by the same fraction as the body, between its last step's value and the
+// step before's (kept here, as the physics keeps only the last): f = 0 the last step, 1 the one
+// before, the game's mix and pgr4_vehicle_pose_extend's alike. A step's per-step turn may be more
+// than half a turn (250 rad/s at 300 km/h: 4.2 rad a step), so the turn between two steps is the
+// one nearest the turn of the step before (any whole turns added). Read at each call.
+struct WheelSpin {
+  float last = 0.0f, before = 0.0f, turn = 0.0f;  // the angle at the last step, at the one before
+  bool has_before = false;
+  // pgr4_vehicle_wheel_pose_mix: the wheel's place (+0, +32), axis (+16, a unit vector) and
+  // steering (+80) at the last step and the one before (kPoseFloats, in kPoseOffsets' order).
+  float pose_last[10] = {}, pose_before[10] = {};
+};
+// The wheel's values sub_82441040 places it by, besides the spin, that sub_82445CB8 also copies
+// from the last step: its place +0 (and +32, the one a debug byte picks), its axis +16 (the
+// suspension's and camber's: 3 degrees a step at most, probe in a race, 18/11/2026) and its
+// steering +80 (4.3 degrees a step at most); measured in a race, 2.2 cm a step at most. Not +124
+// (unchanged in the race probed).
+constexpr int kPoseFloats = 10;
+constexpr int kPoseOffsets[kPoseFloats] = {0, 4, 8, 16, 20, 24, 32, 36, 40, 80};
+struct CarSpin {
+  int32_t n = 0;  // the physics step count at `last`
+  uint32_t wheels = 0;
+  uint64_t frame = 0;
+  WheelSpin wheel[8];
+};
+std::unordered_map<uint32_t, CarSpin> g_wheel_spin;  // by pose (a car record's +736)
+}  // namespace
+REXCVAR_DEFINE_BOOL(pgr4_vehicle_wheel_spin_mix, true, "PGR4",
+                    "Each car wheel's spin angle mixed between its last two physics steps by the "
+                    "fraction the game mixes the body by");
+// Local change (18/11/2026, Tazz: « vérifie aussi pour les pneus et le reste »): the same for the
+// wheel's place, axis and steering (WheelSpin::pose_last). They step as the spin did, by less (2.2
+// cm, 3 and 4.3 degrees a step at most in a race). The tracks (sub_8243FC38) and the rest of the
+// car's update read the wheel where sub_82441040 then places it: at the body's time too. Read at
+// each call.
+REXCVAR_DEFINE_BOOL(pgr4_vehicle_wheel_pose_mix, true, "PGR4",
+                    "Each car wheel's place, axis and steering mixed between its last two physics "
+                    "steps by the fraction the game mixes the body by");
+namespace {
+uint32_t WheelBeU32(const uint8_t* p) {
+  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+}
+// After sub_82445CB8 (its `pose`, physics step count `n`, the fraction `f` it drew the body at:
+// 0 the last step, 1 the one before, past them with pgr4_vehicle_pose_extend).
+void MixWheelSpin(uint8_t* base, uint32_t pose, int32_t n, float f) {
+  const uint32_t wheels = WheelBeU32(base + pose + 968);
+  const uint32_t array = WheelBeU32(base + pose + 960);
+  if (!wheels || wheels > 8 || array < 0x40000000) return;
+  constexpr float kTwoPi = 6.28318530718f;
+  CarSpin& car = g_wheel_spin[pose];
+  // A car seen again after a while, another car in the record, or a jump in the steps (a replay's
+  // cut, a reset): no step before yet.
+  const bool fresh = car.wheels != wheels || g_frame_no > car.frame + 2 || n < car.n || n > car.n + 8;
+  const int32_t steps = fresh ? 0 : n - car.n;
+  for (uint32_t i = 0; i < wheels; ++i) {
+    uint8_t* angle = base + array + 160 * i + 84;  // the spin
+    const float now = BeF(angle);  // the game's: the last step's
+    WheelSpin& w = car.wheel[i];
+    uint8_t* const entry = base + array + 160 * i;
+    float pose_now[kPoseFloats];
+    bool pose_finite = true;
+    for (int k = 0; k < kPoseFloats; ++k) {
+      pose_now[k] = BeF(entry + kPoseOffsets[k]);
+      pose_finite = pose_finite && std::isfinite(pose_now[k]);
+    }
+    if (fresh || !std::isfinite(now) || !pose_finite) {
+      w = {now, now, 0.0f, false};
+      std::copy(pose_now, pose_now + kPoseFloats, w.pose_last);
+      std::copy(pose_now, pose_now + kPoseFloats, w.pose_before);
+      continue;
+    }
+    if (steps > 0) {
+      // The turn over these steps nearest `steps` times the last step's, whole turns added.
+      const float expected = w.turn * float(steps);
+      float d = now - w.last;
+      d += kTwoPi * std::round((expected - d) / kTwoPi);
+      w.turn = d / float(steps);
+      w.before = now - w.turn;  // the step before the last (the others' turns alike)
+      w.has_before = true;
+      // The others alike: the step before the last, the steps between evenly.
+      for (int k = 0; k < kPoseFloats; ++k)
+        w.pose_before[k] = pose_now[k] - (pose_now[k] - w.pose_last[k]) / float(steps);
+    }
+    w.last = now;
+    std::copy(pose_now, pose_now + kPoseFloats, w.pose_last);
+    if (w.has_before && REXCVAR_GET(pgr4_vehicle_wheel_pose_mix)) {
+      float mixed[kPoseFloats];
+      for (int k = 0; k < kPoseFloats; ++k)
+        mixed[k] = pose_now[k] - f * (pose_now[k] - w.pose_before[k]);
+      // The axis kept a unit vector when it was one (the game's rotations are mixed and normalized
+      // alike, sub_822C4200).
+      const float len = std::sqrt(mixed[3] * mixed[3] + mixed[4] * mixed[4] + mixed[5] * mixed[5]);
+      const float len_now = std::sqrt(pose_now[3] * pose_now[3] + pose_now[4] * pose_now[4] +
+                                      pose_now[5] * pose_now[5]);
+      if (len > 1e-6f && std::abs(len_now - 1.0f) < 1e-3f)
+        for (int k = 3; k < 6; ++k) mixed[k] /= len;
+      for (int k = 0; k < kPoseFloats; ++k) PutBeF(entry + kPoseOffsets[k], mixed[k]);
+    }
+    if (!w.has_before || !REXCVAR_GET(pgr4_vehicle_wheel_spin_mix)) continue;
+    // (1 - f) last + f before, as sub_822C4340 mixes the body's position.
+    PutBeF(angle, now - f * w.turn);
+    if (i == 0 && REXCVAR_GET(pgr4_vehicle_pose_probe) && g_pose_probe_left > 0)
+      REXLOG_INFO("PGR4 pose probe: frame {} pose {:08X} wheel 0 spin: step {} angle {:.4f}, turn "
+                  "{:.4f} a step, fraction {:.4f}, drawn {:.4f} (steering +80 {:.4f}, +88 {:.4f})",
+                  g_frame_no, pose, n, now, w.turn, f, now - f * w.turn,
+                  BeF(base + array + 80), BeF(base + array + 88));
+  }
+  // Development (pgr4_vehicle_pose_probe): the wheels' other values sub_82445CB8 copies from the
+  // last step and sub_82441040 draws by (the position vectors +0, +16, +32, the steering +80, +124),
+  // their change since the probe's last look, to see whether they also step.
+  if (REXCVAR_GET(pgr4_vehicle_pose_probe) && g_pose_probe_left > 0) {
+    // The brake lights' switch sub_82415138 reads (Vehicle.Lights.UpdateFromSorcery, light types
+    // 0x1F to 0x21): the car record's +0x47E, off when +0x404 is -1 and +0x480 is set.
+    const uint8_t* record = base + pose - 736;
+    REXLOG_INFO("PGR4 pose probe: frame {} pose {:08X} brake lights: +0x47E {} +0x480 {} +0x404 {}",
+                g_frame_no, pose, record[0x47E], record[0x480],
+                int32_t(WheelBeU32(record + 0x404)));
+    static std::unordered_map<uint32_t, std::array<float, 22>> seen;
+    for (uint32_t i = 0; i < wheels && i < 2; ++i) {
+      const uint8_t* e = base + array + 160 * (i == 0 ? 0 : wheels - 1);
+      static constexpr int kOff[11] = {0, 4, 8, 16, 20, 24, 32, 36, 40, 80, 124};
+      auto& s = seen[pose];
+      float d[11];
+      for (int k = 0; k < 11; ++k) {
+        const float v = BeF(e + kOff[k]);
+        d[k] = v - s[11 * i + k];
+        s[11 * i + k] = v;
+      }
+      REXLOG_INFO("PGR4 pose probe: frame {} pose {:08X} wheel {} step {} change: +0 {:.4f} {:.4f} "
+                  "{:.4f}, +16 {:.4f} {:.4f} {:.4f}, +32 {:.4f} {:.4f} {:.4f}, +80 {:.4f}, +124 {:.4f} "
+                  "(+0 at {:.3f} {:.3f} {:.3f})",
+                  g_frame_no, pose, i == 0 ? 0 : wheels - 1, n, d[0], d[1], d[2], d[3], d[4], d[5],
+                  d[6], d[7], d[8], d[9], d[10], BeF(e), BeF(e + 4), BeF(e + 8));
+    }
+  }
+  car.n = n;
+  car.wheels = wheels;
+  car.frame = g_frame_no;
+}
+}  // namespace
+// Local change (18/11/2026, Tazz: the far opponents' bike wheels change from one frame to the
+// next): a vehicle's parts are drawn with their simplified model (sub_8242D560, the part's second
+// index set) when sub_824230A8 (vehicle, part group, &low) sets `low`: its height on screen
+// (vehicle data +0x31D4, a fraction of the image's height, sub_82438768 by sub_8243B748: the
+// bounding radius projected) at 0.05 or less (the constant at 0x82001290; a debug override at
+// 0x82A1E288 when 0x82AA69E2 is set; always `low` in mode 4 at 0x82AAC630, and for part groups 1, 2,
+// 5 and 6 when the data's +0x321F is set). 0.05 was 36 pixels on the console's 720 lines; at 2160
+// lines it is 108, and a bike's simplified wheel (its tyre not covering the rim: the road seen
+// through) popped in plain sight. pgr4_vehicle_lod_by_pixels keeps the switch at the console's size
+// in pixels: 0.05 times 720 / the render's height (720 times pgr4_native_resolution_scale), the
+// same at 720 lines and below. Read at each call.
+REXCVAR_DEFINE_BOOL(pgr4_vehicle_lod_by_pixels, true, "PGR4",
+                    "Vehicles switch to their simplified models at the console's size in pixels "
+                    "(the game's 5 % of the image's height times 720 / the render's height)");
+REXCVAR_DECLARE(int32_t, pgr4_native_resolution_scale);  // pgr4-native renderer.cpp
+REX_EXTERN(__imp__sub_824230A8);
+REX_HOOK_RAW(sub_824230A8) {
+  const uint32_t vehicle = ctx.r3.u32, group = ctx.r4.u32 & 0xFF, out = ctx.r5.u32;
+  __imp__sub_824230A8(ctx, base);
+  const int32_t scale = REXCVAR_GET(pgr4_native_resolution_scale);
+  if (!REXCVAR_GET(pgr4_vehicle_lod_by_pixels) || scale <= 1) return;
+  // The game's forced cases (its branch to 0x824230B8), kept.
+  if (WheelBeU32(base + 0x82AAC630) == 4) return;
+  const uint32_t data = WheelBeU32(base + vehicle + 0xA0);
+  if (base[data + 0x321F] != 0 && (group == 1 || group == 2 || group == 5 || group == 6)) return;
+  const float size = base[0x82AA69E2] != 0 ? BeF(base + 0x82A1E288) : BeF(base + data + 0x31D4);
+  const float threshold = BeF(base + 0x82001290) / float(scale);
+  base[out] = (size > threshold) ? 0 : 1;  // as the game: not above the threshold, NaN included
+}
+
+// Diagnostic (18/11/2026, Shanghai's far buildings drawn white): sub_823B1F50 binds an instance's
+// lightmap (sampler 14) with the entry sub_823B3A78 (world, record) returns: the record's page
+// (world +0x28, 64 bytes each, at the record's +2) when its first halfword is below 0x8000, else
+// the world's fallback (+0x98). Drawn with the fallback, psSceneDiffuse_Night's g_textureSet_14 is
+// false and the building gets 1.0 for its lightmap, times 6: white. pgr4_lightmap_probe logs every 2
+// seconds how often the fallback was returned, which pages, their entries' first 16 bytes and the
+// fallback's texture. The game's result is unchanged.
+REXCVAR_DEFINE_BOOL(pgr4_lightmap_probe, false, "PGR4",
+                    "Log the lightmap pages missing when the scene's buildings are drawn "
+                    "(sub_823B3A78's fallback), every 2 seconds (diagnostic)");
+REXCVAR_DEFINE_BOOL(pgr4_lightmap_write_probe, false, "PGR4",
+                    "With pgr4_lightmap_probe: note for 60 s which code writes the scene's texture "
+                    "page table (diagnostic)");
+namespace {
+struct LightmapProbe {
+  std::mutex mutex;
+  std::map<uint64_t, uint32_t> missing;  // page << 32 | caller's return address -> fallbacks
+  uint32_t calls = 0, fallbacks = 0, world = 0;
+  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+} g_lightmap_probe;
+
+// Diagnostic (19/11/2026): which code writes the page table (pgr4_lightmap_write_probe). Its host
+// pages are made read-only for kWatchSeconds; a write faults, the handler notes the instruction (its
+// offset in pgr4.exe, for llvm-symbolizer) and the entry's offset, lets that one instruction run
+// (the page writable, the trap flag set) and protects the page again at the single step. Reads are
+// untouched. Removed by its own thread after kWatchSeconds, whatever happens to the race (a file
+// read by the system into a protected page would fail).
+struct PageWrite {
+  uint64_t rva;
+  uint32_t guest;  // guest address written
+  uint32_t value;  // the written word (4-byte aligned) after the write
+};
+struct WriteWatch {
+  std::atomic<bool> on{false};
+  uintptr_t lo = 0, hi = 0;          // host pages protected
+  uint32_t table = 0, count = 0;     // guest table, entries
+  uint8_t* base = nullptr;
+  uintptr_t image = 0;
+  static constexpr uint32_t kMax = 8192;
+  PageWrite writes[kMax];
+  std::atomic<uint32_t> n{0};
+  std::atomic<uint32_t> faults{0};
+  PVOID handler = nullptr;
+  static constexpr int kWatchSeconds = 60;
+} g_write_watch;
+thread_local uintptr_t t_watch_page = 0;
+thread_local uint32_t t_watch_slot = ~0u;
+
+LONG CALLBACK WriteWatchHandler(EXCEPTION_POINTERS* e) {
+  auto& w = g_write_watch;
+  const DWORD code = e->ExceptionRecord->ExceptionCode;
+  if (code == EXCEPTION_SINGLE_STEP && t_watch_page) {
+    DWORD old;
+    VirtualProtect(reinterpret_cast<void*>(t_watch_page), 4096,
+                   w.on.load() ? PAGE_READONLY : PAGE_READWRITE, &old);
+    if (t_watch_slot != ~0u) {
+      PageWrite& r = w.writes[t_watch_slot];
+      // The word written (4-byte aligned), after the write.
+      r.value = WheelBeU32(w.base + (r.guest & ~3u));
+    }
+    t_watch_page = 0;
+    t_watch_slot = ~0u;
+    return EXCEPTION_CONTINUE_EXECUTION;
+  }
+  if (code != EXCEPTION_ACCESS_VIOLATION || e->ExceptionRecord->NumberParameters < 2 ||
+      e->ExceptionRecord->ExceptionInformation[0] != 1)
+    return EXCEPTION_CONTINUE_SEARCH;
+  const uintptr_t at = e->ExceptionRecord->ExceptionInformation[1];
+  if (at < w.lo || at >= w.hi) return EXCEPTION_CONTINUE_SEARCH;
+  w.faults.fetch_add(1, std::memory_order_relaxed);
+  const uintptr_t page = at & ~uintptr_t(4095);
+  DWORD old;
+  VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &old);
+  const uint32_t guest = uint32_t(at - reinterpret_cast<uintptr_t>(w.base));
+  t_watch_slot = ~0u;
+  if (guest >= w.table && guest < w.table + w.count * 64) {
+    const uint32_t i = w.n.fetch_add(1, std::memory_order_relaxed);
+    if (i < WriteWatch::kMax) {
+      w.writes[i] = {uint64_t(e->ContextRecord->Rip - w.image), guest, 0};
+      t_watch_slot = i;
+    }
+  }
+  t_watch_page = page;
+  e->ContextRecord->EFlags |= 0x100;  // trap flag: back here after the write
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void WriteWatchProtect(DWORD protect) {
+  auto& w = g_write_watch;
+  DWORD old;
+  for (uintptr_t p = w.lo; p < w.hi; p += 4096)
+    VirtualProtect(reinterpret_cast<void*>(p), 4096, protect, &old);
+}
+
+void WriteWatchStart(uint8_t* base, uint32_t table, uint32_t count) {
+  auto& w = g_write_watch;
+  if (w.handler || !count) return;  // once a run
+  w.base = base;
+  w.table = table;
+  w.count = count;
+  w.image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+  w.lo = reinterpret_cast<uintptr_t>(base + table) & ~uintptr_t(4095);
+  w.hi = (reinterpret_cast<uintptr_t>(base + table + count * 64) + 4095) & ~uintptr_t(4095);
+  w.handler = AddVectoredExceptionHandler(1, WriteWatchHandler);
+  w.on = true;
+  WriteWatchProtect(PAGE_READONLY);
+  REXLOG_INFO("PGR4 lightmap write probe: table {:08X}, {} entries, {} host pages read-only for {} s",
+              table, count, (w.hi - w.lo) / 4096, WriteWatch::kWatchSeconds);
+  std::thread([] {
+    std::this_thread::sleep_for(std::chrono::seconds(WriteWatch::kWatchSeconds));
+    g_write_watch.on = false;
+    WriteWatchProtect(PAGE_READWRITE);
+    REXLOG_INFO("PGR4 lightmap write probe: stopped ({} faults, {} table writes)",
+                g_write_watch.faults.load(), g_write_watch.n.load());
+  }).detach();
+}
+
+// The writes noted since the last report: by instruction and field, then those to `pages`.
+void WriteWatchReport(std::initializer_list<uint32_t> pages) {
+  auto& w = g_write_watch;
+  static uint32_t reported = 0;
+  const uint32_t n = std::min(w.n.load(), WriteWatch::kMax);
+  if (n == reported) return;
+  std::map<std::pair<uint64_t, uint32_t>, uint32_t> by;  // (rva, field offset) -> writes
+  std::string watched;
+  for (uint32_t i = reported; i < n; ++i) {
+    const PageWrite& r = w.writes[i];
+    const uint32_t entry = (r.guest - w.table) / 64, field = (r.guest - w.table) % 64;
+    ++by[{r.rva, field}];
+    for (const uint32_t p : pages)
+      if (entry == p && watched.size() < 600) {
+        char s[80];
+        std::snprintf(s, sizeof(s), " [%u+%u by %llX -> %08X]", entry, field,
+                      (unsigned long long)r.rva, r.value);
+        watched += s;
+      }
+  }
+  std::string sites;
+  for (const auto& [k, c] : by) {
+    if (sites.size() > 900) break;
+    char s[64];
+    std::snprintf(s, sizeof(s), " %llX+%u x%u", (unsigned long long)k.first, k.second, c);
+    sites += s;
+  }
+  REXLOG_INFO("PGR4 lightmap write probe: {} table writes ({} faults); by code+field:{}; watched:{}",
+              n - reported, w.faults.load(), sites, watched);
+  reported = n;
+}
+// Page loads given up (pgr4_lightmap_probe): sub_82384598 loads a page into its entry's back half
+// (+0x20) and, failing, sets it free with sub_8237E7A8(back half, 2); sub_822B4818(size, &out, pool)
+// is its allocation (pools 1-4), null when the pool is full.
+struct LoadFailures {
+  std::map<uint64_t, uint32_t> given_up;     // entry << 32 | caller -> times
+  std::map<uint64_t, uint32_t> alloc_failed;  // pool << 32 | size -> times
+} g_load_failures;
+}  // namespace
+REX_EXTERN(__imp__sub_8237E7A8);
+REX_HOOK_RAW(sub_8237E7A8) {
+  const uint32_t half = ctx.r3.u32, state = ctx.r4.u32, caller = uint32_t(ctx.lr);
+  __imp__sub_8237E7A8(ctx, base);
+  if (!REXCVAR_GET(pgr4_lightmap_probe) || state != 2) return;
+  std::lock_guard lock(g_lightmap_probe.mutex);
+  const uint32_t world = g_lightmap_probe.world;
+  const uint32_t table = world ? WheelBeU32(base + world + 0x28) : 0;
+  const uint32_t entry = table && half >= table + 0x20 ? (half - 0x20 - table) / 64 : 0xFFFFFFFF;
+  ++g_load_failures.given_up[uint64_t(entry) << 32 | caller];
+}
+REX_EXTERN(__imp__sub_822B4818);
+REX_HOOK_RAW(sub_822B4818) {
+  const uint32_t size = ctx.r3.u32, pool = ctx.r5.u32;
+  __imp__sub_822B4818(ctx, base);
+  if (!REXCVAR_GET(pgr4_lightmap_probe) || ctx.r3.u32 != 0) return;
+  std::lock_guard lock(g_lightmap_probe.mutex);
+  ++g_load_failures.alloc_failed[uint64_t(pool) << 32 | size];
+}
+// Local change (19/11/2026, Tazz: Shanghai's far buildings flashing white with ENHANCED DETAILS high
+// or ultra, with Xenos too): the scene's textures and lightmaps stream into one heap, 0x82A80A7C,
+// made at boot by sub_822B4D88 with a fixed 147 MB (sub_822B5A58(heap, 4 KB blocks, 0x9300000):
+// sub_822B50C8 -> sub_8230BEB0, one contiguous physical allocation, 64 KB aligned; the game stops
+// if it fails). Forced to the scenery's highest LOD (10, needing 139.3 MB by the game's own table,
+// world +0xEC), Shanghai asks for more than the heap holds: page loads (sub_82384598) fail on
+// allocation, a blinking sign's second lightmap (page 15279) never loads, and sub_823B3A78's
+// fallback (no texture) draws the building at full light, times 6: white. Measured in a race: the
+// emulated console's physical memory keeps 207 MB never given out (132 MB in the menus).
+// pgr4_scene_texture_pool_extra_mb adds that many MB to the heap at its creation; everything else
+// reads its size from the heap (+0x3C: sub_823D67A0's LOD choice, sub_823C67C8's streaming budget).
+// Read at boot only. 96 (243 MB): two players' split screen asks 187.8 MB for LOD 10 by the game's
+// table; measured in Shanghai and Quebec at two in storms, peaks of 215.8 and 214.5 MB, no failed
+// allocation; the physical memory left is then 36 MB in the menus, 110 MB in a race (19/11/2026).
+REXCVAR_DEFINE_INT32(pgr4_scene_texture_pool_extra_mb, 96, "PGR4",
+                     "MB added to the scene's texture heap (the game's 147 MB) at boot: more "
+                     "scenery detail loaded without running out (0: the game's size)")
+    .range(0, 96)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REX_EXTERN(__imp__sub_822B5A58);
+REX_HOOK_RAW(sub_822B5A58) {
+  const uint32_t heap = ctx.r3.u32;
+  const int32_t extra = std::clamp(REXCVAR_GET(pgr4_scene_texture_pool_extra_mb), 0, 96);
+  const bool grow = heap == 0x82A80A7C && ctx.r5.u32 == 0x9300000 && extra > 0;
+  if (grow) ctx.r5.u64 = 0x9300000u + (uint32_t(extra) << 20);
+  __imp__sub_822B5A58(ctx, base);
+  if (heap == 0x82A80A7C)
+    REXLOG_INFO("PGR4 scene texture heap: {:.0f} MB at {:08X} (the game's 147 MB{})",
+                WheelBeU32(base + heap + 0x3C) / 1048576.0, WheelBeU32(base + heap + 4),
+                grow ? fmt::format(", plus {} MB", extra) : std::string());
+}
+
+// Local change (19/11/2026, Tazz: the brake lights flicker in replays). sub_822E5BF8 (method 0x18
+// of a car's table, 0x82002740: sub_822DC398 on *(car +808)) sets the car's controls to zero:
+// pedals and steering 0.0, buttons 0. sub_824C6398, the frame's simulation, calls it twice for the
+// cars whose byte +0x3C is set (their controls fed from outside: the replay's cars): once at the
+// frame's start in sub_82303770 (return address 0x823037FC), then at each physics step in
+// sub_82303370, right before sub_824F3010 decodes the step's recorded controls (sub_824E2A40).
+// At the console's 30 FPS every frame ran two steps, so the frame's clear was always followed by a
+// step's clear and decode. Above 60 FPS a frame often runs none: the controls stayed zero for the
+// frame, and sub_82445CB8 drew the brake lights from a 0 pedal (off one frame in three at 95 FPS,
+// measured). pgr4_replay_controls_hold skips the frame's clear when the frame runs no step (the
+// game's test, (n - 1) h <= t - x, n at 0x82A17644, x 0x82A17640, h 0x82001170, t 0x82A81334):
+// the controls stay the last step's, as on the console between two steps. Frames with steps are
+// unchanged. Read at each call.
+REXCVAR_DEFINE_BOOL(pgr4_replay_controls_hold, true, "PGR4",
+                    "Replays: the cars' controls (brake, steering) kept on frames without a physics "
+                    "step instead of cleared (the brake lights flickered above 60 FPS)");
+REX_EXTERN(__imp__sub_822E5BF8);
+REX_HOOK_RAW(sub_822E5BF8) {
+  if (uint32_t(ctx.lr) == 0x823037FC && REXCVAR_GET(pgr4_replay_controls_hold)) {
+    const uint8_t* np = base + 0x82A17644;
+    const int32_t n =
+        int32_t(uint32_t(np[0]) << 24 | uint32_t(np[1]) << 16 | uint32_t(np[2]) << 8 | np[3]);
+    const double h = double(BeF(base + 0x82001170));
+    const float due = float(double(int64_t(n - 1)) * h);  // as sub_824C6398 rounds it
+    if (!(due <= BeF(base + 0x82A81334) - BeF(base + 0x82A17640))) return;  // no step this frame
+  }
+  if (REXCVAR_GET(pgr4_vehicle_lights_probe)) {
+    static std::mutex m;
+    static std::set<uint64_t> seen;
+    const uint32_t caller = uint32_t(ctx.lr), object = ctx.r3.u32;
+    std::lock_guard lock(m);
+    if (seen.insert(uint64_t(caller) << 32 | WheelBeU32(base + object)).second)
+      REXLOG_INFO("PGR4 controls clear: from {:08X}, object {:08X} (table {:08X}), controls {:08X}",
+                  caller, object, WheelBeU32(base + object), WheelBeU32(base + object + 808));
+  }
+  __imp__sub_822E5BF8(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_823B3A78);
+REX_HOOK_RAW(sub_823B3A78) {
+  const uint32_t world = ctx.r3.u32, record = ctx.r4.u32, caller = uint32_t(ctx.lr);
+  __imp__sub_823B3A78(ctx, base);
+  if (!REXCVAR_GET(pgr4_lightmap_probe)) return;
+  auto& p = g_lightmap_probe;
+  std::lock_guard lock(p.mutex);
+  ++p.calls;
+  p.world = world;
+  if (ctx.r3.u32 == world + 0x98) {
+    ++p.fallbacks;
+    const uint64_t page = uint32_t(base[record + 2]) << 8 | base[record + 3];
+    ++p.missing[page << 32 | caller];
+  }
+  // The page watch on the table of the world whose fallback was returned (sub_823B3A78 serves several
+  // worlds: the first one seen held 2520 entries rewritten every frame, not the scene's).
+  if (ctx.r3.u32 == world + 0x98 && REXCVAR_GET(pgr4_lightmap_write_probe) &&
+      (uint32_t(base[record + 2]) << 8 | base[record + 3]) == 15279)
+    WriteWatchStart(base, WheelBeU32(base + world + 0x28), WheelBeU32(base + world + 0x20));
+  const auto now = std::chrono::steady_clock::now();
+  if (now - p.last < std::chrono::seconds(2)) return;
+  p.last = now;
+  const uint32_t table = WheelBeU32(base + world + 0x28);
+  if (REXCVAR_GET(pgr4_lightmap_write_probe))
+    WriteWatchReport({15279, 11654, 12608, 17811, 17815, 17817});
+  std::string pages;
+  int shown = 0;
+  for (const auto& [key, n] : p.missing) {
+    if (shown++ == 12) break;
+    const uint32_t page = uint32_t(key >> 32);
+    const uint8_t* e = base + table + page * 64;
+    char s[128];
+    std::snprintf(s, sizeof(s), " %u from %08X (x%u: %02X%02X %02X%02X %08X %08X %08X)", page,
+                  uint32_t(key), n, e[0], e[1], e[2], e[3], WheelBeU32(e + 4), WheelBeU32(e + 8),
+                  WheelBeU32(e + 16));
+    pages += s;
+  }
+  // 0x82A1BCE0: the lightmap set sub_823B44F8's case 0xCC picks (its record's 2 * set + 1).
+  // The guest's physical memory not given out (the emulator's physical heap, 4 KB pages), the
+  // scene's texture pool (heap 0x82A80A7C: size +0x3C, in use +0x40, peak +0x44) and the
+  // world's highest scenery LOD (+0x728, sub_823D67A0's choice unless ENHANCED DETAILS forces it).
+  auto* physical = rex::system::kernel_memory()->GetPhysicalHeap();
+  const double free_mb = double(physical->GetUnreservedPageCount()) * physical->page_size() / 1048576.0;
+  REXLOG_INFO("PGR4 lightmap probe: {} lookups, {} fallbacks, {} missing; fallback texture {:08X}; "
+              "set {}; physical free {:.1f} of {:.0f} MB; pool {:.1f}/{:.1f} MB (peak {:.1f}); max LOD {};{}",
+              p.calls, p.fallbacks, p.missing.size(), WheelBeU32(base + world + 0x98),
+              int32_t(WheelBeU32(base + 0x82A1BCE0)), free_mb,
+              double(physical->GetTotalPageCount()) * physical->page_size() / 1048576.0,
+              WheelBeU32(base + 0x82A80AB8) / 1048576.0, WheelBeU32(base + 0x82A80ABC) / 1048576.0,
+              WheelBeU32(base + 0x82A80AC0) / 1048576.0,
+              WheelBeU32(base + WheelBeU32(base + 0x82A985E8) + 0x728), pages);
+  p.calls = p.fallbacks = 0;
+  p.missing.clear();
+  auto& f = g_load_failures;
+  if (!f.given_up.empty() || !f.alloc_failed.empty()) {
+    std::string s;
+    for (const auto& [k, n] : f.given_up) {
+      if (s.size() > 700) break;
+      char t[64];
+      std::snprintf(t, sizeof(t), " page %d from %08X x%u", int32_t(k >> 32), uint32_t(k), n);
+      s += t;
+    }
+    s += "; allocations failed:";
+    for (const auto& [k, n] : f.alloc_failed) {
+      if (s.size() > 1400) break;
+      char t[64];
+      std::snprintf(t, sizeof(t), " pool %u size %u x%u", uint32_t(k >> 32), uint32_t(k), n);
+      s += t;
+    }
+    REXLOG_INFO("PGR4 lightmap probe: loads given up:{}", s);
+    f.given_up.clear();
+    f.alloc_failed.clear();
+  }
+}
+REX_EXTERN(__imp__sub_82445CB8);
+REX_HOOK_RAW(sub_82445CB8) {
+  const uint32_t pose = ctx.r3.u32;
+  // Its fraction, as it computes it (g_pose_time above). In the menus the update comes before the
+  // frame's physics steps: the fraction is mostly below its range, the pose a step's.
+  const float x = BeF(base + 0x82A17640), t = BeF(base + 0x82A8131C + 24),
+              h = BeF(base + 0x82001170), lo = BeF(base + 0x82258A6C), hi = BeF(base + 0x8218BCC0);
+  const uint8_t* np = base + 0x82A17644;
+  const int32_t n = int32_t(uint32_t(np[0]) << 24 | uint32_t(np[1]) << 16 | uint32_t(np[2]) << 8 | np[3]);
+  const float fraction =
+      base[0x82A81378] == 0 ? 0.0f : x > 0 ? (x + float(n - 1) * h - t) / x : 0.0f;
+  const bool extend = REXCVAR_GET(pgr4_vehicle_pose_extend) && base[0x82A81378] != 0 &&
+                      (fraction < lo || fraction > hi) && fraction >= kExtendLow &&
+                      fraction <= kExtendHigh;
+  const bool mixed = extend || (!(fraction < lo) && !(fraction > hi));
+  // A car's (physics +16 == 0: sub_82445CB8's wheel loop at 0x824460F8; a bike's goes elsewhere).
+  const bool car_wheels = WheelBeU32(base + ctx.r4.u32 + 16) == 0;
+  t_pose_extend = extend;
+  const uint32_t physics = ctx.r4.u32;
+  __imp__sub_82445CB8(ctx, base);
+  t_pose_extend = false;
+  // Diagnostic (19/11/2026, Tazz: the brake and reverse lights flicker in replays): what
+  // sub_82445CB8 based the lights on, each call: its mode (physics +20; 1: the brake through
+  // sub_82446D78's average of its last calls, *(pose +944): ring at +0, count +8), the brake
+  // pedal (*(physics +808) +8, against f29), the brake lights' flag it wrote (pose +414, the car
+  // record's +0x47E), the gear (physics +2702 into pose +292) and the frame's physics steps.
+  if (car_wheels && REXCVAR_GET(pgr4_vehicle_lights_probe)) {
+    const uint32_t filter = WheelBeU32(base + pose + 944);
+    float average = -1.0f;
+    if (filter >= 0x00010000) {
+      const uint32_t ring = WheelBeU32(base + filter), count = WheelBeU32(base + filter + 8);
+      if (ring && count > 0 && count <= 256) {
+        float sum = BeF(base + filter + 16);
+        for (uint32_t i = 0; i < count; ++i) sum += BeF(base + ring + 4 * i);
+        average = sum / float(count);
+      }
+    }
+    REXLOG_INFO("PGR4 lights probe: frame {} pose {:08X} steps {} mode {} pedal {:.3f} average {:.3f} "
+                "brake flag {} gear {}",
+                g_frame_no, pose, n, int32_t(WheelBeU32(base + physics + 20)),
+                BeF(base + WheelBeU32(base + physics + 808) + 8), average, base[pose + 414],
+                int32_t(int8_t(base[physics + 2702])));
+    // pgr4_vehicle_pedal_watch: the page watch (WriteWatchStart) on this car's controls
+    // (*(physics +808), 64 bytes) from the first time its pedal falls from braking to 0 on a call
+    // without a new physics step (seen in replays only), to find what sets it back to 0.
+    const uint32_t controls = WheelBeU32(base + physics + 808);
+    static std::unordered_map<uint32_t, std::pair<float, int32_t>> last_pedal;  // pose -> pedal, step
+    const float pedal = BeF(base + controls + 8);
+    auto& lp = last_pedal[pose];
+    if (REXCVAR_GET(pgr4_vehicle_pedal_watch) && lp.first > 0.5f && pedal == 0.0f && lp.second == n) {
+      WriteWatchStart(base, controls, 1);
+      REXLOG_INFO("PGR4 pedal watch: controls {:08X} of pose {:08X} (pedal {:.3f} -> 0 at step {})",
+                  controls, pose, lp.first, n);
+    }
+    lp = {pedal, n};
+    static auto last_report = std::chrono::steady_clock::now();
+    if (REXCVAR_GET(pgr4_vehicle_pedal_watch) &&
+        std::chrono::steady_clock::now() - last_report > std::chrono::seconds(2)) {
+      last_report = std::chrono::steady_clock::now();
+      WriteWatchReport({0});
+    }
+  }
+  // Local change: the wheels' spin at the body's time (pgr4_vehicle_wheel_spin_mix).
+  if (car_wheels) MixWheelSpin(base, pose, n, mixed ? fraction : fraction < lo ? 0.0f : 1.0f);
+  // Development (pgr4_vehicle_pose_probe): a bike's wheels (sub_82445CB8's branch at 0x82446298:
+  // the spin carried on at each call, +84 += +88 times the game's step at 0x82A81330; the place
+  // +0 and the steering +80 from the last step's pose), each call.
+  if (!car_wheels && REXCVAR_GET(pgr4_vehicle_pose_probe) && g_pose_probe_left > 0) {
+    const uint32_t array = WheelBeU32(base + pose + 960), wheels = WheelBeU32(base + pose + 968);
+    if (array >= 0x40000000 && wheels && wheels <= 4)
+      for (uint32_t i = 0; i < wheels && i < 2; ++i) {
+        const uint8_t* e = base + array + 160 * i;
+        REXLOG_INFO("PGR4 pose probe: frame {} bike pose {:08X} wheel {} step {} fraction {:.4f}: "
+                    "spin +84 {:.4f} rate +88 {:.3f} dt {:.5f}, steering +80 {:.4f}, place +0 {:.4f} "
+                    "{:.4f} {:.4f}, +16 {:.4f} {:.4f} {:.4f}",
+                    g_frame_no, pose, i, n, fraction, BeF(e + 84), BeF(e + 88),
+                    BeF(base + 0x82A81330), BeF(e + 80), BeF(e), BeF(e + 4), BeF(e + 8), BeF(e + 16),
+                    BeF(e + 20), BeF(e + 24));
+      }
+  }
+  const double last_step = double(x) + double(n - 1) * double(h);
+  g_pose_time[pose] = {mixed            ? double(t)
+                       : fraction < lo  ? last_step
+                                        : last_step - double(x),
+                       double(t), g_frame_no};
+  if (REXCVAR_GET(pgr4_vehicle_pose_probe) && g_pose_probe_left > 0) {
+    --g_pose_probe_left;
+    REXLOG_INFO("PGR4 pose probe: frame {} game interpolation sub_82445CB8 into {:08X}: fraction "
+                "{:.4f}, range {:.4f} to {:.4f}, {}", g_frame_no, pose, fraction, lo, hi,
+                extend ? "mixed past its range" : mixed ? "mixed" : "a step's pose");
+  }
+}
+// sub_82445CB8's range bounds (lfs f0 of 0x82258A6C's 0.001 at 0x82445DE8, of 0x8218BCC0's 0.999
+// at 0x82445E2C, each compared with the fraction f31 next), out of the way while t_pose_extend.
+void Pgr4PoseLowBoundHook(PPCRegister& f0) {
+  if (t_pose_extend) f0.f64 = double(kExtendLow) - 1.0;
+}
+void Pgr4PoseHighBoundHook(PPCRegister& f0) {
+  if (t_pose_extend) f0.f64 = double(kExtendHigh) + 1.0;
+}
+REX_EXTERN(sub_82417B50);
 REX_EXTERN(__imp__sub_82417B50);
 REX_HOOK_RAW(sub_82417B50) {
   const uint32_t record = ctx.r3.u32;
+  PoseProbe(base, "extrapolated (sub_82417B50)", record, ctx.f1.f64, ctx.lr);
   if (record >= 0x40000000) HoldFrozenCar(base, record);
   {
     SteadyBody steady(base, record, float(ctx.f1.f64));
@@ -673,12 +1399,70 @@ void Pgr4RaceWeather(const uint8_t* base);  // src/pgr4_autopilot.cpp
 bool Pgr4FreeCamBefore(uint8_t* base, uint32_t camera, uint8_t saved[8]);  // src/pgr4_freecam.cpp
 void Pgr4FreeCamAfter(uint8_t* base, uint32_t camera, const uint8_t saved[8]);
 REX_EXTERN(__imp__sub_827D4688);
+namespace pgr4::native {
+void NoteGameCameraCut(const float eye[3], const char* why, bool again);  // pgr4-native upscaler.cpp
+}
+namespace {
+// The view camera's cuts (local addition, 18/11/2026; --pgr4_native_game_camera_cuts), read
+// around its update: its mode (+496, the last update's at +500) or its sub-camera (+516, +520)
+// changing, or the replay's zone switch byte (0x82C922CC: 1 at a change of zone; a change of
+// sub-camera within a zone does not set it). Compared with this hook's own last values too, as
+// the game may compare and copy within the update. The eye (+16) goes to the renderer.
+uint32_t g_cut_mode = 0, g_cut_sub = 0;
+bool g_cut_zone = false, g_cut_known = false;
+uint64_t g_cut_frame = UINT64_MAX;  // the game frame of the last cut
+uint32_t BeU32(const uint8_t* p) {
+  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+}
+void NoteCameraCut(const uint8_t* base, bool zone_before) {
+  constexpr uint32_t kView = 0x82C91D00, kZoneSwitch = 0x82C922CC;
+  const uint8_t* c = base + kView;
+  const uint32_t mode = BeU32(c + 496), last_mode = BeU32(c + 500);
+  const uint32_t sub = BeU32(c + 516), last_sub = BeU32(c + 520);
+  const bool zone = zone_before || base[kZoneSwitch] == 1;
+  const char* why = nullptr;
+  if (g_cut_known) {
+    if (mode != g_cut_mode || mode != last_mode) why = "mode";
+    else if (zone && !g_cut_zone) why = "zone";
+    else if (sub != g_cut_sub || sub != last_sub) why = "sub-camera";
+  }
+  static int logged = 0;  // local diagnostic
+  if (why && logged < 400) {
+    ++logged;
+    REXLOG_INFO("PGR4 camera cut: frame {} {} (mode {} -> {}, game's last {}; sub-camera {:08X} "
+                "-> {:08X}, game's last {:08X}; zone byte {})",
+                g_frame_no, why, g_cut_mode, mode, last_mode, g_cut_sub, sub, last_sub, int(zone));
+  }
+  const float eye[3] = {BeF(c + 16), BeF(c + 20), BeF(c + 24)};
+  if (why) {
+    pgr4::native::NoteGameCameraCut(eye, why, false);
+    g_cut_frame = g_frame_no;
+  } else if (g_cut_frame == g_frame_no) {
+    // Updated again in the cut's frame (a replay's zone change was seen to move the eye twice).
+    static int again_logged = 0;
+    if (again_logged < 100) {
+      ++again_logged;
+      REXLOG_INFO("PGR4 camera cut: frame {} camera updated again, eye {:.2f} {:.2f} {:.2f}",
+                  g_frame_no, eye[0], eye[1], eye[2]);
+    }
+    pgr4::native::NoteGameCameraCut(eye, "", true);
+  }
+  g_cut_mode = mode;
+  g_cut_sub = sub;
+  g_cut_zone = zone;
+  g_cut_known = true;
+}
+}  // namespace
+REXCVAR_DECLARE(bool, pgr4_native_game_camera_cuts);
 REX_HOOK_RAW(sub_827D4688) {
   const uint32_t camera = ctx.r3.u32;
   uint8_t saved[8];
   const bool free_camera = Pgr4FreeCamBefore(base, camera, saved);
+  const bool cuts = camera == 0x82C91D00 && !free_camera && REXCVAR_GET(pgr4_native_game_camera_cuts);
+  const bool zone_before = cuts && base[0x82C922CC] == 1;
   __imp__sub_827D4688(ctx, base);
   if (free_camera) Pgr4FreeCamAfter(base, camera, saved);
+  if (cuts) NoteCameraCut(base, zone_before);
 }
 REX_EXTERN(__imp__sub_8264A358);
 REX_HOOK_RAW(sub_8264A358) {
@@ -694,7 +1478,46 @@ REX_HOOK_RAW(sub_82416BA0) {
     Pgr4AutopilotCar(record, g_frame_no);
     HoldFrozenCar(base, record);
   }
+  PoseProbe(base, ctx.r4.u32 ? "given pose (sub_82416BA0)" : "step pose (sub_82416BA0)", record,
+            0.0, ctx.lr);
+  // Local change (18/11/2026): the drawn pose carried to the game's time (pgr4_vehicle_pose_ahead),
+  // from the time of the pose sub_82445CB8 wrote at +736 this frame or the last (g_pose_time): a
+  // step's carried by the time since it, a mixed one (already at the game's time) left the game's.
+  // No such pose: the game's.
+  const auto pose_time = g_pose_time.find(record + 736);
+  if (!ctx.r4.u32 && record >= 0x40000000 && !g_pose_carrying &&
+      REXCVAR_GET(pgr4_vehicle_pose_ahead) && pose_time != g_pose_time.end() &&
+      pose_time->second.frame + 1 >= g_frame_no) {
+    const float t = BeF(base + 0x82A8131C + 24), h = BeF(base + 0x82001170);
+    const uint8_t* np = base + 0x82A17644;
+    const int32_t n =
+        int32_t(uint32_t(np[0]) << 24 | uint32_t(np[1]) << 16 | uint32_t(np[2]) << 8 | np[3]);
+    const double ahead = pose_time->second.target - pose_time->second.time;
+    // Back too: in a race the update runs at each physics step, and at the frame's last the
+    // physics is often ahead of the game's time (measured -0.5 to -17 ms); carried forward only,
+    // those frames kept the step's pose and every car shook between the two (Tazz, 18/11/2026).
+    if (h > 0 && std::abs(ahead) > 1e-6 && ahead >= -2.0 * h && ahead <= 3.0 * h) {
+      const PPCContext saved = ctx;
+      ctx.f1.f64 = ahead;
+      g_carry_r5 = saved.r5.u64;
+      g_pose_carrying = true;
+      sub_82417B50(ctx, base);
+      g_pose_carrying = false;
+      ctx = saved;
+      if (REXCVAR_GET(pgr4_vehicle_pose_probe) && g_pose_probe_left > 0) {
+        const uint8_t* step = base + record + 736 + 48;
+        const uint8_t* drawn = base + record + 12560 + 48;
+        const uint8_t* vel = base + record + 880;
+        REXLOG_INFO("PGR4 pose probe: frame {} car {:08X} ahead {:.5f} n {} t {:.5f} step {:.3f} {:.3f} "
+                    "{:.3f} drawn {:.3f} {:.3f} {:.3f} vel {:.3f} {:.3f} {:.3f}",
+                    g_frame_no, record, ahead, n, t, BeF(step), BeF(step + 4), BeF(step + 8),
+                    BeF(drawn), BeF(drawn + 4), BeF(drawn + 8), BeF(vel), BeF(vel + 4), BeF(vel + 8));
+      }
+      return;
+    }
+  }
   if (ctx.r4.u32) {
+    if (g_pose_carrying) ctx.r5.u64 = g_carry_r5;  // the update's, not sub_82417B50's preview
     __imp__sub_82416BA0(ctx, base);
     return;
   }
@@ -703,6 +1526,141 @@ REX_HOOK_RAW(sub_82416BA0) {
     __imp__sub_82416BA0(ctx, base);
   }
   if (record >= 0x40000000) g_drawn_records[record] = g_frame_no;
+}
+
+// The carried pose's wheels (local change, 18/11/2026). sub_82416BA0 updates each wheel (its
+// +392 of 992 bytes at +384) with sub_82441040(wheel, tracks, pose): given no pose, tracks is the
+// game's (1, or 0 while byte +61 of 0x82A235D8 is set with its +56 mode not 0) and the wheel lays
+// its skid marks (sub_8243FC38, Vehicle.Effects.Tracks); given one, as for the carried pose, 0:
+// no skid marks (Tazz, 18/11/2026). The carried call's wheels get the game's own value.
+REX_EXTERN(__imp__sub_82441040);
+REX_HOOK_RAW(sub_82441040) {
+  if (g_pose_carrying && ctx.r5.u32 != 0) {
+    const uint8_t* state = base + 0x82A235D8;
+    const uint32_t mode = uint32_t(state[56]) << 24 | uint32_t(state[57]) << 16 |
+                          uint32_t(state[58]) << 8 | state[59];
+    ctx.r4.u64 = (mode == 0 || state[61] == 0) ? 1 : 0;
+  }
+  // The probe: what each path places the wheel from, its parent's (+748) +800 without a pose, the
+  // pose given with one, against the parent's step (+736) and drawn (+12560) poses.
+  if (REXCVAR_GET(pgr4_vehicle_pose_probe) && g_pose_probe_left > 0) {
+    --g_pose_probe_left;
+    const uint8_t* w = base + ctx.r3.u32;
+    const uint32_t parent = uint32_t(w[748]) << 24 | uint32_t(w[749]) << 16 |
+                            uint32_t(w[750]) << 8 | w[751];
+    const uint8_t* pr = base + parent;
+    const uint8_t* given = ctx.r5.u32 ? base + ctx.r5.u32 : nullptr;
+    REXLOG_INFO("PGR4 pose probe: frame {} wheel {:08X} {} tracks {} parent {:08X}: +800 {:.3f} "
+                "{:.3f} {:.3f}, +736 {:.3f} {:.3f} {:.3f}, +12560 {:.3f} {:.3f} {:.3f}, given {:.3f} "
+                "{:.3f} {:.3f}",
+                g_frame_no, ctx.r3.u32, g_pose_carrying ? "carried" : "game's", int(ctx.r4.u32),
+                parent, BeF(pr + 800 + 48), BeF(pr + 800 + 52), BeF(pr + 800 + 56),
+                BeF(pr + 736 + 48), BeF(pr + 736 + 52), BeF(pr + 736 + 56), BeF(pr + 12560 + 48),
+                BeF(pr + 12560 + 52), BeF(pr + 12560 + 56), given ? BeF(given + 48) : 0.0f,
+                given ? BeF(given + 52) : 0.0f, given ? BeF(given + 56) : 0.0f);
+  }
+  __imp__sub_82441040(ctx, base);
+}
+
+// The drivers' and riders' ragdolls at any frame rate (local change, 18/11/2026, Tazz: the driver
+// jumps in a replay's cockpit view, more with FSR FG). Both were tuned on the console's 30 frames a
+// second, two physics steps of 1/60 s a frame; probe in a replay at 86 frames a second:
+// - the acceleration a character gets from its vehicle (sub_8249C3E0, called once a frame): its
+//   velocities (+112, +124 of the record at +116) minus the last call's (+48, +64 of r3), over the
+//   frame's time (+132). The velocities move with the physics steps, not with the frames: the
+//   driver got 0 to 19.7 m/s^2 frame to frame for an even 8.8 (then times
+//   Character.Ragdoll.VehicleForceScale, 18). Then mixed into the last by
+//   Character.Ragdoll.VehicleAccelSmoothFactor (0.7, f1) a call: a call's weight, so the
+//   smoothing's time grew shorter with the frame rate.
+//   pgr4_character_accel_window: the acceleration over the console's frame, the velocities now
+//   less those 1/30 s ago (a character's own history, by its time), handed to the game through
+//   the last call's velocities (v - a dt); the weight as a time, 1 - (1 - f1)^(dt 30) (0.7 at 30
+//   frames a second, 0.34 at 86). The game's forces, noise and scale are its own.
+// - the ragdoll's step (sub_824B6438): 1 / (Character.Ragdoll.NumStepsPerFrame x 30) s a call,
+//   the frame's real time it is given (f1) unused: 2.9 times too fast at 86 frames a second.
+//   pgr4_character_ragdoll_time: the 30 it loads (0x821AC658, at 0x824B6480) made 1 / f1, so a
+//   call steps the frame's time (Pgr4RagdollRateHook); at most 1/30 s (the console's, under 30
+//   frames a second), at least 1 ms.
+// Both on by default (Tazz, 18/11/2026: « le pilote c'est bon ça marche »). Measured in a replay's
+// cockpit view, the smoothed acceleration's change frame to frame: 35 % of it at 73 frames a
+// second without, 9 % with both; 24 % and 16 % at 30.
+REXCVAR_DEFINE_BOOL(pgr4_character_accel_window, true, "PGR4",
+                    "Characters' ragdolls: the vehicle's acceleration over the console's 1/30 s and "
+                    "its smoothing by time, at any frame rate");
+REXCVAR_DEFINE_BOOL(pgr4_character_ragdoll_time, true, "PGR4",
+                    "Characters' ragdolls: each step the frame's real time instead of 1/30 s");
+namespace {
+struct VelocitySample {
+  double time;
+  float v[3], w[3];
+};
+struct VelocityHistory {
+  double clock = 0.0;
+  std::vector<VelocitySample> samples;  // oldest first, the last 0.2 s
+};
+std::unordered_map<uint32_t, VelocityHistory> g_character_velocities;  // by sub_8249C3E0's r3
+uint32_t BeU32At(const uint8_t* p) {
+  return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+}
+}  // namespace
+void Pgr4RagdollRateHook(PPCRegister& f0, PPCRegister& f1) {
+  if (!REXCVAR_GET(pgr4_character_ragdoll_time) || !(f1.f64 > 0.0)) return;
+  f0.f64 = 1.0 / std::clamp(f1.f64, 0.001, 1.0 / 30.0);
+}
+REX_EXTERN(__imp__sub_8249C3E0);
+REX_HOOK_RAW(sub_8249C3E0) {
+  const uint32_t state = ctx.r3.u32;
+  uint8_t* const st = base + state;
+  const uint8_t* const r = base + ctx.r4.u32;
+  const uint8_t* const body = base + BeU32At(r + 116);
+  const float dt = BeF(r + 132);
+  // The game's own reset (another vehicle, or its +292 set): no history to go by.
+  const bool same = BeU32At(st) == BeU32At(r + 140) && r[292] == 0;
+  if (!REXCVAR_GET(pgr4_character_accel_window) || !same || !(dt > 1e-5f) || dt > 0.25f) {
+    g_character_velocities.erase(state);
+  } else {
+    VelocityHistory& h = g_character_velocities[state];
+    h.clock += dt;
+    VelocitySample now{h.clock, {}, {}};
+    for (int k = 0; k < 3; ++k) {
+      now.v[k] = BeF(body + 112 + 4 * k);
+      now.w[k] = BeF(body + 124 + 4 * k);
+    }
+    h.samples.push_back(now);
+    while (h.samples.size() > 2 && h.samples[1].time < h.clock - 0.2) h.samples.erase(h.samples.begin());
+    // The velocities 1/30 s ago, between the two samples around then; the oldest while the
+    // history is shorter.
+    const double target = h.clock - 1.0 / 30.0;
+    float old_v[3], old_w[3];
+    double span = 0.0;
+    if (h.samples.front().time >= target) {
+      span = h.clock - h.samples.front().time;
+      std::copy(h.samples.front().v, h.samples.front().v + 3, old_v);
+      std::copy(h.samples.front().w, h.samples.front().w + 3, old_w);
+    } else {
+      span = 1.0 / 30.0;
+      size_t i = 1;
+      while (h.samples[i].time < target) ++i;
+      const VelocitySample& a = h.samples[i - 1];
+      const VelocitySample& b = h.samples[i];
+      const double f = b.time > a.time ? (target - a.time) / (b.time - a.time) : 1.0;
+      for (int k = 0; k < 3; ++k) {
+        old_v[k] = float(a.v[k] + (b.v[k] - a.v[k]) * f);
+        old_w[k] = float(a.w[k] + (b.w[k] - a.w[k]) * f);
+      }
+    }
+    if (span > 1e-4) {
+      // The last call's velocities such that (now - last) / dt is that acceleration.
+      for (int k = 0; k < 3; ++k) {
+        const double av = (now.v[k] - old_v[k]) / span, aw = (now.w[k] - old_w[k]) / span;
+        PutBeF(st + 48 + 4 * k, float(now.v[k] - av * dt));
+        PutBeF(st + 64 + 4 * k, float(now.w[k] - aw * dt));
+      }
+      const double s = ctx.f1.f64;
+      if (s > 0.0 && s < 1.0) ctx.f1.f64 = 1.0 - std::pow(1.0 - s, double(dt) * 30.0);
+    }
+  }
+  __imp__sub_8249C3E0(ctx, base);
 }
 
 // pgr4_net_start_probe: the network race start check (sub_8265C268, NetRaceCore.RaceStartSynchronized:
@@ -1179,20 +2137,30 @@ PGR4_XAUDIO_PROBE(829195F0, "voice 95F0")
 // (+0x14), loaded (+0x440) and the event's handle is not 0.
 REXCVAR_DEFINE_BOOL(pgr4_audio_ui_probe, false, "PGR4",
                     "Development: the UI sound events the game plays (kudos, countdown), in the log");
-// Local change (15/11/2026, Tazz): the kudos counter's tick (HUD_Kudos_Up, index 5) at the
-// console's 30 FPS pace. The HUD's counter steps once per so many game frames, and the game runs
-// at the real frame rate (up to the screen's: 165 Hz and more), so it asked for its tick
-// rate / 30 times too often. Each request adds 30 x the frame's duration; a tick plays when that
-// reaches 1: every request at 30 FPS, one in two at 60, about one in 5.5 at 165.
+// Local change (15/11/2026, Tazz; redone 17/11/2026, perf-cpu; on testing 18/11/2026): the kudos
+// counter's tick (HUD_Kudos_Up, index 5) at the console's pace, one per console frame at most. The
+// tick is asked for by sub_825815A0 at each kudos award (sub_82582FB8, from sub_82583AE0,
+// sub_82583958): the kudos shown, each floored, summed and compared with the sum at its last call
+// (+0xD8D8), the tick when they differ by 1 or more. A drift awards twice a frame: two requests in
+// the same frame (measured at a 30 FPS limit, 0 ms apart, every frame), which the console, at 30
+// FPS, played at the same moment, its frame's, heard as one. Here they were heard as two (Tazz,
+// 17/11/2026: too fast even at 30 FPS), and a higher frame rate awards in more frames. So, as on
+// the console, the tick is played on the console's frames (1/30 s of game time,
+// g_console_credit): one asked for during a console frame, however many times, plays once at the
+// start of the next (sub_824C6FD8), never between: the ticks 33, 67, 100 ms... apart, as on the
+// console, at the game frame nearest (at a frame rate that is not a multiple of 30, one game frame
+// off at most). Tried before: each request adding 30 x the frame's length, a tick when that
+// reached 1 (15/11/2026: in pairs, 17 then 50 ms apart, at 60 FPS); sub_825815A0 itself run once
+// per 1/30 s (17/11/2026: wrong, it runs per award); the first request of each console frame
+// played at once (17/11/2026: 6 to 21 ms gaps when the requests come unevenly above 60 FPS,
+// measured at 80 FPS and simulated).
 REXCVAR_DEFINE_BOOL(pgr4_kudos_tick_30fps_pace, true, "PGR4",
                     "The kudos counter's tick played at the console's 30 FPS pace at any frame rate");
 REX_EXTERN(__imp__sub_826A03A8);
 REX_HOOK_RAW(sub_826A03A8) {
-  if (ctx.r4.u32 == 5 && REXCVAR_GET(pgr4_kudos_tick_30fps_pace)) {
-    static double credit = 1.0;
-    credit = std::min(credit + std::clamp(double(Pgr4FrameSeconds()) * 30.0, 0.0, 1.0), 2.0);
-    if (credit < 1.0) return;
-    credit -= 1.0;
+  if (ctx.r4.u32 == 5 && REXCVAR_GET(pgr4_kudos_tick_30fps_pace) && !g_kudos_tick_playing) {
+    g_kudos_tick_object.store(ctx.r3.u32);  // played at the next console frame's start
+    return;
   }
   if (REXCVAR_GET(pgr4_audio_ui_probe)) {
     static const char* const kNames[] = {
@@ -1963,4 +2931,823 @@ REX_HOOK_RAW(sub_822FB680) {
   const int gear = int32_t(Be32(base, gearbox + 12));
   __imp__sub_822FB680(ctx, base);
   if (pressed) GearPressTaken(base, bike + 3230, "bike", gear, int32_t(Be32(base, gearbox + 12)));
+}
+
+// Development (18/11/2026, the frame-rate audit: work/audit_complet/cadence_fonctions.tsv): the
+// game's functions that read a 1/30, 1/60, 30 or 60 constant, outside the physics step, counted
+// per game frame and per physics step (pgr4_cadence_probe, off by default). Every 600 game frames
+// the log gives each one called: its calls per frame and per step. Generated; to be removed with
+// the audit.
+REXCVAR_DEFINE_BOOL(pgr4_cadence_probe, false, "PGR4",
+                    "Development: count the frame-rate audit's functions' calls per frame and step");
+namespace {
+constexpr uint32_t kCadenceFns[] = {
+    0x822C2CD8, 0x82405B98, 0x82406020, 0x822C2BB8, 0x822C2EB0, 0x822E1210,
+    0x822E63C0, 0x822F7538, 0x8246E8A8, 0x8248B780, 0x824B2BC0, 0x824B4938,
+    0x82632310, 0x8268BF40, 0x826E3C78, 0x82842AD0, 0x82844320, 0x82848720,
+    0x828B5CD8, 0x828B6038, 0x828B8510, 0x828BAFB8, 0x828C9068, 0x828C91A8,
+    0x822DD238, 0x822DE7F0, 0x822DED00, 0x822E0250, 0x822E0E68, 0x822E16F0,
+    0x822E1CB8, 0x822E45B0, 0x822E52C0, 0x822E57B0, 0x822E5850, 0x822E6A90,
+    0x822EDCC8, 0x822EDEA0, 0x822EEE30, 0x822EEF58, 0x822EF888, 0x822F79D8,
+    0x823014D0, 0x82301730, 0x82302B68, 0x823057D0, 0x82307140, 0x8230F5F0,
+    0x82311F38, 0x8233F090, 0x8233F4B8, 0x8233F5E0, 0x823404B8, 0x82341060,
+    0x82369300, 0x82373A48, 0x823CF0D0, 0x823D9730, 0x823DE570, 0x823DE828,
+    0x823DFA48, 0x823F3BF0, 0x823F6B08, 0x82406200, 0x82406860, 0x824069F8,
+    0x8240A7C8, 0x824376F0, 0x8243C1F8, 0x82448598, 0x8244CE60, 0x8244E2C8,
+    0x8245E7E0, 0x8246B610, 0x8246CB48, 0x8246FA48, 0x824841D0, 0x82485478,
+    0x8248E700, 0x824945B8, 0x824B6438, 0x824B86F8, 0x824DC5E8, 0x824FD038,
+    0x82538EC0, 0x82596278, 0x825BE5D0, 0x825D5220, 0x825DF530, 0x825EE9B8,
+    0x82600D68, 0x82613EA8, 0x8261BDA8, 0x826289D8, 0x82631308, 0x82639A28,
+    0x826442C0, 0x8267AB20, 0x8267B1D8, 0x8267BAF8, 0x8267BD78, 0x8267BFA8,
+    0x8267C728, 0x8267CD18, 0x8267CFE8, 0x8267D200, 0x8267D410, 0x8267D740,
+    0x8267DAA8, 0x8267DC90, 0x82699450, 0x827D2400, 0x827D2CD8, 0x827D5C80,
+    0x827DC090, 0x827DCBA0, 0x82841958, 0x82843608, 0x82843DA8, 0x82874AE0,
+    0x8289FDB8, 0x828B6320, 0x828B6470, 0x828B6FA8, 0x828BBD08, 0x828BBE28,
+    0x828BBF48, 0x828BC080, 0x828BCE30, 0x828CA280, 0x828CB0A0, 0x828CC340,
+    0x82915FF0, 0x82920180, 0x82920400, 0x829206D8, 0x82920A88, 0x82921110,
+    0x82921320, 0x82921560, 0x82921808, 0x82921B30, 0x82921E60, 0x82922260,
+    0x829227F8, 0x82922FA8, 0x82923240, 0x82923538, 0x82923900, 0x8293BA80,
+    0x82940490, 0x829428F8, 0x8294D698, 0x8295E4A8, 0x8295EAD0, 0x8297C4A8,
+    0x8297C5B0, 0x8297D640, 0x8297D748, 0x8297DF90, 0x8297ECF8, 0x8297EE00,
+    0x82980980, 0x82983318, 0x829840C8, 0x82988340, 0x82992CA8, 0x82994E80,
+    0x82995290, 0x82996358, 0x82996838, 0x82998098, 0x8299E1B0, 0x8299E2B8,
+    0x8299E3C0, 0x8299E4C8, 0x8299EEC0, 0x829A35D0, 0x829AF7B8, 0x829BFBD8,
+    0x829C00C0, 0x829D0B98, 0x829D30B8, 0x829E0E50, 0x829E56C0,
+};
+std::atomic<uint32_t> g_cadence_calls[std::size(kCadenceFns)];
+std::atomic<bool> g_cadence_on{false};
+}  // namespace
+// Called once per game frame (sub_824C6FD8's hook): the probe's switch, its sums and its log.
+void Pgr4CadenceFrame(const uint8_t* base) {
+  static uint32_t frames = 0, last_n = 0;
+  static uint64_t steps = 0;
+  static double clock_first = 0.0;
+  static uint32_t n_first = 0;
+  const bool on = REXCVAR_GET(pgr4_cadence_probe);
+  const uint8_t* np = base + 0x82A17644;
+  const uint32_t n = uint32_t(np[0]) << 24 | uint32_t(np[1]) << 16 | uint32_t(np[2]) << 8 | np[3];
+  if (!on) {
+    if (g_cadence_on.exchange(false))
+      for (auto& c : g_cadence_calls) c.store(0, std::memory_order_relaxed);
+    frames = 0;
+    steps = 0;
+    last_n = n;
+    return;
+  }
+  g_cadence_on.store(true, std::memory_order_relaxed);
+  // The game's clock (seconds, standing still in the pause), as a second count of the steps: its
+  // time over the step (0x82001170).
+  const float clock = BeF(base + 0x82A8131C + 24), h = BeF(base + 0x82001170);
+  if (!frames) {
+    clock_first = clock;
+    n_first = n;
+  }
+  if (frames) steps += uint32_t(n - last_n);
+  last_n = n;
+  if (++frames < 600) return;
+  REXLOG_INFO("PGR4 cadence: {} frames, {} physics steps ({:.2f} a frame); counter {} -> {}, game "
+              "clock {:.3f} -> {:.3f} s ({:.2f} steps a frame by the clock)",
+              frames - 1, steps, double(steps) / double(frames - 1), n_first, n, clock_first,
+              double(clock), h > 0 ? (double(clock) - clock_first) / h / double(frames - 1) : 0.0);
+  for (size_t i = 0; i < std::size(kCadenceFns); ++i) {
+    const uint32_t c = g_cadence_calls[i].exchange(0, std::memory_order_relaxed);
+    if (c)
+      REXLOG_INFO("PGR4 cadence: sub_{:08X} {} calls, {:.3f} a frame, {:.3f} a step",
+                  kCadenceFns[i], c, double(c) / double(frames - 1),
+                  steps ? double(c) / double(steps) : 0.0);
+  }
+  frames = 0;
+  steps = 0;
+}
+#define PGR4_CADENCE(i, name)                                                     REX_EXTERN(__imp__##name);                                                      REX_HOOK_RAW(name) {                                                              if (g_cadence_on.load(std::memory_order_relaxed))                                 g_cadence_calls[i].fetch_add(1, std::memory_order_relaxed);                   __imp__##name(ctx, base);                                                     }
+PGR4_CADENCE(0, sub_822C2CD8)
+PGR4_CADENCE(1, sub_82405B98)
+PGR4_CADENCE(2, sub_82406020)
+PGR4_CADENCE(3, sub_822C2BB8)
+PGR4_CADENCE(4, sub_822C2EB0)
+PGR4_CADENCE(5, sub_822E1210)
+PGR4_CADENCE(6, sub_822E63C0)
+PGR4_CADENCE(7, sub_822F7538)
+PGR4_CADENCE(8, sub_8246E8A8)
+PGR4_CADENCE(9, sub_8248B780)
+PGR4_CADENCE(10, sub_824B2BC0)
+PGR4_CADENCE(11, sub_824B4938)
+PGR4_CADENCE(12, sub_82632310)
+PGR4_CADENCE(13, sub_8268BF40)
+PGR4_CADENCE(14, sub_826E3C78)
+PGR4_CADENCE(15, sub_82842AD0)
+PGR4_CADENCE(16, sub_82844320)
+PGR4_CADENCE(17, sub_82848720)
+PGR4_CADENCE(18, sub_828B5CD8)
+PGR4_CADENCE(19, sub_828B6038)
+PGR4_CADENCE(20, sub_828B8510)
+PGR4_CADENCE(21, sub_828BAFB8)
+PGR4_CADENCE(22, sub_828C9068)
+PGR4_CADENCE(23, sub_828C91A8)
+PGR4_CADENCE(24, sub_822DD238)
+PGR4_CADENCE(25, sub_822DE7F0)
+PGR4_CADENCE(26, sub_822DED00)
+PGR4_CADENCE(27, sub_822E0250)
+PGR4_CADENCE(28, sub_822E0E68)
+PGR4_CADENCE(29, sub_822E16F0)
+PGR4_CADENCE(30, sub_822E1CB8)
+PGR4_CADENCE(31, sub_822E45B0)
+PGR4_CADENCE(32, sub_822E52C0)
+PGR4_CADENCE(33, sub_822E57B0)
+PGR4_CADENCE(34, sub_822E5850)
+PGR4_CADENCE(35, sub_822E6A90)
+PGR4_CADENCE(36, sub_822EDCC8)
+PGR4_CADENCE(37, sub_822EDEA0)
+PGR4_CADENCE(38, sub_822EEE30)
+PGR4_CADENCE(39, sub_822EEF58)
+PGR4_CADENCE(40, sub_822EF888)
+PGR4_CADENCE(41, sub_822F79D8)
+PGR4_CADENCE(42, sub_823014D0)
+PGR4_CADENCE(43, sub_82301730)
+PGR4_CADENCE(44, sub_82302B68)
+PGR4_CADENCE(45, sub_823057D0)
+PGR4_CADENCE(46, sub_82307140)
+PGR4_CADENCE(47, sub_8230F5F0)
+PGR4_CADENCE(48, sub_82311F38)
+PGR4_CADENCE(49, sub_8233F090)
+PGR4_CADENCE(50, sub_8233F4B8)
+PGR4_CADENCE(51, sub_8233F5E0)
+// 52, sub_823404B8: counted in its own hook (the exhaust flames' reflections, below).
+PGR4_CADENCE(53, sub_82341060)
+PGR4_CADENCE(54, sub_82369300)
+PGR4_CADENCE(55, sub_82373A48)
+// 56, sub_823CF0D0: counted in its own hook (the lightning, below).
+PGR4_CADENCE(57, sub_823D9730)
+PGR4_CADENCE(58, sub_823DE570)
+PGR4_CADENCE(59, sub_823DE828)
+PGR4_CADENCE(60, sub_823DFA48)
+PGR4_CADENCE(61, sub_823F3BF0)
+PGR4_CADENCE(62, sub_823F6B08)
+PGR4_CADENCE(63, sub_82406200)
+PGR4_CADENCE(64, sub_82406860)
+PGR4_CADENCE(65, sub_824069F8)
+PGR4_CADENCE(66, sub_8240A7C8)
+PGR4_CADENCE(67, sub_824376F0)
+// 68, sub_8243C1F8: counted in its own hook (the blurred wheels, below).
+PGR4_CADENCE(69, sub_82448598)
+PGR4_CADENCE(70, sub_8244CE60)
+PGR4_CADENCE(71, sub_8244E2C8)
+PGR4_CADENCE(72, sub_8245E7E0)
+PGR4_CADENCE(73, sub_8246B610)
+PGR4_CADENCE(74, sub_8246CB48)
+PGR4_CADENCE(75, sub_8246FA48)
+PGR4_CADENCE(76, sub_824841D0)
+PGR4_CADENCE(77, sub_82485478)
+PGR4_CADENCE(78, sub_8248E700)
+PGR4_CADENCE(79, sub_824945B8)
+PGR4_CADENCE(80, sub_824B6438)
+PGR4_CADENCE(81, sub_824B86F8)
+PGR4_CADENCE(82, sub_824DC5E8)
+PGR4_CADENCE(83, sub_824FD038)
+PGR4_CADENCE(84, sub_82538EC0)
+PGR4_CADENCE(85, sub_82596278)
+PGR4_CADENCE(86, sub_825BE5D0)
+PGR4_CADENCE(87, sub_825D5220)
+PGR4_CADENCE(88, sub_825DF530)
+PGR4_CADENCE(89, sub_825EE9B8)
+PGR4_CADENCE(90, sub_82600D68)
+PGR4_CADENCE(91, sub_82613EA8)
+PGR4_CADENCE(92, sub_8261BDA8)
+PGR4_CADENCE(93, sub_826289D8)
+PGR4_CADENCE(94, sub_82631308)
+PGR4_CADENCE(95, sub_82639A28)
+PGR4_CADENCE(96, sub_826442C0)
+PGR4_CADENCE(97, sub_8267AB20)
+PGR4_CADENCE(98, sub_8267B1D8)
+PGR4_CADENCE(99, sub_8267BAF8)
+PGR4_CADENCE(100, sub_8267BD78)
+PGR4_CADENCE(101, sub_8267BFA8)
+PGR4_CADENCE(102, sub_8267C728)
+PGR4_CADENCE(103, sub_8267CD18)
+PGR4_CADENCE(104, sub_8267CFE8)
+PGR4_CADENCE(105, sub_8267D200)
+PGR4_CADENCE(106, sub_8267D410)
+PGR4_CADENCE(107, sub_8267D740)
+PGR4_CADENCE(108, sub_8267DAA8)
+PGR4_CADENCE(109, sub_8267DC90)
+PGR4_CADENCE(110, sub_82699450)
+// 111, sub_827D2400: counted in its own hook (the photo mode's camera, below).
+PGR4_CADENCE(112, sub_827D2CD8)
+PGR4_CADENCE(113, sub_827D5C80)
+PGR4_CADENCE(114, sub_827DC090)
+PGR4_CADENCE(115, sub_827DCBA0)
+PGR4_CADENCE(116, sub_82841958)
+PGR4_CADENCE(117, sub_82843608)
+PGR4_CADENCE(118, sub_82843DA8)
+PGR4_CADENCE(119, sub_82874AE0)
+PGR4_CADENCE(120, sub_8289FDB8)
+PGR4_CADENCE(121, sub_828B6320)
+PGR4_CADENCE(122, sub_828B6470)
+PGR4_CADENCE(123, sub_828B6FA8)
+PGR4_CADENCE(124, sub_828BBD08)
+PGR4_CADENCE(125, sub_828BBE28)
+PGR4_CADENCE(126, sub_828BBF48)
+PGR4_CADENCE(127, sub_828BC080)
+PGR4_CADENCE(128, sub_828BCE30)
+PGR4_CADENCE(129, sub_828CA280)
+PGR4_CADENCE(130, sub_828CB0A0)
+PGR4_CADENCE(131, sub_828CC340)
+PGR4_CADENCE(132, sub_82915FF0)
+PGR4_CADENCE(133, sub_82920180)
+PGR4_CADENCE(134, sub_82920400)
+PGR4_CADENCE(135, sub_829206D8)
+PGR4_CADENCE(136, sub_82920A88)
+PGR4_CADENCE(137, sub_82921110)
+PGR4_CADENCE(138, sub_82921320)
+PGR4_CADENCE(139, sub_82921560)
+PGR4_CADENCE(140, sub_82921808)
+PGR4_CADENCE(141, sub_82921B30)
+PGR4_CADENCE(142, sub_82921E60)
+PGR4_CADENCE(143, sub_82922260)
+PGR4_CADENCE(144, sub_829227F8)
+PGR4_CADENCE(145, sub_82922FA8)
+PGR4_CADENCE(146, sub_82923240)
+PGR4_CADENCE(147, sub_82923538)
+PGR4_CADENCE(148, sub_82923900)
+PGR4_CADENCE(149, sub_8293BA80)
+PGR4_CADENCE(150, sub_82940490)
+PGR4_CADENCE(151, sub_829428F8)
+PGR4_CADENCE(152, sub_8294D698)
+PGR4_CADENCE(153, sub_8295E4A8)
+PGR4_CADENCE(154, sub_8295EAD0)
+PGR4_CADENCE(155, sub_8297C4A8)
+PGR4_CADENCE(156, sub_8297C5B0)
+PGR4_CADENCE(157, sub_8297D640)
+PGR4_CADENCE(158, sub_8297D748)
+PGR4_CADENCE(159, sub_8297DF90)
+PGR4_CADENCE(160, sub_8297ECF8)
+PGR4_CADENCE(161, sub_8297EE00)
+PGR4_CADENCE(162, sub_82980980)
+PGR4_CADENCE(163, sub_82983318)
+PGR4_CADENCE(164, sub_829840C8)
+PGR4_CADENCE(165, sub_82988340)
+PGR4_CADENCE(166, sub_82992CA8)
+PGR4_CADENCE(167, sub_82994E80)
+PGR4_CADENCE(168, sub_82995290)
+PGR4_CADENCE(169, sub_82996358)
+PGR4_CADENCE(170, sub_82996838)
+PGR4_CADENCE(171, sub_82998098)
+PGR4_CADENCE(172, sub_8299E1B0)
+PGR4_CADENCE(173, sub_8299E2B8)
+PGR4_CADENCE(174, sub_8299E3C0)
+PGR4_CADENCE(175, sub_8299E4C8)
+PGR4_CADENCE(176, sub_8299EEC0)
+PGR4_CADENCE(177, sub_829A35D0)
+PGR4_CADENCE(178, sub_829AF7B8)
+PGR4_CADENCE(179, sub_829BFBD8)
+PGR4_CADENCE(180, sub_829C00C0)
+PGR4_CADENCE(181, sub_829D0B98)
+PGR4_CADENCE(182, sub_829D30B8)
+PGR4_CADENCE(183, sub_829E0E50)
+PGR4_CADENCE(184, sub_829E56C0)
+#undef PGR4_CADENCE
+
+// --- Blurred wheels (local change, 19/11/2026). A fast wheel is drawn as slices (sub_8243C1F8, r3
+// the wheel's blur: slice count +4, base angle +20, slices from +92, 80 bytes each; f2 the wheel's
+// spin). Vehicle.Render.Wheels.BlurMethod (0x82AAC3F8, 0 by default) 0: the base angle turns by
+// sign(spin) x WheelAngularSpeed (0x82AAC328, 1 rad) x f1 at each call, then each slice is set from
+// it by an offset also times f1 (the blur's width). Method 1: each slice turns by its own rate
+// (+100) x f1. The caller (sub_82441040, 0x82441620-0x82441654) passes f1 = 1.0, 0 in a pause
+// (pause byte x the frame's time 0x82A81330 not 0): one turn a frame, 30 rad/s at the console's 30
+// FPS but 120 at 120 FPS. pgr4_wheel_blur_by_time turns them by f1 x 30 x the frame's time
+// instead: method 0 puts the base angle where the game's own turn of f1 then lands it on the turn
+// of 30 x dt, and the offsets keep the game's f1 (the blur's width, not a rate); method 1 is given
+// f1 x 30 x dt. Read at each call; false: the game's turn per frame, for comparison.
+REXCVAR_DEFINE_BOOL(pgr4_wheel_blur_by_time, true, "PGR4",
+                    "Blurred wheels: the slices turn by the frame's time (as at the console's 30 "
+                    "FPS) instead of a fixed turn each frame");
+REXCVAR_DEFINE_BOOL(pgr4_wheel_blur_probe, false, "PGR4",
+                    "Development: the blurred wheels' base angle, its turn per second of real time, "
+                    "once a second");
+namespace {
+struct WheelBlurProbe {
+  double turned = 0.0;  // radians, unwrapped, since the last line
+  uint32_t calls = 0;
+};
+std::unordered_map<uint32_t, WheelBlurProbe> g_wheel_blur_probe;
+std::chrono::steady_clock::time_point g_wheel_blur_probe_since{};
+}  // namespace
+REX_EXTERN(__imp__sub_8243C1F8);
+REX_HOOK_RAW(sub_8243C1F8) {
+  if (g_cadence_on.load(std::memory_order_relaxed))
+    g_cadence_calls[68].fetch_add(1, std::memory_order_relaxed);
+  const uint32_t blur = ctx.r3.u32;
+  const uint32_t method = Be32(base, 0x82AAC3F8);
+  const float f1 = float(ctx.f1.f64);
+  const float dt = BeF(base + 0x82A81330);
+  const float turn = BeF(base + 0x82002B2C);  // the game's wrap of the angles (2 pi)
+  const bool by_time = REXCVAR_GET(pgr4_wheel_blur_by_time) && f1 != 0.0f && turn > 0.0f;
+  const float scale = float(30.0 * double(dt));
+  const float before = BeF(base + blur + 20);
+  if (by_time && method == 0) {
+    // The game's step, as it computes it (0x8243C240-0x8243C254): its 1.0 or -1.0 by the spin's
+    // sign, times WheelAngularSpeed.
+    const float sign = ctx.f2.f64 >= 0.0 ? BeF(base + 0x82258A24) : BeF(base + 0x82000CB0);
+    const float step = float(double(sign) * double(BeF(base + 0x82AAC328)));
+    float target = std::fmod(float(double(before) + double(step) * f1 * scale), turn);
+    if (target < 0.0f) target += turn;
+    PutBeF(base + blur + 20, float(double(target) - double(step) * f1));
+  } else if (by_time && method == 1) {
+    ctx.f1.f64 = double(float(f1 * scale));
+  }
+  __imp__sub_8243C1F8(ctx, base);
+  if (by_time && method == 1) {
+    // Below 30 FPS a slice can turn by more than the game's single wrap takes back.
+    const float count = BeF(base + blur + 4);
+    for (uint32_t i = 0; i < 64 && float(i) < count; ++i) {
+      uint8_t* a = base + blur + 92 + 80 * i;
+      const float v = BeF(a);
+      if (v > turn || v < 0.0f) {
+        const float w = std::fmod(v, turn);
+        PutBeF(a, w < 0.0f ? w + turn : w);
+      }
+    }
+  }
+  if (REXCVAR_GET(pgr4_wheel_blur_probe)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (g_wheel_blur_probe_since == std::chrono::steady_clock::time_point{})
+      g_wheel_blur_probe_since = now;
+    float d = BeF(base + blur + 20) - before;
+    if (turn > 0.0f) {
+      if (d > 0.5f * turn) d -= turn;
+      if (d < -0.5f * turn) d += turn;
+    }
+    auto& p = g_wheel_blur_probe[blur];
+    p.turned += d;
+    ++p.calls;
+    const double secs = std::chrono::duration<double>(now - g_wheel_blur_probe_since).count();
+    if (secs >= 1.0) {
+      REXLOG_INFO("PGR4 wheel blur probe: {:.3f} s, method {}, by time {}, f1 {:.3f}, dt {:.5f}, "
+                  "WheelAngularSpeed {:.3f}, signs {:.1f} {:.1f}, wrap {:.5f}, {} wheels",
+                  secs, method, REXCVAR_GET(pgr4_wheel_blur_by_time), f1, dt,
+                  BeF(base + 0x82AAC328), BeF(base + 0x82258A24), BeF(base + 0x82000CB0), turn,
+                  g_wheel_blur_probe.size());
+      uint32_t shown = 0;
+      for (const auto& [w, q] : g_wheel_blur_probe)
+        if (shown++ < 4)
+          REXLOG_INFO("PGR4 wheel blur probe: {:08X} {} calls ({:.1f} a second), base angle "
+                      "turned {:.2f} rad/s, slices {:.0f}",
+                      w, q.calls, q.calls / secs, q.turned / secs, BeF(base + w + 4));
+      g_wheel_blur_probe.clear();
+      g_wheel_blur_probe_since = now;
+    }
+  } else if (!g_wheel_blur_probe.empty()) {
+    g_wheel_blur_probe.clear();
+    g_wheel_blur_probe_since = {};
+  }
+}
+
+// --- Lightning (local change, 19/11/2026). sub_823CF0D0 (r3 the weather's lightning, once a frame):
+// a flash (+284 set) picks a record and its length in frames, +280 = int(the record's +12 x 30, at
+// 0x8218BCC8); its timer +288 is set to 0, then grows by the frame's time (0x82A81330) at each call.
+// Each call of a flash (while +288 is below the wait +292, out of the pause) reads the light curve at
+// step +296 / +280, lights the sky and the scene by it, sets LightningIntensity and triggers
+// LightningActionIn (sub_826A1BE0, called from 0x823CF294), then +296 += 1; the flash ends after +280
+// steps. So a flash lasted +280 frames: its length at 30 FPS, a quarter of it at 120.
+// pgr4_lightning_by_time gives each call the step of the flash's own time, int(+288 x 30), at most
+// +280 - 1: one step a frame at 30 FPS as at the console, the same step for 4 frames at 120 (the
+// flicker keeps its 30 Hz), and the sound's call only when the step is a new one (one a 1/30 s, as at
+// the console). When the game does not play the flash in the call (pause, the wait over), the step is
+// put back. Read at each call; false: the game's step a frame, for comparison.
+REXCVAR_DEFINE_BOOL(pgr4_lightning_by_time, true, "PGR4",
+                    "Lightning: each flash lasts its time (its steps at 30 a second, as at the "
+                    "console's 30 FPS) instead of one step a frame");
+REXCVAR_DEFINE_BOOL(pgr4_lightning_probe, false, "PGR4",
+                    "Development: a line per lightning flash (its steps, real length, calls, sound "
+                    "triggers)");
+namespace {
+bool g_lightning_hold_sound = false;  // sub_823CF0D0's call of sub_826A1BE0 skipped (same step)
+uint32_t g_lightning_sounds = 0;      // sub_823CF0D0's calls of sub_826A1BE0 passed on
+struct LightningProbe {
+  bool on = false;
+  std::chrono::steady_clock::time_point start{};
+  uint32_t calls = 0, sounds_at_start = 0;
+  int32_t steps = 0;
+};
+LightningProbe g_lightning_probe;
+void PutBe32(uint8_t* p, uint32_t v) {
+  p[0] = uint8_t(v >> 24);
+  p[1] = uint8_t(v >> 16);
+  p[2] = uint8_t(v >> 8);
+  p[3] = uint8_t(v);
+}
+}  // namespace
+REX_EXTERN(__imp__sub_826A1BE0);
+REX_HOOK_RAW(sub_826A1BE0) {
+  if (uint32_t(ctx.lr) == 0x823CF294) {
+    if (g_lightning_hold_sound) return;
+    ++g_lightning_sounds;
+  }
+  __imp__sub_826A1BE0(ctx, base);
+}
+REX_EXTERN(__imp__sub_823CF0D0);
+REX_HOOK_RAW(sub_823CF0D0) {
+  if (g_cadence_on.load(std::memory_order_relaxed))
+    g_cadence_calls[56].fetch_add(1, std::memory_order_relaxed);
+  const uint32_t w = ctx.r3.u32;
+  const bool was_on = base[w + 284] != 0;
+  const int32_t step_before = int32_t(Be32(base, w + 296));
+  int32_t step = step_before;
+  const uint32_t sounds0 = g_lightning_sounds;
+  g_lightning_hold_sound = false;
+  if (was_on && REXCVAR_GET(pgr4_lightning_by_time)) {
+    const int32_t count = int32_t(Be32(base, w + 280));
+    const double t = double(BeF(base + w + 288)) * double(BeF(base + 0x8218BCC8));
+    // Never back before the step last drawn (step_before - 1): the switch turned on mid-flash.
+    step = std::max(int32_t(std::floor(t + 1e-3)), step_before - 1);
+    step = std::clamp(step, 0, std::max(count - 1, 0));
+    g_lightning_hold_sound = step < step_before;
+    PutBe32(base + w + 296, uint32_t(step));
+  }
+  __imp__sub_823CF0D0(ctx, base);
+  g_lightning_hold_sound = false;
+  const bool is_on = base[w + 284] != 0;
+  // Not played in this call (the pause, the wait over): the game's step back.
+  if (was_on && is_on && step != step_before && int32_t(Be32(base, w + 296)) == step)
+    PutBe32(base + w + 296, uint32_t(step_before));
+  if (!REXCVAR_GET(pgr4_lightning_probe)) {
+    g_lightning_probe.on = false;
+    return;
+  }
+  auto& p = g_lightning_probe;
+  if (!was_on && is_on) {
+    p.on = true;
+    p.start = std::chrono::steady_clock::now();
+    p.calls = 0;
+    p.sounds_at_start = sounds0;
+    p.steps = int32_t(Be32(base, w + 280));
+  }
+  if (p.on) ++p.calls;
+  if (p.on && was_on && !is_on) {
+    p.on = false;
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - p.start).count();
+    REXLOG_INFO("PGR4 lightning probe: by time {}, {} steps, {:.3f} s from the first to the last "
+                "step (console {:.3f} s), {} calls, {} sound triggers, timer {:.3f}, dt {:.5f}",
+                REXCVAR_GET(pgr4_lightning_by_time), p.steps, secs, (p.steps - 1) / 30.0, p.calls,
+                g_lightning_sounds - p.sounds_at_start, BeF(base + w + 288),
+                BeF(base + 0x82A81330));
+  }
+}
+
+// --- Exhaust flames' reflections on the ground (local change, 19/11/2026). sub_823404B8 draws them:
+// for each car (sub_82434BA0: the list at 0x82AAAFE0, its count at 0x82AAB008) and its 4 flames
+// (intensity at car +10868, then every 32 bytes), a reflection at the intensity when it is above 0,
+// then, out of the pause (0x82A135D8 +56 / +61), the intensity -= GfxEffects.ExhaustFlame.Reflections.
+// FadeSpeed (0x82A9707C, 0.2) each frame; at 0 or below it is set to 0. A reflection from 1 faded in 5
+// frames: 0.17 s at 30 FPS, 0.04 s at 120. pgr4_exhaust_reflection_fade_by_time: after the call, a
+// flame the game has just lowered (its intensity now exactly the one before less FadeSpeed) is set to
+// the one before less FadeSpeed x 30 x the frame's time (0x82A81330). The frame's drawing, the clamp
+// at 0 and the pause are the game's. Read at each call; false: the game's fade a frame, for comparison.
+REXCVAR_DEFINE_BOOL(pgr4_exhaust_reflection_fade_by_time, true, "PGR4",
+                    "Exhaust flames' reflections fade by the frame's time (as at the console's 30 "
+                    "FPS) instead of a fixed step each frame");
+REXCVAR_DEFINE_BOOL(pgr4_exhaust_reflection_probe, false, "PGR4",
+                    "Development: a line per exhaust flame reflection faded out (start, real time, "
+                    "frames, the console's time)");
+namespace {
+constexpr uint32_t kExhaustCars = 10;  // the list's room: 0x82AAAFE0 to its count at +40
+struct ExhaustFade {
+  std::chrono::steady_clock::time_point start{};
+  float from = 0.0f, last = 0.0f;
+  uint32_t frames = 0;
+};
+std::unordered_map<uint64_t, ExhaustFade> g_exhaust_fade;  // by car << 2 | flame
+}  // namespace
+REX_EXTERN(__imp__sub_823404B8);
+REX_HOOK_RAW(sub_823404B8) {
+  if (g_cadence_on.load(std::memory_order_relaxed))
+    g_cadence_calls[52].fetch_add(1, std::memory_order_relaxed);
+  const bool by_time = REXCVAR_GET(pgr4_exhaust_reflection_fade_by_time);
+  const bool probe = REXCVAR_GET(pgr4_exhaust_reflection_probe);
+  if (!by_time && !probe) {
+    g_exhaust_fade.clear();
+    __imp__sub_823404B8(ctx, base);
+    return;
+  }
+  const uint32_t count = std::min(Be32(base, 0x82AAB008), kExhaustCars);
+  uint32_t cars[kExhaustCars] = {};
+  float before[kExhaustCars][4] = {};
+  for (uint32_t i = 0; i < count; ++i) {
+    cars[i] = Be32(base, 0x82AAAFE0 + 4 * i);
+    if (cars[i])
+      for (uint32_t k = 0; k < 4; ++k) before[i][k] = BeF(base + cars[i] + 10868 + 32 * k);
+  }
+  __imp__sub_823404B8(ctx, base);
+  const float fade = BeF(base + 0x82A9707C);
+  const float dt = BeF(base + 0x82A81330);
+  const auto now = std::chrono::steady_clock::now();
+  for (uint32_t i = 0; i < count; ++i) {
+    if (!cars[i]) continue;
+    for (uint32_t k = 0; k < 4; ++k) {
+      uint8_t* p = base + cars[i] + 10868 + 32 * k;
+      const float b = before[i][k];
+      float a = BeF(p);
+      if (!(b > 0.0f) || a != float(double(b) - double(fade))) continue;  // not lowered by the game
+      if (by_time) {
+        a = float(double(b) - double(fade) * 30.0 * double(dt));
+        PutBeF(p, a);
+      }
+      if (!probe) continue;
+      const uint64_t key = uint64_t(cars[i]) << 2 | k;
+      auto it = g_exhaust_fade.find(key);
+      if (it == g_exhaust_fade.end() || b > it->second.last + 1e-6f)  // a new flame lit it again
+        it = g_exhaust_fade.insert_or_assign(key, ExhaustFade{now, b, b, 0}).first;
+      ExhaustFade& f = it->second;
+      ++f.frames;
+      f.last = a;
+      if (a <= 0.0f) {
+        REXLOG_INFO("PGR4 exhaust reflection probe: by time {}, car {} flame {}: from {:.3f}, out in "
+                    "{} frames, {:.3f} s from the first to the last fade (console {} frames, {:.3f} "
+                    "s), dt {:.5f}",
+                    by_time, i, k, f.from, f.frames,
+                    std::chrono::duration<double>(now - f.start).count(),
+                    int(std::ceil(f.from / std::max(fade, 1e-3f) - 1e-4f)),
+                    (std::ceil(f.from / std::max(fade, 1e-3f) - 1e-4f) - 1.0) / 30.0, dt);
+        g_exhaust_fade.erase(it);
+      }
+    }
+  }
+  if (!probe) g_exhaust_fade.clear();
+}
+
+// --- Audio at the console's rate (local changes, 19/11/2026; work/audit_audio/code/
+// cadence_audio_jeu.md items 1, 2 and 4).
+// The music's fades (sub_8269D850, r3 the music, every frame): out (state +2152 = 2), the volume
+// +2156 -= 0.06 (0x82A6397C) a call, sent to the music (SoundSystem +156), to 0 (state 1); in (state
+// 3), += 0.06 a call up to the target +2100 (0.6 x (the profile's volume / 10)^2), the track started
+// on the first step from 0 (sub_8269D498). The delayed stop (sub_8269D050, every frame): while
+// +18487, +18488 -= 0.1 (0x82A63978) a call, at 0 the track stops (sub_8269CFE0). Both steps are
+// read only there. 10 calls each: 0.33 s at 30 FPS, 0.08 s at 120. pgr4_music_fade_by_time: during
+// the call, the step is its value x 30 x the frame's time (0x82A81330), then put back; the game's
+// step when the frame's time is 0 (the fade in would start the track again at each call). Read at
+// each call.
+REXCVAR_DEFINE_BOOL(pgr4_music_fade_by_time, true, "PGR4",
+                    "Music: the fades in and out and the delayed stop last their time (as at the "
+                    "console's 30 FPS) instead of a fixed step each frame");
+// The crowd after a rider's fall (sub_82697B30): it reacts only when the collisions' counter +1312
+// is at 320, then sets it to 0; the counter is +1 a call of sub_82698628 (every frame) up to 320:
+// 10.7 s at 30 FPS, 2.7 s at 120. pgr4_audio_crowd_delay_by_time: the counter moves on console
+// frames only (g_console_frame_start), the call's +1 taken back on the others. Read at each call.
+REXCVAR_DEFINE_BOOL(pgr4_audio_crowd_delay_by_time, true, "PGR4",
+                    "Crowd: the delay between two reactions to a rider's fall counted in console "
+                    "frames (10.7 s) instead of game frames");
+// The collisions: each physics step's impact keeps the strongest since the last sending: the
+// scenery's (sub_82697550: the collisions +1248..+1295, pending +1296), each car's (sub_82694278:
+// the car's sound +2208 + 48 i, pending at +44) and bike's (sub_8268DCE8: +2144 + 48 i); each frame
+// sends what is pending and clears it (sub_82698628; sub_82696278 -> sub_82695700 from 0x82697268;
+// sub_8268FCD0 -> sub_8268F3A0 from 0x82690BAC). At 30 FPS a frame's two steps merged; above 60,
+// one event a step, weaker. pgr4_audio_collisions_by_console_frame: on frames that start no
+// console frame, nothing is sent and the kept impact (and its pending flag) is put back after the
+// call; the strongest of the console frame goes on the next. Read at each call.
+REXCVAR_DEFINE_BOOL(pgr4_audio_collisions_by_console_frame, true, "PGR4",
+                    "Collision sounds: the strongest impact of each console frame (1/30 s) sent, "
+                    "as at 30 FPS, instead of one event a game frame");
+REXCVAR_DEFINE_BOOL(pgr4_audio_rate_probe, false, "PGR4",
+                    "Development: the music's fades, the crowd's delay and the collision events "
+                    "per second, in the log");
+namespace {
+struct AudioFadeRun {
+  bool on = false;
+  uint32_t state = 0, calls = 0;
+  float from = 0.0f;
+  std::chrono::steady_clock::time_point start{};
+};
+AudioFadeRun g_music_fade, g_music_stop;
+struct HeldSlot {
+  uint32_t address;
+  uint8_t bytes[48];
+};
+std::vector<HeldSlot> g_held_collisions;  // the cars' and bikes' kept impacts, put back after
+struct AudioRateCounts {
+  uint32_t car = 0, bike = 0, world = 0, held = 0;
+  float strongest = 0.0f;
+  std::chrono::steady_clock::time_point since{};
+};
+AudioRateCounts g_audio_rate;
+std::chrono::steady_clock::time_point g_crowd_counter_zero{};
+double SecondsSince(std::chrono::steady_clock::time_point t) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+}
+void AudioRateLog(const uint8_t* base) {
+  auto& r = g_audio_rate;
+  const auto now = std::chrono::steady_clock::now();
+  if (r.since == std::chrono::steady_clock::time_point{}) r.since = now;
+  const double secs = std::chrono::duration<double>(now - r.since).count();
+  if (secs < 1.0) return;
+  if (r.car || r.bike || r.world || r.held)
+    REXLOG_INFO("PGR4 audio rate probe: {:.2f} s, collision events: cars {}, bikes {}, scenery {} "
+                "({:.1f} a second), held {}, strongest {:.3f}; by console frame {}, dt {:.5f}",
+                secs, r.car, r.bike, r.world, (r.car + r.bike + r.world) / secs, r.held,
+                r.strongest, REXCVAR_GET(pgr4_audio_collisions_by_console_frame),
+                BeF(base + 0x82A81330));
+  r = AudioRateCounts{};
+  r.since = now;
+}
+// A music fade step (at `at`) scaled for the call; `kept` is the game's, put back after.
+void MusicStep(uint8_t* base, uint32_t at, bool active, float& kept, bool& scaled) {
+  const float dt = BeF(base + 0x82A81330);
+  kept = BeF(base + at);
+  scaled = active && REXCVAR_GET(pgr4_music_fade_by_time) && dt > 0.0f;
+  if (scaled) PutBeF(base + at, float(double(kept) * 30.0 * double(dt)));
+}
+void MusicRun(AudioFadeRun& run, bool active_before, bool active_after, uint32_t state,
+              float from, float to, const char* what) {
+  if (!REXCVAR_GET(pgr4_audio_rate_probe)) {
+    run.on = false;
+    return;
+  }
+  if (active_before && (!run.on || run.state != state)) {
+    run.on = true;
+    run.state = state;
+    run.calls = 0;
+    run.from = from;
+    run.start = std::chrono::steady_clock::now();
+  }
+  if (run.on) ++run.calls;
+  if (run.on && !active_after) {
+    run.on = false;
+    REXLOG_INFO("PGR4 audio rate probe: {} (state {}) from {:.3f} to {:.3f}: {} calls, {:.3f} s "
+                "(console {:.3f} s), by time {}",
+                what, state, run.from, to, run.calls, SecondsSince(run.start), run.calls / 30.0,
+                REXCVAR_GET(pgr4_music_fade_by_time));
+  }
+}
+// The cars' (0x82697268) and bikes' (0x82690BAC) sending of a kept impact: on a frame that starts
+// no console frame, the slot (in the sound `obj`, the 48 bytes of key `key` from `first`) is kept
+// to be put back after the update, and nothing is sent.
+bool HoldCollision(uint8_t* base, uint32_t obj, uint32_t key, uint32_t first) {
+  if (!REXCVAR_GET(pgr4_audio_collisions_by_console_frame) ||
+      g_console_frame_start.load(std::memory_order_relaxed))
+    return false;
+  const uint32_t count = std::min(Be32(base, 0x82A84480), 64u);
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t s = obj + first + 48 * i;
+    if (Be32(base, s) != key || !base[s + 44]) continue;
+    HeldSlot h{s, {}};
+    std::memcpy(h.bytes, base + s, 48);
+    g_held_collisions.push_back(h);
+    ++g_audio_rate.held;
+    return true;
+  }
+  return false;
+}
+void PutBackCollisions(uint8_t* base) {
+  for (const HeldSlot& h : g_held_collisions) std::memcpy(base + h.address, h.bytes, 48);
+  g_held_collisions.clear();
+}
+}  // namespace
+REX_EXTERN(__imp__sub_8269D850);
+REX_HOOK_RAW(sub_8269D850) {
+  const uint32_t m = ctx.r3.u32;
+  const uint32_t state = Be32(base, m + 2152);
+  const float from = BeF(base + m + 2156);
+  const bool fading = state == 2 || state == 3;
+  float kept = 0.0f;
+  bool scaled = false;
+  MusicStep(base, 0x82A6397C, fading, kept, scaled);
+  __imp__sub_8269D850(ctx, base);
+  if (scaled) PutBeF(base + 0x82A6397C, kept);
+  MusicRun(g_music_fade, fading, Be32(base, m + 2152) == state, state, from,
+           BeF(base + m + 2156), "music fade");
+}
+REX_EXTERN(__imp__sub_8269D050);
+REX_HOOK_RAW(sub_8269D050) {
+  const uint32_t m = ctx.r3.u32;
+  const bool stopping = base[m + 18487] != 0;
+  const float from = BeF(base + m + 18488);
+  float kept = 0.0f;
+  bool scaled = false;
+  MusicStep(base, 0x82A63978, stopping, kept, scaled);
+  __imp__sub_8269D050(ctx, base);
+  if (scaled) PutBeF(base + 0x82A63978, kept);
+  MusicRun(g_music_stop, stopping, base[m + 18487] != 0, 1, from, BeF(base + m + 18488),
+           "music delayed stop");
+}
+REX_EXTERN(__imp__sub_82698628);
+REX_HOOK_RAW(sub_82698628) {
+  const uint32_t c = ctx.r3.u32;
+  const bool console_frame = g_console_frame_start.load(std::memory_order_relaxed);
+  const bool hold_world = REXCVAR_GET(pgr4_audio_collisions_by_console_frame) && !console_frame;
+  const bool hold_crowd = REXCVAR_GET(pgr4_audio_crowd_delay_by_time) && !console_frame;
+  const bool active = base[c + 1236] != 0;
+  const bool pending = base[c + 1296] != 0;
+  const uint32_t counter = Be32(base, c + 1312);
+  uint8_t kept[49];
+  const bool held = hold_world && pending;
+  if (held) {
+    std::memcpy(kept, base + c + 1248, 49);  // +1248..+1295 and the pending flag +1296
+    base[c + 1296] = 0;
+    ++g_audio_rate.held;
+  } else if (active && pending) {
+    ++g_audio_rate.world;
+    g_audio_rate.strongest = std::max(g_audio_rate.strongest, BeF(base + c + 1280));
+  }
+  __imp__sub_82698628(ctx, base);
+  if (held) std::memcpy(base + c + 1248, kept, 49);
+  if (hold_crowd && Be32(base, c + 1312) == counter + 1) PutBe32(base + c + 1312, counter);
+  if (!REXCVAR_GET(pgr4_audio_rate_probe)) {
+    g_crowd_counter_zero = {};
+    return;
+  }
+  const uint32_t now_counter = Be32(base, c + 1312);
+  if (now_counter <= 1 && counter != now_counter)
+    g_crowd_counter_zero = std::chrono::steady_clock::now();
+  else if (counter < 320 && now_counter == 320 &&
+           g_crowd_counter_zero != std::chrono::steady_clock::time_point{})
+    REXLOG_INFO("PGR4 audio rate probe: crowd fall delay at 320 after {:.2f} s (console 10.67 "
+                "s), by time {}",
+                SecondsSince(g_crowd_counter_zero), REXCVAR_GET(pgr4_audio_crowd_delay_by_time));
+  AudioRateLog(base);
+}
+REX_EXTERN(__imp__sub_82695700);
+REX_HOOK_RAW(sub_82695700) {
+  if (uint32_t(ctx.lr) == 0x82697268) {
+    if (HoldCollision(base, ctx.r3.u32, ctx.r4.u32, 2208)) return;
+    ++g_audio_rate.car;
+    g_audio_rate.strongest = std::max(g_audio_rate.strongest, float(ctx.f1.f64));
+  }
+  __imp__sub_82695700(ctx, base);
+}
+REX_EXTERN(__imp__sub_82696278);
+REX_HOOK_RAW(sub_82696278) {
+  g_held_collisions.clear();
+  __imp__sub_82696278(ctx, base);
+  PutBackCollisions(base);
+}
+REX_EXTERN(__imp__sub_8268F3A0);
+REX_HOOK_RAW(sub_8268F3A0) {
+  if (uint32_t(ctx.lr) == 0x82690BAC) {
+    if (HoldCollision(base, ctx.r3.u32, ctx.r4.u32, 2144)) return;
+    ++g_audio_rate.bike;
+    g_audio_rate.strongest = std::max(g_audio_rate.strongest, float(ctx.f1.f64));
+  }
+  __imp__sub_8268F3A0(ctx, base);
+}
+REX_EXTERN(__imp__sub_8268FCD0);
+REX_HOOK_RAW(sub_8268FCD0) {
+  g_held_collisions.clear();
+  __imp__sub_8268FCD0(ctx, base);
+  PutBackCollisions(base);
+}
+
+// --- The photo mode's camera (mode 513, sub_827D2400), updated at each frame of the photo mode
+// only: the game frame it last ran in, for pgr4-native's motion blur rule (renderer.cpp
+// ApplyMotionBlurRule), which leaves the photo mode its motion blur under DLSS (19/11/2026, Tazz:
+// « le flou qui doit se désactiver c'est celui dans les options seulement »).
+namespace {
+std::atomic<uint64_t> g_photo_camera_frame{0};
+}  // namespace
+bool Pgr4PhotoModeActive() {
+  const uint64_t f = g_photo_camera_frame.load(std::memory_order_relaxed);
+  return f != 0 && g_frame_no - f <= 2;
+}
+REX_EXTERN(__imp__sub_827D2400);
+REX_HOOK_RAW(sub_827D2400) {
+  if (g_cadence_on.load(std::memory_order_relaxed))
+    g_cadence_calls[111].fetch_add(1, std::memory_order_relaxed);
+  g_photo_camera_frame.store(std::max<uint64_t>(g_frame_no, 1), std::memory_order_relaxed);
+  __imp__sub_827D2400(ctx, base);
+}
+
+// --- The photo mode's focus (local change, 19/11/2026, Tazz: « le mode focus du mode photo est
+// inversé », « le focus ne marche qu'une fois après il fait plus rien »). sub_824B8CE0 (called by
+// the focus, sub_825E0108: InvDepth = 1 / its distance) locks a depth resolve (0x82A946A0), reads
+// its centre texel (width / 2, height / 2) as the console's D24FS8 (the 20e4 float in the top 24
+// bits, 1 the nearest), and turns it into a distance: v = (far - near) x (depth - 1) + far, the
+// distance far x near / v (far when v is at most 0x82002C28), near and far the camera's
+// (*(*0x82C98E48 + 0xC0) + 0x30C, + 0x310); 0 when the lock fails. pgr4-native never reads depth
+// resolves back to guest memory: the texel kept an old value, the focus stayed where it first went.
+// After the call, its result is computed the same way from the scene's depth at the centre read
+// back from the GPU (Pgr4PhotoFocusDepth, pgr4-native draw.cpp: a few frames old at most, the photo
+// mode's view still). pgr4_native_photo_focus_depth false: the game's result.
+bool Pgr4PhotoFocusDepth(float* depth);  // pgr4-native draw.cpp
+REXCVAR_DECLARE(bool, pgr4_native_photo_focus_depth);
+REX_EXTERN(__imp__sub_824B8CE0);
+REX_HOOK_RAW(sub_824B8CE0) {
+  __imp__sub_824B8CE0(ctx, base);
+  float depth = 0.0f;
+  if (!REXCVAR_GET(pgr4_native_photo_focus_depth) || !Pgr4PhotoFocusDepth(&depth)) return;
+  const uint32_t holder = Be32(base, 0x82C98E48);
+  const uint32_t camera = holder ? Be32(base, holder + 0xC0) : 0;
+  if (!camera) return;
+  const float near_plane = BeF(base + camera + 0x30C), far_plane = BeF(base + camera + 0x310);
+  const float one = BeF(base + 0x82258A24), least = BeF(base + 0x82002C28);
+  const float v = float(double(float(double(far_plane) - double(near_plane))) *
+                            double(float(double(depth) - double(one))) +
+                        double(far_plane));
+  const double before = ctx.f1.f64;
+  ctx.f1.f64 = least < v ? double(float(float(double(far_plane) * double(near_plane)) / v))
+                         : double(far_plane);
+  static auto last_log = std::chrono::steady_clock::now();
+  if (std::chrono::steady_clock::now() - last_log > std::chrono::seconds(1)) {
+    last_log = std::chrono::steady_clock::now();
+    REXLOG_INFO("PGR4 photo focus: depth {:.6f} (near {:.3f}, far {:.1f}): {:.2f} m, the game's "
+                "{:.2f} m", depth, near_plane, far_plane, ctx.f1.f64, before);
+  }
 }

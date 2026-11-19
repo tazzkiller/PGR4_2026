@@ -37,6 +37,7 @@
 #include <string>
 #include <functional>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 struct ID3D12Device;
@@ -91,6 +92,9 @@ struct FrameStats {
   // reached its Swap, how long FramePacer::WaitToBegin held it before it began, and the frame's
   // present number (D3D12Device::EndFrameTimes::presents; 0: not presented).
   uint64_t guest_begin_ns = 0, guest_swap_ns = 0, pace_wait_ns = 0, present = 0;
+  // Local change (18/11/2026): the command recorder (D3D12Device::TakeRecorderStats), 1 when on.
+  uint64_t rec_on = 0, rec_wait_ns = 0, rec_drains = 0, rec_replay_ns = 0, rec_bytes = 0,
+           rec_forwarded = 0;
 };
 
 class NativeRenderer {
@@ -136,6 +140,12 @@ class NativeRenderer {
   // The frame's direct command list: open from the previous Swap until OnSwap closes and
   // submits it. Record into it from the On* calls only (the render thread, in that mode).
   ID3D12GraphicsCommandList* command_list() const;
+  static void LoadShaderFamilies();  // local change, development (VsFamily)
+  // Local change (18/11/2026): the draw path's list (D3D12Device::recording_list).
+  ID3D12GraphicsCommandList* recording_list() const;
+  // Development (18/11/2026, --pgr4_native_profile): 1 for a car's draw, 2 for an animated
+  // character's, else 0 (renderer.cpp: shaders\shader_names.tsv).
+  static int VsFamily(const DrawPrep* prep);
   // Swaps recorded so far (= index of the frame being recorded).
   uint64_t frame_index() const { return frame_index_; }
   // Fence value OnSwap will signal for the frame being recorded; a resource last used in this
@@ -158,6 +168,9 @@ class NativeRenderer {
     queued_settings_.push_back(std::move(fn));
   }
   bool upscaler_on() const { return upscaler_on_; }
+  // Local change (18/11/2026): DLSS (Super Resolution, and its frame generation with it) upscales
+  // the frames now (set at each Swap by the render thread; read on any thread).
+  bool dlss_running() const { return dlss_running_.load(std::memory_order_relaxed); }
   void RequestUpscaler(bool on) {
     if (on != upscaler_on_) upscaler_switch_requested_.store(true, std::memory_order_relaxed);
   }
@@ -290,6 +303,10 @@ class NativeRenderer {
   std::mutex settings_mutex_;
   std::vector<std::function<void()>> queued_settings_;  // QueueSettings
   bool upscaler_on_ = false;
+  std::atomic<bool> dlss_running_{false};  // dlss_running()
+  // The game's motion blur held off by ApplyMotionBlurRule (guest thread).
+  bool blur_held_off_ = false;
+  void ApplyMotionBlurRule(uint8_t* base);
   uint32_t scene_msaa_ = 2;  // --pgr4_native_msaa, as far as the GPU has it
 
   static inline std::atomic<bool> paces_frames_{false};       // pacer_->pacing(), for any thread
@@ -319,6 +336,20 @@ class NativeRenderer {
   // until one matches); the upscaler reads it through the pointer set_camera gave it.
   FfxCamera camera_;
   uint32_t camera_scan_ = 0;  // this frame's scene depth draws still to scan for it
+  // Development (--pgr4_native_profile, 18/11/2026): the draws by render target
+  // (RB_SURFACE_INFO): their count, the cars' among them (VsFamily) and the render thread's time,
+  // logged every 300 frames (LogPasses).
+  struct PassCount {
+    uint64_t draws = 0, car = 0, ticks = 0;
+    std::unordered_map<uint64_t, uint32_t> vs, ps;  // draws by shader (ucode hash)
+  };
+  std::unordered_map<uint32_t, PassCount> passes_;
+  uint32_t passes_frames_ = 0;
+  void LogPasses();
+  // Local change (18/11/2026): the CSV has the profiler's columns (--pgr4_native_profile at the
+  // start); --pgr4_native_profile is then read again at each Swap (a profile with and without it
+  // in one session), the columns written either way (zeros while it is off).
+  bool csv_profile_ = false;
   bool camera_logged_ = false;
   // Primary mode with --pgr4_native_frame_latency > 0, or observing only with --pgr4_native_csv.
   std::unique_ptr<FramePacer> pacer_;

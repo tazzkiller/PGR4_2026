@@ -55,7 +55,8 @@ namespace {
 namespace xenos = rex::graphics::xenos;
 namespace texture_util = rex::graphics::texture_util;
 
-constexpr uint32_t kViewsPerResolve = 4;  // t0 color/depth, t1 stencil, u0 texel bits, u1 floats
+// t0 color/depth, t1 stencil, u0 texel bits, u1 floats, t2 the scene's deferred occlusion (local change).
+constexpr uint32_t kViewsPerResolve = 5;
 constexpr uint32_t kHeapPerFrame = 128 * kViewsPerResolve;  // descriptors per frame slot
 constexpr uint32_t kHeapSlots = 4;                          // > frames in flight
 static_assert(kHeapSlots > D3D12Device::kFramesInFlight);
@@ -193,7 +194,8 @@ cbuffer Params : register(b0) {
   uint cb_dest_format;  // xenos::TextureFormat
   uint cb_src_format;   // xenos::ColorRenderTargetFormat, or the depth format
   uint cb_flags;        // 1: swap, 4-6: sample select, 8-9: log2 of the samples, 10: the host's
-                        // own samples, 12-14: number, 15: also the converted color into dst_float
+                        // own samples, 11: times the scene's occlusion (t2), 12-14: number, 15:
+                        // also the converted color into dst_float
   int cb_exp_bias;
   uint cb_dest_layout;  // DestLayout of dst
   uint pad;
@@ -229,6 +231,9 @@ Texture2DMS<float4> src : register(t0);
 #else
 Texture2D<float4> src : register(t0);
 #endif
+// Local change (pgr4 project): flag 11, the scene's ambient occlusion at the target's host size
+// (SceneEffects::DeferredOcclusion), multiplied into the color as the samples are averaged.
+Texture2D<float> scene_ao : register(t2);
 #endif
 // The destination image through its UINT view (Xenos texel bits), or (B5G6R5, the R32_FLOAT
 // image of depth resolves, and the linear image of flag 15) as floats.
@@ -367,7 +372,13 @@ uint4 PackPixel(int2 p, out float4 floats) {
   floats = (src_format == 1u ? F20e4ToF32(d24) : (float)d24 / 16777215.0).xxxx;
   return uint4((d24 << 8) | (stencil & 0xFFu), 0, 0, 0);
 #else
-  floats = Convert(LoadColor(p));
+  float4 c = LoadColor(p);
+  if (flags & 0x800u) {
+    uint aw, ah;
+    scene_ao.GetDimensions(aw, ah);
+    c.rgb *= scene_ao.Load(int3(min(uint2(max(p, int2(0, 0))), uint2(aw, ah) - 1u), 0));
+  }
+  floats = Convert(c);
   return PackDest(floats);
 #endif
 }
@@ -790,19 +801,24 @@ bool Resolver::Initialize(ID3D12Device* device, RenderTargets* targets, ID3D12Co
 }
 
 bool Resolver::CreatePipelines() {
-  // Root signature: b0 = 12 root constants, one table of t0-t1 (sources) and u0-u1 (images).
-  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  // Root signature: b0 = 12 root constants, one table of t0-t1 (sources), u0-u1 (images) and t2
+  // (local change: the scene's deferred occlusion, SceneEffects::DeferredOcclusion).
+  D3D12_DESCRIPTOR_RANGE ranges[3] = {};
   ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   ranges[0].NumDescriptors = 2;
   ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
   ranges[1].NumDescriptors = 2;
   ranges[1].OffsetInDescriptorsFromTableStart = 2;
+  ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[2].NumDescriptors = 1;
+  ranges[2].BaseShaderRegister = 2;
+  ranges[2].OffsetInDescriptorsFromTableStart = 4;
   D3D12_ROOT_PARAMETER params[2] = {};
   params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   params[0].Constants.Num32BitValues = sizeof(ShaderConstants) / 4;
   params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  params[1].DescriptorTable.NumDescriptorRanges = 2;
+  params[1].DescriptorTable.NumDescriptorRanges = 3;
   params[1].DescriptorTable.pDescriptorRanges = ranges;
   params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   D3D12_ROOT_SIGNATURE_DESC rd = {};
@@ -910,6 +926,7 @@ ID3D12Resource* Resolver::GuestSize(ID3D12GraphicsCommandList* list, const Resol
   device_->CreateUnorderedAccessView(guest.Get(), nullptr, &ud, at(2));
   ud.Format = DXGI_FORMAT_R32_UINT;
   device_->CreateUnorderedAccessView(nullptr, nullptr, &ud, at(3));
+  device_->CreateShaderResourceView(nullptr, &sd, at(4));
 
   if (guest_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
     const D3D12_RESOURCE_BARRIER b =
@@ -1228,7 +1245,9 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p, 
   }
   // Local change: the scene's effects, before its first resolve of the frame reads it.
   if (Upscaler::IsScene(p.regs.surface_info) && Upscaler::IsSceneWidth(p.x0, p.x1)) {
-    if (effects_) effects_->Apply(list, *targets_, p.regs, frame_);
+    if (effects_ && effects_->Enabled()) {
+      effects_->Apply(list, *targets_, p.regs, frame_, timer_, /*defer=*/upscaler_ == nullptr);
+    }
     // The draws bind their state again after a pass of another's (compute_passes()).
     if (scene_end_ && scene_end_(list, *targets_, p.regs)) ++compute_passes_;
   }
@@ -1336,17 +1355,30 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   if (rt->samples == 1) sd.Texture2D.MipLevels = 1;
   sd.Format = rt->srv_format;
   device_->CreateShaderResourceView(rt->resource.Get(), &sd, view(0));
+  D3D12_SHADER_RESOURCE_VIEW_DESC nd = {};
+  nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  nd.Texture2D.MipLevels = 1;
   if (depth) {
     sd.Format = rt->stencil_srv_format;
     if (rt->samples == 1) sd.Texture2D.PlaneSlice = 1;
     device_->CreateShaderResourceView(rt->resource.Get(), &sd, view(1));
   } else {
-    D3D12_SHADER_RESOURCE_VIEW_DESC nd = {};
-    nd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    nd.Texture2D.MipLevels = 1;
     device_->CreateShaderResourceView(nullptr, &nd, view(1));
+  }
+  // Local change (pgr4 project): the scene's color copied out of its own target (no upscaler
+  // in between) takes the frame's ambient occlusion here when SceneEffects deferred it.
+  // (Deferred only without an upscaler, so `rt` is the scene's target itself.)
+  ID3D12Resource* const occlusion = !depth && effects_ && rt->samples > 1 &&
+                                            Upscaler::IsScene(p.regs.surface_info) &&
+                                            Upscaler::IsSceneWidth(p.x0, p.x1)
+                                        ? effects_->DeferredOcclusion(frame_)
+                                        : nullptr;
+  {
+    D3D12_SHADER_RESOURCE_VIEW_DESC ad = nd;
+    ad.Format = DXGI_FORMAT_R8_UNORM;
+    device_->CreateShaderResourceView(occlusion, &ad, view(4));
   }
   // The image the shader writes: B5G6R5 without its typed UAV store goes through `bits`.
   const bool staged = img->bits != nullptr;
@@ -1390,7 +1422,7 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   c.flags = (p.dest_swap ? 2u : 0u) | (p.sample_select << 4) |
             (uint32_t(std::countr_zero(rt->samples)) << 8) |
             (rt->samples > 1 && rt->samples != rt->edram_samples ? 0x400u : 0u) |
-            (p.dest_number << 12) | (linear ? 0x8000u : 0u);
+            (p.dest_number << 12) | (linear ? 0x8000u : 0u) | (occlusion ? 0x800u : 0u);
   c.exp_bias = p.exp_bias;
   c.dest_layout = staged ? kR16 : storage->layout;
   c.src_scale[0] = rt->scale.factor(0);

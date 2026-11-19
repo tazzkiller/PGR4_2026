@@ -58,6 +58,9 @@ static const float kRoadLift = 0.05;     // metres above the road the ray starts
 static const float kRoadGrain = PGR4_TUNE_kRoadGrain;
 static const float kRoadDetail = 0.3;  // the less blurred level mixed in (thin bright lines kept, faint)
 static const float kRoadOccluded = 0.0;  // what hides the reflected (a barrier before a sign's foot) reflected instead, this much
+// Metres behind a vehicle a ray still hits it (scene_ray.hlsli xe_ray_vehicle; 0: as any surface,
+// kReflectThickness 1.5 m): local change, 19/11/2026.
+static const float kRoadVehicleThickness = 0.4;
 // The ray's steps: each this much longer, this many (0.4 m x 1.1^64: about 175 m, past kRoadFar);
 // longer steps jumped over a sign's plate at some distances, cutting its reflection by moments.
 static const float kRoadStepGrowth = 1.1;
@@ -217,6 +220,7 @@ float4 XeRoadFinish(float4 color, XeInput i) {
   xe_ray_detail = kRoadDetail;
   xe_ray_rise_growth = kRoadRiseGrowth;
   xe_ray_occluded = kRoadOccluded;
+  xe_ray_vehicle = kRoadVehicleThickness;
   xe_ray_growth = kRoadStepGrowth;
   xe_ray_steps = kRoadSteps;
   // The asphalt's relief under its water film, fixed to the ground: the reflection bent by it

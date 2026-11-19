@@ -1,5 +1,7 @@
 // Local change (pgr4 project): the in-game settings overlay (overlay.h).
 #include "overlay.h"
+#include "scene_effects.h"
+#include "shader_replace.h"
 
 #include "streamline.h"
 #include "tunables.h"
@@ -21,6 +23,7 @@
 REXCVAR_DECLARE(bool, pgr4_native_dlss);
 REXCVAR_DECLARE(bool, pgr4_freeze_car);  // src/pgr4_hooks.cpp
 REXCVAR_DECLARE(std::string, pgr4_native_dlss_mode);
+REXCVAR_DECLARE(std::string, pgr4_native_fsr_mode);  // upscaler.cpp
 REXCVAR_DECLARE(std::string, pgr4_native_dlss_preset);
 REXCVAR_DECLARE(bool, pgr4_native_dlss_fg);
 REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_frames);
@@ -34,6 +37,20 @@ REXCVAR_DECLARE(bool, pgr4_native_reactive_mask);
 REXCVAR_DECLARE(bool, pgr4_native_scaled_cube);
 REXCVAR_DECLARE(bool, pgr4_native_shader_replace);
 REXCVAR_DECLARE(bool, pgr4_native_gtao);
+REXCVAR_DECLARE(int32_t, pgr4_native_ao_method);
+REXCVAR_DECLARE(int32_t, pgr4_native_xegtao_quality);
+REXCVAR_DECLARE(int32_t, pgr4_native_xegtao_denoise);
+REXCVAR_DECLARE(double, pgr4_native_xegtao_intensity);
+REXCVAR_DECLARE(double, pgr4_native_xegtao_radius);
+REXCVAR_DECLARE(double, pgr4_native_xegtao_radius_multiplier);
+REXCVAR_DECLARE(double, pgr4_native_xegtao_falloff);
+REXCVAR_DECLARE(double, pgr4_native_xegtao_sample_power);
+REXCVAR_DECLARE(double, pgr4_native_xegtao_thin_compensation);
+REXCVAR_DECLARE(double, pgr4_native_xegtao_final_power);
+REXCVAR_DECLARE(double, pgr4_native_xegtao_mip_offset);
+REXCVAR_DECLARE(bool, pgr4_native_xegtao_near_fade);  // scene_effects.cpp
+REXCVAR_DECLARE(double, pgr4_native_xegtao_near_start);
+REXCVAR_DECLARE(double, pgr4_native_xegtao_near_end);
 REXCVAR_DECLARE(bool, pgr4_native_original_look);
 REXCVAR_DECLARE(double, pgr4_native_gtao_radius);
 REXCVAR_DECLARE(double, pgr4_native_gtao_intensity);
@@ -80,6 +97,8 @@ REXCVAR_DECLARE(double, pgr4_native_tune_harbour_waves);
 REXCVAR_DECLARE(double, pgr4_native_tune_highlights);
 REXCVAR_DECLARE(double, pgr4_native_tune_bloom);
 REXCVAR_DECLARE(double, pgr4_native_tune_water_reflect);
+REXCVAR_DECLARE(double, pgr4_native_tune_water_sun_waves);  // shader_replace.cpp
+REXCVAR_DECLARE(double, pgr4_native_tune_water_haze);
 REXCVAR_DECLARE(double, pgr4_native_tune_road_reflect);
 REXCVAR_DECLARE(double, pgr4_native_tune_road_blur);
 REXCVAR_DECLARE(double, pgr4_native_tune_road_fresnel);
@@ -159,6 +178,7 @@ std::string SaveRendererSettings(bool upscaler_on) {
       {"pgr4_native_upscaler", upscaler_on ? "true" : "false"},
       {"pgr4_native_dlss", REXCVAR_GET(pgr4_native_dlss) ? "true" : "false"},
       {"pgr4_native_dlss_mode", quoted(REXCVAR_GET(pgr4_native_dlss_mode))},
+      {"pgr4_native_fsr_mode", quoted(REXCVAR_GET(pgr4_native_fsr_mode))},
       {"pgr4_native_dlss_preset", quoted(REXCVAR_GET(pgr4_native_dlss_preset))},
       {"pgr4_native_dlss_fg", REXCVAR_GET(pgr4_native_dlss_fg) ? "true" : "false"},
       {"pgr4_native_dlss_fg_frames", rex::cvar::GetFlagByName("pgr4_native_dlss_fg_frames")},
@@ -179,6 +199,30 @@ std::string SaveRendererSettings(bool upscaler_on) {
       {"pgr4_native_msaa", std::to_string(REXCVAR_GET(pgr4_native_msaa))},
       {"pgr4_native_anisotropy", std::to_string(REXCVAR_GET(pgr4_native_anisotropy))},
       {"pgr4_native_gtao", REXCVAR_GET(pgr4_native_gtao) ? "true" : "false"},
+      {"pgr4_native_ao_method", std::to_string(REXCVAR_GET(pgr4_native_ao_method))},
+      {"pgr4_native_xegtao_quality", std::to_string(REXCVAR_GET(pgr4_native_xegtao_quality))},
+      {"pgr4_native_xegtao_denoise", std::to_string(REXCVAR_GET(pgr4_native_xegtao_denoise))},
+      {"pgr4_native_xegtao_intensity", rex::cvar::GetFlagByName("pgr4_native_xegtao_intensity")},
+      {"pgr4_native_xegtao_radius", rex::cvar::GetFlagByName("pgr4_native_xegtao_radius")},
+      {"pgr4_native_xegtao_radius_multiplier",
+       rex::cvar::GetFlagByName("pgr4_native_xegtao_radius_multiplier")},
+      {"pgr4_native_xegtao_falloff", rex::cvar::GetFlagByName("pgr4_native_xegtao_falloff")},
+      {"pgr4_native_xegtao_sample_power", rex::cvar::GetFlagByName("pgr4_native_xegtao_sample_power")},
+      {"pgr4_native_xegtao_thin_compensation",
+       rex::cvar::GetFlagByName("pgr4_native_xegtao_thin_compensation")},
+      {"pgr4_native_xegtao_final_power", rex::cvar::GetFlagByName("pgr4_native_xegtao_final_power")},
+      {"pgr4_native_xegtao_mip_offset", rex::cvar::GetFlagByName("pgr4_native_xegtao_mip_offset")},
+      {"pgr4_native_xegtao_near_fade", REXCVAR_GET(pgr4_native_xegtao_near_fade) ? "true" : "false"},
+      {"pgr4_native_xegtao_near_start", rex::cvar::GetFlagByName("pgr4_native_xegtao_near_start")},
+      {"pgr4_native_xegtao_near_end", rex::cvar::GetFlagByName("pgr4_native_xegtao_near_end")},
+      {"pgr4_native_xegtao_clear", quoted(rex::cvar::GetFlagByName("pgr4_native_xegtao_clear"))},
+      {"pgr4_native_xegtao_overcast", quoted(rex::cvar::GetFlagByName("pgr4_native_xegtao_overcast"))},
+      {"pgr4_native_xegtao_fog", quoted(rex::cvar::GetFlagByName("pgr4_native_xegtao_fog"))},
+      {"pgr4_native_xegtao_rain", quoted(rex::cvar::GetFlagByName("pgr4_native_xegtao_rain"))},
+      {"pgr4_native_xegtao_snow", quoted(rex::cvar::GetFlagByName("pgr4_native_xegtao_snow"))},
+      {"pgr4_native_xegtao_icy", quoted(rex::cvar::GetFlagByName("pgr4_native_xegtao_icy"))},
+      {"pgr4_native_xegtao_heavy_snow",
+       quoted(rex::cvar::GetFlagByName("pgr4_native_xegtao_heavy_snow"))},
       {"pgr4_native_gtao_radius", rex::cvar::GetFlagByName("pgr4_native_gtao_radius")},
       {"pgr4_native_gtao_intensity", rex::cvar::GetFlagByName("pgr4_native_gtao_intensity")},
       {"pgr4_native_gtao_distance", rex::cvar::GetFlagByName("pgr4_native_gtao_distance")},
@@ -243,6 +287,20 @@ std::string SaveRendererSettings(bool upscaler_on) {
        rex::cvar::GetFlagByName("pgr4_native_tune_harbour_waves")},
       {"pgr4_native_tune_highlights", rex::cvar::GetFlagByName("pgr4_native_tune_highlights")},
       {"pgr4_native_tune_water_reflect", rex::cvar::GetFlagByName("pgr4_native_tune_water_reflect")},
+      {"pgr4_native_tune_water_sun_waves",
+       rex::cvar::GetFlagByName("pgr4_native_tune_water_sun_waves")},
+      {"pgr4_native_tune_water_haze", rex::cvar::GetFlagByName("pgr4_native_tune_water_haze")},
+      {"pgr4_native_tune_water_clear", quoted(rex::cvar::GetFlagByName("pgr4_native_tune_water_clear"))},
+      {"pgr4_native_tune_water_overcast",
+       quoted(rex::cvar::GetFlagByName("pgr4_native_tune_water_overcast"))},
+      {"pgr4_native_tune_water_fog", quoted(rex::cvar::GetFlagByName("pgr4_native_tune_water_fog"))},
+      {"pgr4_native_tune_water_rain", quoted(rex::cvar::GetFlagByName("pgr4_native_tune_water_rain"))},
+      {"pgr4_native_tune_water_light_rain",
+       quoted(rex::cvar::GetFlagByName("pgr4_native_tune_water_light_rain"))},
+      {"pgr4_native_tune_water_snow", quoted(rex::cvar::GetFlagByName("pgr4_native_tune_water_snow"))},
+      {"pgr4_native_tune_water_icy", quoted(rex::cvar::GetFlagByName("pgr4_native_tune_water_icy"))},
+      {"pgr4_native_tune_water_heavy_snow",
+       quoted(rex::cvar::GetFlagByName("pgr4_native_tune_water_heavy_snow"))},
       {"pgr4_native_tune_road_reflect", rex::cvar::GetFlagByName("pgr4_native_tune_road_reflect")},
       {"pgr4_native_tune_road_blur", rex::cvar::GetFlagByName("pgr4_native_tune_road_blur")},
       {"pgr4_native_tune_road_fresnel", rex::cvar::GetFlagByName("pgr4_native_tune_road_fresnel")},
@@ -618,137 +676,283 @@ Overlay::Actions Overlay::Build(const Info& info) {
     if (ImGui::Checkbox("GTAO", &gtao)) REXCVAR_SET(pgr4_native_gtao, gtao);
     if (gtao) {
       float radius = float(REXCVAR_GET(pgr4_native_gtao_radius));
-      if (ImGui::SliderFloat("Rayon (m)", &radius, 0.1f, 5.0f, "%.2f"))
+      if (ImGui::SliderFloat("Rayon notre GTAO (m)", &radius, 0.1f, 5.0f, "%.2f"))
         REXCVAR_SET(pgr4_native_gtao_radius, double(radius));
       float intensity = float(REXCVAR_GET(pgr4_native_gtao_intensity));
-      if (ImGui::SliderFloat("Intensite", &intensity, 0.0f, 4.0f, "%.2f"))
+      if (ImGui::SliderFloat("Intensite notre GTAO", &intensity, 0.0f, 4.0f, "%.2f"))
         REXCVAR_SET(pgr4_native_gtao_intensity, double(intensity));
       float distance = float(REXCVAR_GET(pgr4_native_gtao_distance));
-      if (ImGui::SliderFloat("Distance (m)", &distance, 10.0f, 2000.0f, "%.0f"))
+      if (ImGui::SliderFloat("Distance (m, les deux)", &distance, 10.0f, 2000.0f, "%.0f"))
         REXCVAR_SET(pgr4_native_gtao_distance, double(distance));
-      bool full = REXCVAR_GET(pgr4_native_gtao_full);
-      if (ImGui::Checkbox("Pleine resolution (plus stable, plus cher)", &full))
-        REXCVAR_SET(pgr4_native_gtao_full, full);
+      // Local change (16/11/2026): the method, automatic by default (MSAA: ours; an upscaler:
+      // Intel's XeGTAO), forced for comparisons. Both settings shown.
+      int method = REXCVAR_GET(pgr4_native_ao_method);
+      static const char* const kMethods[] = {"Auto (MSAA : notre GTAO, upscaler : XeGTAO)",
+                                             "Toujours notre GTAO", "Toujours XeGTAO"};
+      if (ImGui::Combo("Methode", &method, kMethods, 3)) REXCVAR_SET(pgr4_native_ao_method, method);
+      ImGui::SeparatorText("XeGTAO (Intel)");
+      {
+        int quality = REXCVAR_GET(pgr4_native_xegtao_quality);
+        static const char* const kXeQuality[] = {"Basse (1x2)", "Moyenne (2x2)", "Haute (3x3)",
+                                                 "Ultra (9x3)"};
+        if (ImGui::Combo("Qualite XeGTAO", &quality, kXeQuality, 4))
+          REXCVAR_SET(pgr4_native_xegtao_quality, quality);
+        int denoise = REXCVAR_GET(pgr4_native_xegtao_denoise) + 1;
+        static const char* const kXeDenoise[] = {"Auto (1 avec upscaler, sinon 2)", "Aucun",
+                                                 "Net (1)", "Moyen (2)", "Doux (3)"};
+        if (ImGui::Combo("Debruitage XeGTAO", &denoise, kXeDenoise, 5))
+          REXCVAR_SET(pgr4_native_xegtao_denoise, denoise - 1);
+        // Local change (16/11/2026): the general tuning, or the race's weather's own
+        // (SceneEffects::XeTuningFor), which the sliders then edit.
+        using Effects = pgr4::native::SceneEffects;
+        static const char* const kWeathers[Effects::kXeWeathers] = {
+            "degage", "couvert", "brouillard", "pluie", "neige", "verglas", "forte neige"};
+        const int weather = Effects::XeWeather();
+        bool own = weather >= 0 && Effects::XeHasOwn(weather);
+        if (weather < 0) {
+          ImGui::TextUnformatted("Meteo : hors course (reglages generaux)");
+        } else {
+          ImGui::Text("Meteo de la course : %s", kWeathers[weather]);
+          if (ImGui::Checkbox("Reglages propres a cette meteo", &own)) {
+            if (own) {
+              const Effects::XeTuning t = Effects::XeTuningFor(weather);
+              Effects::XeSetOwn(weather, &t);
+            } else {
+              Effects::XeSetOwn(weather, nullptr);
+            }
+          }
+        }
+        Effects::XeTuning t = own ? Effects::XeTuningFor(weather) : Effects::XeGeneralTuning();
+        bool changed = false;
+        changed |= ImGui::SliderFloat(own ? "Rayon XeGTAO (m), cette meteo" : "Rayon XeGTAO (m)",
+                                      &t.radius, 0.1f, 5.0f, "%.2f");
+        changed |= ImGui::SliderFloat(own ? "Intensite XeGTAO, cette meteo" : "Intensite XeGTAO",
+                                      &t.intensity, 0.0f, 4.0f, "%.2f");
+        // XeGTAO's own tuning, as its GTAOImGuiSettings (Intel's ranges and defaults).
+        if (ImGui::TreeNode("Reglages fins XeGTAO (Intel)")) {
+          struct Tune {
+            const char* label;
+            float Effects::XeTuning::*field;
+            float lo, hi, def;
+            const char* help;
+          };
+          static const Tune kTunes[] = {
+              {"Multiplicateur de rayon", &Effects::XeTuning::radius_multiplier, 0.3f, 3.0f,
+               1.457f, "Multiplie le rayon (reglage automatique Intel)"},
+              {"Attenuation (falloff)", &Effects::XeTuning::falloff, 0.0f, 1.0f, 0.615f,
+               "Part du rayon sur laquelle les echantillons lointains s'effacent"},
+              {"Repartition des echantillons", &Effects::XeTuning::sample_power, 1.0f, 3.0f, 2.0f,
+               "1 : reguliere ; plus : les petits creux plutot que les grandes surfaces"},
+              {"Compensation objets fins", &Effects::XeTuning::thin_compensation, 0.0f, 0.7f, 0.0f,
+               "Moins d'assombrissement par les poteaux, grillages, feuillages"},
+              {"Puissance finale", &Effects::XeTuning::final_power, 0.5f, 5.0f, 2.2f,
+               "La courbe de force de XeGTAO, avant l'intensite"},
+              {"Decalage de mip de profondeur", &Effects::XeTuning::mip_offset, 2.0f, 6.0f, 3.3f,
+               "Plus bas : plus fin, plus stable sur les objets fins, plus lent"},
+          };
+          for (const Tune& k : kTunes) {
+            changed |= ImGui::SliderFloat(k.label, &(t.*k.field), k.lo, k.hi, "%.3f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s (Intel : %.3f)", k.help, k.def);
+          }
+          if (ImGui::Button("Valeurs d'Intel")) {
+            for (const Tune& k : kTunes) t.*k.field = k.def;
+            changed = true;
+          }
+          ImGui::SameLine();
+          // The game's defaults (scene_effects.cpp: Tazz's tuning of 16/11/2026), radius and
+          // intensity included; in fog, its own (intensity 0.2, falloff 1).
+          if (ImGui::Button("Valeurs du jeu")) {
+            t = {5.0f, 0.5f, 1.457f, 0.619f, 1.5f, 0.6f, 2.2f, 3.3f};
+            if (own && weather == 2) t.intensity = 0.2f, t.falloff = 1.0f;
+            changed = true;
+          }
+          ImGui::TreePop();
+        }
+        if (changed) {
+          if (own)
+            Effects::XeSetOwn(weather, &t);
+          else
+            Effects::XeSetGeneral(t);
+        }
+        // Local change (17/11/2026): the near fade (the cockpit view), off by default.
+        bool near_fade = REXCVAR_GET(pgr4_native_xegtao_near_fade);
+        if (ImGui::Checkbox("Fondu de pres (habitacle)", &near_fade))
+          REXCVAR_SET(pgr4_native_xegtao_near_fade, near_fade);
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Pas d'occlusion avant le debut, toute l'occlusion a partir de la fin "
+                            "(distance a l'oeil)");
+        if (near_fade) {
+          float near_start = float(REXCVAR_GET(pgr4_native_xegtao_near_start));
+          if (ImGui::SliderFloat("Debut du fondu (m)", &near_start, 0.0f, 5.0f, "%.2f"))
+            REXCVAR_SET(pgr4_native_xegtao_near_start, double(near_start));
+          float near_end = float(REXCVAR_GET(pgr4_native_xegtao_near_end));
+          if (ImGui::SliderFloat("Fin du fondu (m)", &near_end, 0.0f, 10.0f, "%.2f"))
+            REXCVAR_SET(pgr4_native_xegtao_near_end, double(near_end));
+        }
+      }
+      ImGui::SeparatorText("Notre GTAO");
+      {
+        bool full = REXCVAR_GET(pgr4_native_gtao_full);
+        if (ImGui::Checkbox("Pleine resolution (plus stable, plus cher)", &full))
+          REXCVAR_SET(pgr4_native_gtao_full, full);
+      }
       bool debug = REXCVAR_GET(pgr4_native_gtao_debug);
       if (ImGui::Checkbox("Voir l'occlusion seule", &debug)) REXCVAR_SET(pgr4_native_gtao_debug, debug);
     }
   }
 
-  ImGui::SeparatorText("Upscaler");
+  // Local change (18/11/2026, Tazz): one anti-aliasing chosen, MSAA, DLSS (where Streamline is up)
+  // or FSR, as the game's GRAPHICS page; under it the settings of that one only.
+  ImGui::SeparatorText("Anticrenelage");
+  const int kind_now = !info.upscaler_on ? 0 : info.dlss ? 1 : 2;
   {
-    // Local change (pgr4 project): the sharpening after DLSS / FSR (Upscaler::Sharpen).
-    // One strength per upscaler; none with MSAA.
-    float dlss_sharpen = float(REXCVAR_GET(pgr4_native_sharpen_dlss));
-    if (ImGui::SliderFloat("Nettete DLSS (CAS)", &dlss_sharpen, 0.0f, 1.0f, "%.2f"))
-      REXCVAR_SET(pgr4_native_sharpen_dlss, double(dlss_sharpen));
-    float fsr_sharpen = float(REXCVAR_GET(pgr4_native_sharpen_fsr));
-    if (ImGui::SliderFloat("Nettete FSR (CAS)", &fsr_sharpen, 0.0f, 1.0f, "%.2f"))
-      REXCVAR_SET(pgr4_native_sharpen_fsr, double(fsr_sharpen));
-  }
-  bool upscaler = info.upscaler_on;
-  if (ImGui::Checkbox("Upscaler actif (F7)", &upscaler)) actions.switch_upscaler = true;
-  if (info.dlss_available) {
-    int backend = REXCVAR_GET(pgr4_native_dlss) ? 0 : 1;
-    const int before = backend;
-    ImGui::RadioButton("DLSS", &backend, 0);
+    int kind = !info.upscaler_on                                      ? 0
+               : info.dlss_available && REXCVAR_GET(pgr4_native_dlss) ? 1
+                                                                      : 2;
+    const int before = kind;
+    ImGui::RadioButton("MSAA", &kind, 0);
+    if (info.dlss_available) {
+      ImGui::SameLine();
+      ImGui::RadioButton("DLSS", &kind, 1);
+    }
     ImGui::SameLine();
-    ImGui::RadioButton("FSR", &backend, 1);
-    if (backend != before) {
-      REXCVAR_SET(pgr4_native_dlss, backend == 0);
-      actions.recreate_upscaler = true;
+    ImGui::RadioButton("FSR", &kind, 2);
+    if (kind != before) {
+      if (kind == 0) {
+        if (info.upscaler_on) actions.switch_upscaler = true;
+      } else {
+        REXCVAR_SET(pgr4_native_dlss, kind == 1);
+        if (info.upscaler_on)
+          actions.recreate_upscaler = true;
+        else
+          actions.switch_upscaler = true;
+      }
     }
-  } else {
-    ImGui::TextDisabled("DLSS indisponible (Streamline non charge) : FSR");
+    if (!info.dlss_available) ImGui::TextDisabled("DLSS indisponible (Streamline non charge)");
+    static const char* const kKinds[] = {"MSAA", "DLSS", "FSR"};
+    ImGui::Text("En cours : %s (F7 : MSAA / upscaler)", kKinds[kind_now]);
   }
-  if (info.upscaler_on) ImGui::Text("En cours : %s", info.dlss ? "DLSS" : "FSR");
-  // Local change (pgr4 project): the reactive mask of the transparents (Upscaler::SnapshotOpaque).
-  // The mask keeps the transparents (rain, smoke, glass) out of the upscaler's history.
-  bool reactive = REXCVAR_GET(pgr4_native_reactive_mask);
-  if (ImGui::Checkbox("Masque des transparents (pluie, fumee, vitres)", &reactive))
-    REXCVAR_SET(pgr4_native_reactive_mask, reactive);
-  if (reactive) {
-    bool dlss_mask = REXCVAR_GET(pgr4_native_reactive_dlss);
-    if (ImGui::Checkbox("Aussi avec DLSS", &dlss_mask))
-      REXCVAR_SET(pgr4_native_reactive_dlss, dlss_mask);
-    float scale = float(REXCVAR_GET(pgr4_native_reactive_scale));
-    if (ImGui::SliderFloat("Force du masque", &scale, 0.25f, 8.0f, "%.2f"))
-      REXCVAR_SET(pgr4_native_reactive_scale, double(scale));
-    float most = float(REXCVAR_GET(pgr4_native_reactive_max));
-    if (ImGui::SliderFloat("Masque maximum", &most, 0.05f, 1.0f, "%.2f"))
-      REXCVAR_SET(pgr4_native_reactive_max, double(most));
-    bool show = REXCVAR_GET(pgr4_native_reactive_show);
-    if (ImGui::Checkbox("Voir le masque (rouge)", &show))
-      REXCVAR_SET(pgr4_native_reactive_show, show);
-    // The mask's settings back to their defaults (upscaler.cpp's).
-    if (ImGui::Button("Masque : valeurs par defaut")) {
-      REXCVAR_SET(pgr4_native_reactive_dlss, true);
-      REXCVAR_SET(pgr4_native_reactive_scale, 2.0);
-      REXCVAR_SET(pgr4_native_reactive_max, 0.8);
-      REXCVAR_SET(pgr4_native_reactive_show, false);
+  const int kind = !info.upscaler_on                                      ? 0
+                   : info.dlss_available && REXCVAR_GET(pgr4_native_dlss) ? 1
+                                                                          : 2;
+  if (kind == 0) {
+    static const int kMsaa[] = {1, 2, 4, 8};
+    static const char* const kMsaaLabels[] = {"1x", "2x (jeu)", "4x", "8x"};
+    if (IntCombo("Echantillons MSAA", msaa_, kMsaa, kMsaaLabels, 4)) {
+      REXCVAR_SET(pgr4_native_msaa, msaa_);
+      actions.apply_msaa = true;
     }
   }
-  const bool dlss_chosen = info.dlss_available && REXCVAR_GET(pgr4_native_dlss);
-  std::string mode = REXCVAR_GET(pgr4_native_dlss_mode);
-  if (dlss_chosen) {
+  if (kind >= 1) {
+    // The quality mode of the upscaler chosen, each its own (local change, 17/11/2026).
+    const bool dlss_chosen = kind == 1;
+    std::string mode =
+        dlss_chosen ? REXCVAR_GET(pgr4_native_dlss_mode) : REXCVAR_GET(pgr4_native_fsr_mode);
     static const char* const kModes[] = {"auto",     "dlaa",        "quality",
                                          "balanced", "performance", "ultra_performance"};
     static const char* const kModeLabels[] = {
-        "Auto (taille de rendu ci-dessous)", "DLAA (100 %)",     "Qualite (67 %)",
+        "Auto (taille de rendu ci-dessous)", "Natif (100 %)",     "Qualite (67 %)",
         "Equilibre (58 %)",                  "Performance (50 %)", "Ultra performance (33 %)"};
-    if (StringCombo("Mode DLSS", mode, kModes, kModeLabels, 6)) {
-      REXCVAR_SET(pgr4_native_dlss_mode, mode);
+    if (StringCombo(dlss_chosen ? "Mode DLSS" : "Mode FSR", mode, kModes, kModeLabels, 6)) {
+      if (dlss_chosen)
+        REXCVAR_SET(pgr4_native_dlss_mode, mode);
+      else
+        REXCVAR_SET(pgr4_native_fsr_mode, mode);
       actions.recreate_upscaler = true;
     }
-    std::string preset = REXCVAR_GET(pgr4_native_dlss_preset);
-    static const char* const kPresets[] = {"E", "default", "J", "K", "L", "M"};
-    static const char* const kPresetLabels[] = {"E (CNN, route nette)", "Defaut NVIDIA (K en DLAA)",
-                                                "J", "K (transformer)", "L (ultra perf.)",
-                                                "M (performance)"};
-    if (StringCombo("Preset DLSS", preset, kPresets, kPresetLabels, 6))
-      REXCVAR_SET(pgr4_native_dlss_preset, preset);
+    if (dlss_chosen) {
+      std::string preset = REXCVAR_GET(pgr4_native_dlss_preset);
+      static const char* const kPresets[] = {"E", "default", "J", "K", "L", "M"};
+      static const char* const kPresetLabels[] = {"E (CNN, route nette)", "Defaut NVIDIA (K en DLAA)",
+                                                  "J", "K (transformer)", "L (ultra perf.)",
+                                                  "M (performance)"};
+      if (StringCombo("Preset DLSS", preset, kPresets, kPresetLabels, 6))
+        REXCVAR_SET(pgr4_native_dlss_preset, preset);
+    }
+    // The sharpening after it (Upscaler::Sharpen), its own.
+    float sharpen = float(dlss_chosen ? REXCVAR_GET(pgr4_native_sharpen_dlss)
+                                      : REXCVAR_GET(pgr4_native_sharpen_fsr));
+    if (ImGui::SliderFloat(dlss_chosen ? "Nettete DLSS (CAS)" : "Nettete FSR (CAS)", &sharpen, 0.0f,
+                           1.0f, "%.2f")) {
+      if (dlss_chosen)
+        REXCVAR_SET(pgr4_native_sharpen_dlss, double(sharpen));
+      else
+        REXCVAR_SET(pgr4_native_sharpen_fsr, double(sharpen));
+    }
+    if (mode == "auto" || mode.empty()) {
+      if (!upscaler_width_) {
+        upscaler_width_ = REXCVAR_GET(pgr4_native_upscaler_width);
+        upscaler_height_ = REXCVAR_GET(pgr4_native_upscaler_height);
+      }
+      const int max_w = int(info.output_width), max_h = int(info.output_height);
+      ImGui::SliderInt("Largeur de rendu", &upscaler_width_, 320, std::max(320, max_w));
+      const bool w_done = ImGui::IsItemDeactivatedAfterEdit();
+      ImGui::SliderInt("Hauteur de rendu", &upscaler_height_, 180, std::max(180, max_h));
+      if (w_done || ImGui::IsItemDeactivatedAfterEdit()) {
+        REXCVAR_SET(pgr4_native_upscaler_width, upscaler_width_);
+        REXCVAR_SET(pgr4_native_upscaler_height, upscaler_height_);
+        actions.recreate_upscaler = true;
+      }
+    }
   }
-  if (!dlss_chosen || mode == "auto" || mode.empty()) {
-    if (!upscaler_width_) {
-      upscaler_width_ = REXCVAR_GET(pgr4_native_upscaler_width);
-      upscaler_height_ = REXCVAR_GET(pgr4_native_upscaler_height);
-    }
-    const int max_w = int(info.output_width), max_h = int(info.output_height);
-    ImGui::SliderInt("Largeur de rendu", &upscaler_width_, 320, std::max(320, max_w));
-    const bool w_done = ImGui::IsItemDeactivatedAfterEdit();
-    ImGui::SliderInt("Hauteur de rendu", &upscaler_height_, 180, std::max(180, max_h));
-    if (w_done || ImGui::IsItemDeactivatedAfterEdit()) {
-      REXCVAR_SET(pgr4_native_upscaler_width, upscaler_width_);
-      REXCVAR_SET(pgr4_native_upscaler_height, upscaler_height_);
-      actions.recreate_upscaler = true;
+  if (kind >= 1) {
+    // Local change (pgr4 project): the reactive mask of the transparents (Upscaler::SnapshotOpaque),
+    // for DLSS and FSR: it keeps the transparents (rain, smoke, glass) out of the history.
+    bool reactive = REXCVAR_GET(pgr4_native_reactive_mask);
+    if (ImGui::Checkbox("Masque des transparents (pluie, fumee, vitres)", &reactive))
+      REXCVAR_SET(pgr4_native_reactive_mask, reactive);
+    if (reactive) {
+      if (kind == 1) {
+        bool dlss_mask = REXCVAR_GET(pgr4_native_reactive_dlss);
+        if (ImGui::Checkbox("Aussi avec DLSS", &dlss_mask))
+          REXCVAR_SET(pgr4_native_reactive_dlss, dlss_mask);
+      }
+      float scale = float(REXCVAR_GET(pgr4_native_reactive_scale));
+      if (ImGui::SliderFloat("Force du masque", &scale, 0.25f, 8.0f, "%.2f"))
+        REXCVAR_SET(pgr4_native_reactive_scale, double(scale));
+      float most = float(REXCVAR_GET(pgr4_native_reactive_max));
+      if (ImGui::SliderFloat("Masque maximum", &most, 0.05f, 1.0f, "%.2f"))
+        REXCVAR_SET(pgr4_native_reactive_max, double(most));
+      bool show = REXCVAR_GET(pgr4_native_reactive_show);
+      if (ImGui::Checkbox("Voir le masque (rouge)", &show))
+        REXCVAR_SET(pgr4_native_reactive_show, show);
+      // The mask's settings back to their defaults (upscaler.cpp's).
+      if (ImGui::Button("Masque : valeurs par defaut")) {
+        REXCVAR_SET(pgr4_native_reactive_dlss, true);
+        REXCVAR_SET(pgr4_native_reactive_scale, 2.0);
+        REXCVAR_SET(pgr4_native_reactive_max, 0.8);
+        REXCVAR_SET(pgr4_native_reactive_show, false);
+      }
     }
   }
 
-  ImGui::SeparatorText("DLSS Frame Generation");
-  if (!info.fg_available) {
-    ImGui::TextDisabled("Indisponible : pgr4_native_dlss_fg = true au lancement");
-  } else {
-    bool fg = REXCVAR_GET(pgr4_native_dlss_fg);
-    if (ImGui::Checkbox("DLSS-G actif", &fg)) REXCVAR_SET(pgr4_native_dlss_fg, fg);
-    // Local change: Multi Frame Generation's multiplier (an RTX 50's, or an RTX 40 unlocked,
-    // mfg_unlock.h).
-    if (const uint32_t max = std::min(5u, streamline::MaxGeneratedFrames()); max > 1) {
-      static const int kFrames[] = {1, 2, 3, 4, 5};
-      static const char* const kFrameLabels[] = {"x2", "x3", "x4", "x5", "x6"};
-      int32_t frames = int32_t(streamline::GeneratedFrames());
-      if (IntCombo("Multiplicateur", frames, kFrames, kFrameLabels, int(max)))
-        REXCVAR_SET(pgr4_native_dlss_fg_frames, frames);
+  if (kind == 1) {
+    ImGui::SeparatorText("DLSS Frame Generation");
+    if (!info.fg_available) {
+      ImGui::TextDisabled("Indisponible : pgr4_native_dlss_fg = true au lancement");
+    } else {
+      bool fg = REXCVAR_GET(pgr4_native_dlss_fg);
+      if (ImGui::Checkbox("DLSS-G actif", &fg)) REXCVAR_SET(pgr4_native_dlss_fg, fg);
+      // Local change: Multi Frame Generation's multiplier (an RTX 50's, or an RTX 40 unlocked,
+      // mfg_unlock.h).
+      if (const uint32_t max = std::min(5u, streamline::MaxGeneratedFrames()); max > 1) {
+        static const int kFrames[] = {1, 2, 3, 4, 5};
+        static const char* const kFrameLabels[] = {"x2", "x3", "x4", "x5", "x6"};
+        int32_t frames = int32_t(streamline::GeneratedFrames());
+        if (IntCombo("Multiplicateur", frames, kFrames, kFrameLabels, int(max)))
+          REXCVAR_SET(pgr4_native_dlss_fg_frames, frames);
+      }
+      // No 0: saved in the toml, it left frame generation with no motion at all (heavy ghosting;
+      // seen in another project, 14/11/2026).
+      static const int kFactors[] = {1, -1};
+      static const char* const kFactorLabels[] = {"1", "-1 (PGR4)"};
+      int32_t fx = REXCVAR_GET(pgr4_native_dlss_fg_mvec_x),
+              fy = REXCVAR_GET(pgr4_native_dlss_fg_mvec_y);
+      if (IntCombo("Vecteurs X", fx, kFactors, kFactorLabels, 2))
+        REXCVAR_SET(pgr4_native_dlss_fg_mvec_x, fx);
+      if (IntCombo("Vecteurs Y", fy, kFactors, kFactorLabels, 2))
+        REXCVAR_SET(pgr4_native_dlss_fg_mvec_y, fy);
     }
-    if (!dlss_chosen) ImGui::TextDisabled("(seulement avec DLSS comme upscaler)");
-    // No 0: saved in the toml, it left frame generation with no motion at all (heavy ghosting; seen in another
-    // project, 14/11/2026).
-    static const int kFactors[] = {1, -1};
-    static const char* const kFactorLabels[] = {"1", "-1 (PGR4)"};
-    int32_t fx = REXCVAR_GET(pgr4_native_dlss_fg_mvec_x),
-            fy = REXCVAR_GET(pgr4_native_dlss_fg_mvec_y);
-    if (IntCombo("Vecteurs X", fx, kFactors, kFactorLabels, 2))
-      REXCVAR_SET(pgr4_native_dlss_fg_mvec_x, fx);
-    if (IntCombo("Vecteurs Y", fy, kFactors, kFactorLabels, 2))
-      REXCVAR_SET(pgr4_native_dlss_fg_mvec_y, fy);
   }
 
   ImGui::SeparatorText("Rendu");
@@ -766,12 +970,6 @@ Overlay::Actions Overlay::Build(const Info& info) {
       resolution_scale_ != int(info.resolution_scale)) {
     REXCVAR_SET(pgr4_native_resolution_scale, resolution_scale_);
     actions.rebuild_pipeline = true;
-  }
-  static const int kMsaa[] = {1, 2, 4, 8};
-  static const char* const kMsaaLabels[] = {"1x", "2x (jeu)", "4x", "8x"};
-  if (IntCombo("MSAA (sans upscaler)", msaa_, kMsaa, kMsaaLabels, 4)) {
-    REXCVAR_SET(pgr4_native_msaa, msaa_);
-    actions.apply_msaa = true;
   }
   static const int kAniso[] = {1, 2, 4, 8, 16};
   static const char* const kAnisoLabels[] = {"Jeu", "2x", "4x", "8x", "16x"};
@@ -913,20 +1111,72 @@ Overlay::Actions Overlay::Build(const Info& info) {
     tuning("Rayures plus petites (carrosserie)",
            FLAGS_pgr4_native_tune_scratch_paint_scale_storage_(), 0.5f, 4.0f, "%.2f");
     ImGui::SeparatorText("Eau : vagues et reflets");
-    tuning("Force des vagues (0 : jeu d'origine)", FLAGS_pgr4_native_tune_wave_strength_storage_(),
-           0.0f, 1.5f, "%.2f");
-    tuning("Vagues plus creusees", FLAGS_pgr4_native_tune_wave_steepness_storage_(), 0.02f,
-           0.4f, "%.3f");
-    tuning("Part de clapot irregulier", FLAGS_pgr4_native_tune_wave_noise_storage_(), 0.0f, 1.0f,
-           "%.2f");
-    tuning("Taille des vagues (1 : 0,4 a 7 m)", FLAGS_pgr4_native_tune_wave_size_storage_(), 0.1f,
-           2.0f, "%.2f");
-    tuning("Vitesse des vagues", FLAGS_pgr4_native_tune_wave_speed_storage_(), 0.0f, 3.0f,
-           "%.2f");
-    tuning("Direction du vent (radians)", FLAGS_pgr4_native_tune_wind_angle_storage_(), -3.14f,
-           3.14f, "%.2f");
-    tuning("Reflet du decor (0 : ciel seul)", FLAGS_pgr4_native_tune_water_reflect_storage_(),
-           0.0f, 1.0f, "%.2f");
+    // Local change (17/11/2026): the general tuning, or the race's weather's own (WaterTuningFor),
+    // which the sliders then edit.
+    static const char* const kWaterWeathers[kWaterWeathers] = {
+        "degage", "couvert", "brouillard", "pluie", "neige", "verglas", "forte neige",
+        "pluie legere"};
+    const int water_weather = WaterWeather();
+    bool water_own = water_weather >= 0 && WaterHasOwn(water_weather);
+    if (water_weather < 0) {
+      ImGui::TextUnformatted("Meteo : hors course (reglages generaux)");
+    } else {
+      ImGui::Text("Meteo de la course : %s", kWaterWeathers[water_weather]);
+      if (ImGui::Checkbox("Reglages de l'eau propres a cette meteo", &water_own)) {
+        if (water_own) {
+          const WaterTuning t = WaterTuningFor(water_weather);
+          WaterSetOwn(water_weather, &t);
+        } else {
+          WaterSetOwn(water_weather, nullptr);
+        }
+      }
+    }
+    if (water_own) {
+      WaterTuning t = WaterTuningFor(water_weather);
+      bool changed = false;
+      struct Row {
+        const char* label;
+        float WaterTuning::*field;
+        float lo, hi;
+        const char* format;
+      };
+      static const Row kRows[] = {
+          {"Force des vagues, cette meteo", &WaterTuning::wave_strength, 0.0f, 1.5f, "%.2f"},
+          {"Vagues plus creusees, cette meteo", &WaterTuning::wave_steepness, 0.02f, 0.4f, "%.3f"},
+          {"Part de clapot irregulier, cette meteo", &WaterTuning::wave_noise, 0.0f, 1.0f, "%.2f"},
+          {"Taille des vagues, cette meteo", &WaterTuning::wave_size, 0.1f, 2.0f, "%.2f"},
+          {"Vitesse des vagues, cette meteo", &WaterTuning::wave_speed, 0.0f, 3.0f, "%.2f"},
+          {"Direction du vent, cette meteo", &WaterTuning::wind_angle, -3.14f, 3.14f, "%.2f"},
+          {"Reflet du decor, cette meteo", &WaterTuning::water_reflect, 0.0f, 1.0f, "%.2f"},
+          {"Soleil sur les vagues, cette meteo", &WaterTuning::sun_waves, 0.0f, 1.0f, "%.2f"},
+          {"Brouillard sur l'eau, cette meteo", &WaterTuning::haze, 0.0f, 1.0f, "%.2f"},
+      };
+      for (const Row& r : kRows) {
+        double v = double(t.*r.field);
+        tuning(r.label, v, r.lo, r.hi, r.format);
+        if (float(v) != t.*r.field) t.*r.field = float(v), changed = true;
+      }
+      if (changed) WaterSetOwn(water_weather, &t);
+    } else {
+      tuning("Force des vagues (0 : jeu d'origine)", FLAGS_pgr4_native_tune_wave_strength_storage_(),
+             0.0f, 1.5f, "%.2f");
+      tuning("Vagues plus creusees", FLAGS_pgr4_native_tune_wave_steepness_storage_(), 0.02f,
+             0.4f, "%.3f");
+      tuning("Part de clapot irregulier", FLAGS_pgr4_native_tune_wave_noise_storage_(), 0.0f,
+             1.0f, "%.2f");
+      tuning("Taille des vagues (1 : 0,4 a 7 m)", FLAGS_pgr4_native_tune_wave_size_storage_(),
+             0.1f, 2.0f, "%.2f");
+      tuning("Vitesse des vagues", FLAGS_pgr4_native_tune_wave_speed_storage_(), 0.0f, 3.0f,
+             "%.2f");
+      tuning("Direction du vent (radians)", FLAGS_pgr4_native_tune_wind_angle_storage_(), -3.14f,
+             3.14f, "%.2f");
+      tuning("Reflet du decor (0 : ciel seul)", FLAGS_pgr4_native_tune_water_reflect_storage_(),
+             0.0f, 1.0f, "%.2f");
+      tuning("Soleil sur les vagues (0 : eau lisse du jeu)",
+             FLAGS_pgr4_native_tune_water_sun_waves_storage_(), 0.0f, 1.0f, "%.2f");
+      tuning("Brouillard sur l'eau (1 : jeu)", FLAGS_pgr4_native_tune_water_haze_storage_(), 0.0f,
+             1.0f, "%.2f");
+    }
     ImGui::SeparatorText("Eau du port (garage)");
     tuning("Transparence (0 : couleur de l'eau, 1 : jeu)",
            FLAGS_pgr4_native_tune_harbour_clarity_storage_(), 0.0f, 1.0f, "%.2f");

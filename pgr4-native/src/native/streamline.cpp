@@ -51,6 +51,23 @@ REXCVAR_DEFINE_BOOL(pgr4_native_reflex_boost, false, "PGR4 native",
                     "clocks when the frames are light (loading screens, menus), so a race does "
                     "not start at low clocks")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Local diagnostic (17/11/2026, brought over from perf-cpu on 18/11): a folder of Streamline's
+// development DLLs (the SDK's bin/x64/development) loaded instead of the signed production ones
+// beside the executable: the development DLSS-G's debug view (Ctrl+Shift+Insert on and off,
+// Ctrl+Shift+End the next view: depth, motion vectors, their alignment with the color, the dynamic
+// objects; Ctrl+Shift+Home its statistics) and NGX's development DLSS. Not signed by NVIDIA: not
+// checked, and the RTX 40 unlock (mfg_unlock.h, made for the production provider) not applied.
+// Empty: the production DLLs. Never in a release.
+REXCVAR_DEFINE_STRING(pgr4_native_streamline_dev_dir, "", "PGR4 native",
+                      "Development: the folder of Streamline's development DLLs to load instead of "
+                      "the production ones (DLSS-G's debug view)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// With them, sl.imgui too. Off (17/11/2026: with it the GPU was removed at the 60th frame's
+// Present, in the menus; without it, no crash): the development DLSS-G alone.
+REXCVAR_DEFINE_BOOL(pgr4_native_streamline_dev_imgui, false, "PGR4 native",
+                    "Development: with pgr4_native_streamline_dev_dir, load sl.imgui too (it "
+                    "removed the GPU on 17/11/2026)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(pgr4_native_dlss_fg_debug_generated_only, false, "PGR4 native",
                     "DLSS-G debug: show only the generated frames (DLSSGFlags::"
                     "eShowOnlyInterpolatedFrame)")
@@ -126,12 +143,17 @@ const Api& api() { return g.api; }
 bool Init() {
   if (g.tried) return g.active;
   g.tried = true;
-  const std::filesystem::path dll = ExeDir() / L"sl.interposer.dll";
+  const std::string dev_dir = REXCVAR_GET(pgr4_native_streamline_dev_dir);
+  const std::filesystem::path dir = dev_dir.empty() ? ExeDir() : std::filesystem::path(dev_dir);
+  const std::filesystem::path dll = dir / L"sl.interposer.dll";
   if (!std::filesystem::exists(dll)) {
-    REXLOG_ERROR("PGR4 native DLSS: no {} beside the executable", dll.string());
+    REXLOG_ERROR("PGR4 native DLSS: no {}", dll.string());
     return false;
   }
-  if (!sl::security::verifyEmbeddedSignature(dll.c_str())) {
+  if (!dev_dir.empty()) {
+    REXLOG_WARN("PGR4 native DLSS: Streamline's development DLLs from {} (unsigned)",
+                dir.string());
+  } else if (!sl::security::verifyEmbeddedSignature(dll.c_str())) {
     REXLOG_ERROR("PGR4 native DLSS: {} is not signed by NVIDIA; not loaded", dll.string());
     return false;
   }
@@ -158,16 +180,32 @@ bool Init() {
   static const sl::Feature features_sr[] = {sl::kFeatureDLSS};
   static const sl::Feature features_fg[] = {sl::kFeatureDLSS, sl::kFeatureDLSS_G,
                                             sl::kFeatureReflex};
+  // The development DLLs with pgr4_native_streamline_dev_imgui: sl.imgui too.
+  static const sl::Feature features_dev[] = {sl::kFeatureDLSS, sl::kFeatureDLSS_G,
+                                             sl::kFeatureReflex, sl::kFeatureImGUI};
   // DLSS-G and Reflex always load (local change): --pgr4_native_dlss_fg only switches the
   // generation, live (the game's Graphics page), which needs them loaded from the start.
   const bool want_fg = true;
-  const sl::Feature* features = want_fg ? features_fg : features_sr;
+  const bool dev = !dev_dir.empty();
+  const bool imgui = dev && REXCVAR_GET(pgr4_native_streamline_dev_imgui);
+  const sl::Feature* features = imgui ? features_dev : want_fg ? features_fg : features_sr;
   sl::Preferences pref;
   pref.showConsole = false;
   pref.logLevel = sl::LogLevel::eDefault;
   pref.logMessageCallback = LogMessage;
   pref.featuresToLoad = features;
-  pref.numFeaturesToLoad = want_fg ? uint32_t(std::size(features_fg)) : uint32_t(std::size(features_sr));
+  pref.numFeaturesToLoad = imgui     ? uint32_t(std::size(features_dev))
+                           : want_fg ? uint32_t(std::size(features_fg))
+                                     : uint32_t(std::size(features_sr));
+  // The plugins (and the NGX providers) from the development folder.
+  static std::wstring plugin_dir;
+  static const wchar_t* plugin_paths[1] = {};
+  if (dev) {
+    plugin_dir = dir.wstring();
+    plugin_paths[0] = plugin_dir.c_str();
+    pref.pathsToPlugins = plugin_paths;
+    pref.numPathsToPlugins = 1;
+  }
   // Manual hooking: only the interfaces Upgrade gets are Streamline's (the Xenos plugin's device
   // and the process's other DXGI objects stay untouched). No over-the-air updates: only the
   // signed DLLs shipped beside the executable run.
@@ -189,8 +227,9 @@ bool Init() {
 
 bool SetDevice(ID3D12Device* device) {
   if (!g.active) return false;
-  // Before slSetD3DDevice, where sl.dlss_g's startup reads the provider's maximum.
-  mfg_unlock::Apply(device);
+  // Before slSetD3DDevice, where sl.dlss_g's startup reads the provider's maximum. Not over the
+  // development DLLs (pgr4_native_streamline_dev_dir): made for the production provider.
+  if (REXCVAR_GET(pgr4_native_streamline_dev_dir).empty()) mfg_unlock::Apply(device);
   if (const sl::Result r = g.set_d3d_device(device); r != sl::Result::eOk) {
     REXLOG_ERROR("PGR4 native DLSS: slSetD3DDevice failed ({})", int(r));
     Shutdown();

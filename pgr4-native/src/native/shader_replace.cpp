@@ -12,7 +12,10 @@
 #include <rex/logging.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -20,6 +23,26 @@
 REXCVAR_DEFINE_BOOL(pgr4_native_shader_replace, true, "PGR4 native",
                     "Replace the game's pixel shaders that have an HLSL file in "
                     "pgr4_native_shader_replace_dir");
+// Local change (18/11/2026, Tazz): the water's tuning for the race's weather from the race's load, not
+// from its first screen (3-2-1-Go, with the intro's camera already drawn), and a weather's change
+// compiled at once (the wait is for a slider being dragged): the water no longer changes in the intro.
+REXCVAR_DEFINE_BOOL(pgr4_native_water_weather_at_load, true, "PGR4 native",
+                    "The water's tuning for the race's weather from the race's load, compiled at once");
+// Local change (18/11/2026, Tazz: "je change des valeurs et des fois il ne se passe rien"): a
+// shader still compiling when a tuning changed was skipped, its code kept the values read when its
+// compile started (Compile), until the next change.
+// Local change (18/11/2026, Tazz): the water's tuning given to its draws each frame instead of
+// compiled in (a slider at once, no compile that comes late or is lost), and its waves' clock run
+// here: their speed or size changed without the waves jumping (water_hooks.hlsli PGR4_WATER_LIVE).
+REXCVAR_DEFINE_BOOL(pgr4_native_water_live, true, "PGR4 native",
+                    "The water's tuning given to its shaders each frame, its waves' clock run by the "
+                    "renderer (a slider applied at once, the speed without a jump)");
+REXCVAR_DEFINE_BOOL(pgr4_native_tune_requeue_pending, true, "PGR4 native",
+                    "A shader compiling when a tuning changes compiled again once done (else it "
+                    "keeps the values from before the change)");
+REXCVAR_DEFINE_BOOL(pgr4_native_replace_alpha_test, true, "PGR4 native",
+                    "Our replaced shaders do the game's alpha test (their cut-out parts not "
+                    "written), as the translator does");
 REXCVAR_DEFINE_BOOL(pgr4_native_decal_light_off, false, "PGR4 native",
                     "The painted lines' and start line's baked area light left out (it vibrated "
                     "on them in motion): the scenery shader's decals only");
@@ -113,6 +136,48 @@ REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_wave_size, 0.1, "PGR4 native",
                       "The water's waves' and patches' size, 1 the 0.4 to 7 m waves (kWaveSize)");
 REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_water_reflect, 1.0, "PGR4 native",
                       "The scenery's reflection on the water, 0 the game's sky alone (kWaterReflect)");
+// Local change (17/11/2026): the sun's reflection on the fine waves (water_hooks.hlsli kSunWaves).
+REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_water_sun_waves, 1.0, "PGR4 native",
+                      "The sun's reflection on the water's fine waves, 0 on the game's smooth water "
+                      "(its soft spot; the rest keeps the waves), 1 on the waves (kSunWaves)")
+    .range(0.0, 1.0);
+// Local change (17/11/2026, Tazz: the water and its reflections hidden in heavy fog): the game's
+// fog over the water times this (water_hooks.hlsli kWaterFog).
+REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_water_haze, 1.0, "PGR4 native",
+                      "The game's fog over the water times this, 1 the game's (kWaterFog)")
+    .range(0.0, 1.0);
+// Local change (17/11/2026, Tazz): the water's tuning per weather, over the above (WaterTuningFor).
+// In heavy fog the game still lights its water with the sun (c6, c7), a soft spot on its smooth
+// water, which the fine waves broke into glitter all over it; fog comes with calm air.
+REXCVAR_DEFINE_STRING(pgr4_native_tune_water_clear, "", "PGR4 native",
+                      "The water in clear weather: \"key=value ...\" over its general tuning (keys "
+                      "wave_strength, wave_steepness, wave_noise, wave_size, wave_speed, "
+                      "wind_angle, water_reflect, sun_waves, haze); empty: the general one");
+REXCVAR_DEFINE_STRING(pgr4_native_tune_water_overcast, "", "PGR4 native",
+                      "The water when overcast (as --pgr4_native_tune_water_clear)");
+// Fog: Light Fog, Heavy Fog and Foggy F1 alike (the game's weather kind 2, src/pgr4_autopilot.cpp).
+REXCVAR_DEFINE_STRING(pgr4_native_tune_water_fog, "sun_waves=0 haze=0.4", "PGR4 native",
+                      "The water in fog (as --pgr4_native_tune_water_clear; by default Tazz's "
+                      "tuning of 17/11/2026: the sun on the game's smooth water, no glitter, and "
+                      "0.4 of the game's fog over the water, which shows it and its reflections)");
+// Rain: every rain of the game's weather kind 3 (Light Rain, Heavy Rain, Storm, their blends, Wet).
+REXCVAR_DEFINE_STRING(pgr4_native_tune_water_rain,
+                      "wave_strength=1.5 wave_steepness=0.193 wave_size=0.75 wave_speed=1.51 "
+                      "wind_angle=-1.68 sun_waves=0 haze=0.4",
+                      "PGR4 native",
+                      "The water in rain (as --pgr4_native_tune_water_clear; by default Tazz's "
+                      "tuning of 17/11/2026, in a storm at St Petersburg)");
+// Local change (17/11/2026, Tazz): light rain apart (a weather name with "Light Rain"), the rain's
+// tuning while empty.
+REXCVAR_DEFINE_STRING(pgr4_native_tune_water_light_rain, "", "PGR4 native",
+                      "The water in light rain (as --pgr4_native_tune_water_clear; empty: the "
+                      "rain's, --pgr4_native_tune_water_rain)");
+REXCVAR_DEFINE_STRING(pgr4_native_tune_water_snow, "", "PGR4 native",
+                      "The water in snow (as --pgr4_native_tune_water_clear)");
+REXCVAR_DEFINE_STRING(pgr4_native_tune_water_icy, "", "PGR4 native",
+                      "The water on ice (as --pgr4_native_tune_water_clear)");
+REXCVAR_DEFINE_STRING(pgr4_native_tune_water_heavy_snow, "", "PGR4 native",
+                      "The water in heavy snow (as --pgr4_native_tune_water_clear)");
 REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_harbour_clarity, 0.0, "PGR4 native",
                       "The garage harbour's water: the scene seen through it, 0 its own color "
                       "alone, 1 the game's (441604EE7597C1D1 kHarbourClarity)");
@@ -125,7 +190,126 @@ REXCVAR_DEFINE_STRING(pgr4_native_shader_replace_dir, "shaders", "PGR4 native",
                       "Folder of replacement pixel shaders (<ucode hash>.ps.hlsl), beside the "
                       "executable");
 
+extern int g_pgr4_weather_kind;  // draw.cpp: the race's weather, -1 unknown, 0 clear .. 6
+extern bool g_pgr4_race_screen;  // draw.cpp: a race's, the garage's, a replay's or photo screen
+extern bool g_pgr4_light_rain;   // draw.cpp: the race's weather's name has "Light Rain"
+extern bool g_pgr4_race_loaded;  // draw.cpp: the race's weather read, no screen loaded since
+
 namespace pgr4::native {
+
+namespace {
+std::string WaterWeatherSetting(int weather) {
+  switch (weather) {
+    case 0: return REXCVAR_GET(pgr4_native_tune_water_clear);
+    case 1: return REXCVAR_GET(pgr4_native_tune_water_overcast);
+    case 2: return REXCVAR_GET(pgr4_native_tune_water_fog);
+    case 3: return REXCVAR_GET(pgr4_native_tune_water_rain);
+    case 4: return REXCVAR_GET(pgr4_native_tune_water_snow);
+    case 5: return REXCVAR_GET(pgr4_native_tune_water_icy);
+    case 6: return REXCVAR_GET(pgr4_native_tune_water_heavy_snow);
+    case 7: return REXCVAR_GET(pgr4_native_tune_water_light_rain);
+    default: return {};
+  }
+}
+void WaterSetWeatherSetting(int weather, const std::string& v) {
+  switch (weather) {
+    case 0: REXCVAR_SET(pgr4_native_tune_water_clear, v); break;
+    case 1: REXCVAR_SET(pgr4_native_tune_water_overcast, v); break;
+    case 2: REXCVAR_SET(pgr4_native_tune_water_fog, v); break;
+    case 3: REXCVAR_SET(pgr4_native_tune_water_rain, v); break;
+    case 4: REXCVAR_SET(pgr4_native_tune_water_snow, v); break;
+    case 5: REXCVAR_SET(pgr4_native_tune_water_icy, v); break;
+    case 6: REXCVAR_SET(pgr4_native_tune_water_heavy_snow, v); break;
+    case 7: REXCVAR_SET(pgr4_native_tune_water_light_rain, v); break;
+    default: break;
+  }
+}
+// The tuning's fields by their keys.
+struct WaterKey {
+  const char* name;
+  float WaterTuning::*field;
+};
+constexpr WaterKey kWaterKeys[] = {
+    {"wave_strength", &WaterTuning::wave_strength}, {"wave_steepness", &WaterTuning::wave_steepness},
+    {"wave_noise", &WaterTuning::wave_noise},       {"wave_size", &WaterTuning::wave_size},
+    {"wave_speed", &WaterTuning::wave_speed},       {"wind_angle", &WaterTuning::wind_angle},
+    {"water_reflect", &WaterTuning::water_reflect}, {"sun_waves", &WaterTuning::sun_waves},
+    {"haze", &WaterTuning::haze},
+};
+}  // namespace
+
+int WaterWeather() {
+  const bool race = g_pgr4_race_screen ||
+                    (REXCVAR_GET(pgr4_native_water_weather_at_load) && g_pgr4_race_loaded);
+  if (!race || g_pgr4_weather_kind < 0 || g_pgr4_weather_kind > 6) return -1;
+  return g_pgr4_weather_kind == 3 && g_pgr4_light_rain ? 7 : g_pgr4_weather_kind;
+}
+
+WaterTuning WaterGeneralTuning() {
+  return {float(REXCVAR_GET(pgr4_native_tune_wave_strength)),
+          float(REXCVAR_GET(pgr4_native_tune_wave_steepness)),
+          float(REXCVAR_GET(pgr4_native_tune_wave_noise)),
+          float(REXCVAR_GET(pgr4_native_tune_wave_size)),
+          float(REXCVAR_GET(pgr4_native_tune_wave_speed)),
+          float(REXCVAR_GET(pgr4_native_tune_wind_angle)),
+          float(REXCVAR_GET(pgr4_native_tune_water_reflect)),
+          float(REXCVAR_GET(pgr4_native_tune_water_sun_waves)),
+          float(REXCVAR_GET(pgr4_native_tune_water_haze))};
+}
+
+void WaterSetGeneral(const WaterTuning& t) {
+  REXCVAR_SET(pgr4_native_tune_wave_strength, double(t.wave_strength));
+  REXCVAR_SET(pgr4_native_tune_wave_steepness, double(t.wave_steepness));
+  REXCVAR_SET(pgr4_native_tune_wave_noise, double(t.wave_noise));
+  REXCVAR_SET(pgr4_native_tune_wave_size, double(t.wave_size));
+  REXCVAR_SET(pgr4_native_tune_wave_speed, double(t.wave_speed));
+  REXCVAR_SET(pgr4_native_tune_wind_angle, double(t.wind_angle));
+  REXCVAR_SET(pgr4_native_tune_water_reflect, double(t.water_reflect));
+  REXCVAR_SET(pgr4_native_tune_water_sun_waves, double(t.sun_waves));
+  REXCVAR_SET(pgr4_native_tune_water_haze, double(t.haze));
+}
+
+WaterTuning WaterTuningFor(int weather) {
+  WaterTuning t = WaterGeneralTuning();
+  std::string s = WaterWeatherSetting(weather);
+  if (weather == 7 && s.empty()) s = WaterWeatherSetting(3);  // light rain: the rain's
+  // "key=value" pairs, separated by spaces, commas or semicolons; unknown keys are skipped.
+  size_t i = 0;
+  while (i < s.size()) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == ',' || s[i] == ';')) ++i;
+    const size_t end = s.find_first_of(" ,;", i);
+    const std::string token = s.substr(i, end == std::string::npos ? std::string::npos : end - i);
+    i = end == std::string::npos ? s.size() : end;
+    const size_t eq = token.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string key = token.substr(0, eq);
+    for (const WaterKey& k : kWaterKeys)
+      if (key == k.name) t.*k.field = std::strtof(token.c_str() + eq + 1, nullptr);
+  }
+  return t;
+}
+
+bool WaterHasOwn(int weather) { return !WaterWeatherSetting(weather).empty(); }
+
+void WaterSetOwn(int weather, const WaterTuning* t) {
+  if (!t) return WaterSetWeatherSetting(weather, {});
+  // Only what differs from the general tuning.
+  const WaterTuning g = WaterGeneralTuning();
+  std::string s;
+  for (const WaterKey& k : kWaterKeys) {
+    if (std::abs(t->*k.field - g.*k.field) < 1e-4f) continue;
+    char v[32];
+    std::snprintf(v, sizeof(v), "%g", double(t->*k.field));
+    s += (s.empty() ? "" : " ") + std::string(k.name) + "=" + v;
+  }
+  // All alike: still its own (the check box stays), its strength written.
+  if (s.empty()) {
+    char v[32];
+    std::snprintf(v, sizeof(v), "%g", double(t->wave_strength));
+    s = std::string("wave_strength=") + v;
+  }
+  WaterSetWeatherSetting(weather, s);
+}
 
 // Local change (pgr4 project): the overlay's "the game without our changes" (renderer.cpp).
 bool OriginalLook();
@@ -137,6 +321,11 @@ namespace {
 
 // The hooks' tunings as #defines (the pgr4_native_tune_* cvars).
 std::string ShaderTuningDefines() {
+  // The water's: the race's weather's (local change, 17/11/2026). Live (pgr4_native_water_live,
+  // 18/11/2026): taken from the draw's constants (draw.cpp), none compiled in, so that no slider
+  // nor weather recompiles the water.
+  const bool live = REXCVAR_GET(pgr4_native_water_live);
+  const WaterTuning water = live ? WaterTuning{} : WaterTuningFor(WaterWeather());
   char text[2560];
   std::snprintf(text, sizeof(text),
                 "#define PGR4_TUNE_kRoadNormal %.6f\n#define PGR4_TUNE_kSunGlint %.6f\n"
@@ -158,7 +347,8 @@ std::string ShaderTuningDefines() {
                 "#define PGR4_TUNE_kWaveSpeed %.6f\n#define PGR4_TUNE_kWaterReflect %.6f\n"
                 "#define PGR4_TUNE_kWaveSize %.6f\n#define PGR4_TUNE_kHighlights %.6f\n"
                 "#define PGR4_TUNE_kBloom %.6f\n#define PGR4_TUNE_kHarbourClarity %.6f\n"
-                "#define PGR4_TUNE_kWaterDistort %.6f\n#define PGR4_TUNE_kHarbourWaves %.6f\n",
+                "#define PGR4_TUNE_kWaterDistort %.6f\n#define PGR4_TUNE_kHarbourWaves %.6f\n"
+                "#define PGR4_TUNE_kSunWaves %.6f\n#define PGR4_TUNE_kWaterFog %.6f\n",
                 REXCVAR_GET(pgr4_native_tune_road_relief), REXCVAR_GET(pgr4_native_tune_sun_glint),
                 REXCVAR_GET(pgr4_native_tune_sun_sharpness), REXCVAR_GET(pgr4_native_tune_rim),
                 REXCVAR_GET(pgr4_native_tune_glass_reflect), REXCVAR_GET(pgr4_native_tune_glass_sky),
@@ -179,15 +369,16 @@ std::string ShaderTuningDefines() {
                 REXCVAR_GET(pgr4_native_tune_road_grain_light),
                 REXCVAR_GET(pgr4_native_tune_road_puddles_light),
                 REXCVAR_GET(pgr4_native_tune_road_sheen_light),
-                REXCVAR_GET(pgr4_native_tune_wave_strength), REXCVAR_GET(pgr4_native_tune_wave_steepness),
-                REXCVAR_GET(pgr4_native_tune_wave_noise), REXCVAR_GET(pgr4_native_tune_wind_angle),
-                REXCVAR_GET(pgr4_native_tune_wave_speed), REXCVAR_GET(pgr4_native_tune_water_reflect),
-                REXCVAR_GET(pgr4_native_tune_wave_size), REXCVAR_GET(pgr4_native_tune_highlights),
+                double(water.wave_strength), double(water.wave_steepness),
+                double(water.wave_noise), double(water.wind_angle),
+                double(water.wave_speed), double(water.water_reflect),
+                double(water.wave_size), REXCVAR_GET(pgr4_native_tune_highlights),
                 REXCVAR_GET(pgr4_native_tune_bloom),
                 REXCVAR_GET(pgr4_native_tune_harbour_clarity),
                 REXCVAR_GET(pgr4_native_tune_harbour_distort),
-                REXCVAR_GET(pgr4_native_tune_harbour_waves));
-  return text;
+                REXCVAR_GET(pgr4_native_tune_harbour_waves), double(water.sun_waves),
+                double(water.haze));
+  return live ? std::string(text) + "#define PGR4_WATER_LIVE 1\n" : std::string(text);
 }
 
 std::filesystem::path BesideExe(const std::string& dir) {
@@ -284,8 +475,10 @@ bool MakePrelude(const DxbcShader::Translation& translation, std::string* prelud
        "  float4 pgr4_wiper_blade;\n"
        "  uint4 pgr4_wiper_mask;\n"
        "  float4 pgr4_shelter;\n"
-       "  float4 pgr4_dirt;\n"
-       "};\n";
+       "  float4 pgr4_dirt;\n";
+  // Only then, so that the other shaders' text (and their cache) stays the same without it.
+  if (REXCVAR_GET(pgr4_native_water_live)) p << "  float4 pgr4_water[6];\n";
+  p << "};\n";
   const auto& map = shader.constant_register_map();
   const uint32_t floats = map.float_dynamic_addressing ? 256 : std::max(1u, map.float_count);
   p << "cbuffer xe_float_cbuffer : register(b1) { float4 xe_float_constants[" << floats
@@ -405,18 +598,52 @@ bool MakePrelude(const DxbcShader::Translation& translation, std::string* prelud
       << " : SV_Target" << e.semantic_index << ";\n";
   }
   if (!color) return false;
-  // Early depth as the translator declares it, without coverage output.
-  m << "};\n" << (coverage ? "" : "[earlydepthstencil]\n")
+  // Local change (19/11/2026, Tazz: « regarde autour des motos y'a comme un flou bizarre »): the
+  // game's alpha test, as the translator does it (dxbc_translator_om.cpp, CompletePixelShader: on
+  // the color's alpha before the exponent bias, discarded when it fails; not equal true for NaN).
+  // Without it, the replaced draws cut out by their alpha (the bikes' blurred wheels' quads, parts
+  // of the riders, the lamps' covers) wrote their whole quads: their alpha 0 there, which the
+  // game's motion blur takes for a vehicle (not blurred: a sharp zone around the bikes), and their
+  // depth. Only in the variants the translator gives no early depth (depth_stencil_mode: alpha test
+  // or alpha to mask possible, ShaderModification in shader_translate.cpp), which then lose the
+  // forced early depth too; the other variants' text (and cache) stays the same. Read when the
+  // shaders are made.
+  using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
+  const bool early = DxbcShaderTranslator::Modification(translation.modification())
+                         .pixel.depth_stencil_mode == DepthStencilMode::kEarlyHint;
+  const bool alpha_test = !early && REXCVAR_GET(pgr4_native_replace_alpha_test);
+  m << "};\n" << (coverage || alpha_test ? "" : "[earlydepthstencil]\n")
     << "XeOutput main(XeInput i) {\n"
        "  XeOutput o;\n"
-       "  o.o0 = Shade(i) * xe_color_exp_bias.x;\n";
+       "  const float4 xe_color = Shade(i);\n";
+  if (alpha_test) {
+    constexpr uint32_t ref = offsetof(DxbcShaderTranslator::SystemConstants, alpha_test_reference);
+    static_assert(ref < 240 && ref % 4 == 0);
+    m << "  const uint xe_alpha_func = (xe_system_head[0].x >> "
+      << uint32_t(DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift) << "u) & 7u;\n"
+      << "  if (xe_alpha_func != 7u) {\n"
+      << "    const float xe_alpha_ref = asfloat(xe_system_head[" << ref / 16 << "]."
+      << "xyzw"[(ref % 16) / 4] << ");\n"
+      << "    const bool xe_alpha_pass = xe_alpha_func == 5u\n"
+         "        ? xe_color.a != xe_alpha_ref\n"
+         "        : ((xe_alpha_func & 1u) != 0u && xe_color.a < xe_alpha_ref) ||\n"
+         "          ((xe_alpha_func & 2u) != 0u && xe_color.a == xe_alpha_ref) ||\n"
+         "          ((xe_alpha_func & 4u) != 0u && xe_color.a > xe_alpha_ref);\n"
+         "    if (!xe_alpha_pass) discard;\n"
+         "  }\n";
+  }
+  m << "  o.o0 = xe_color * xe_color_exp_bias.x;\n";
   if (coverage) m << "  o.xe_coverage = 0xFFFFFFFFu;\n";
+  // Local change (16/11/2026): as the translator writes them (dxbc_translator_om.cpp): none for a
+  // point behind the camera in the previous frame (w at most 0: an infinite or NaN motion, black
+  // blocks in DLSS Frame Generation's frames), any other at most one screen per frame.
   if (motion)
     m << "  float2 xe_now = i.xe_motion0.xy / i.xe_motion0.w;\n"
          "  float2 xe_before = i.xe_motion1.xy / i.xe_motion1.w;\n"
          "  o.o"
       << DxbcShaderTranslator::kMotionVectorRenderTarget
-      << " = (xe_before - xe_now) * float2(0.5, -0.5);\n";
+      << " = i.xe_motion1.w >= 1.0 / 1024.0\n"
+         "      ? clamp((xe_before - xe_now) * float2(0.5, -0.5), -1.0, 1.0) : float2(0.0, 0.0);\n";
   m << "  return o;\n}\n";
   *main = m.str();
   return true;
@@ -508,13 +735,23 @@ void ShaderReplacer::Poll() {
   // A tuning changed (once it held kTuningFrames: a slider being dragged is not compiled at each
   // step): the replaced shaders whose hooks read it compiled again in the background, each one
   // drawn with its current code until its new one is ready (not the game's: no flicker).
-  if (std::string tuning = TuningDefines(); tuning != tuning_) {
-    if (tuning_.empty()) {
-      tuning_ = std::move(tuning);
-    } else if (tuning != tuning_wanted_) {
+  // A weather's change (WaterWeather) is not a slider: compiled at once (pgr4_native_water_weather_at_load).
+  const int weather = WaterWeather();
+  if (std::string tuning = TuningDefines(); tuning == tuning_) {
+    tuning_weather_ = weather;
+  } else if (tuning_.empty()) {
+    tuning_ = std::move(tuning);
+    tuning_weather_ = weather;
+  } else {
+    const bool weather_changed =
+        REXCVAR_GET(pgr4_native_water_weather_at_load) && weather != tuning_weather_;
+    const bool fresh = tuning != tuning_wanted_;
+    if (fresh) {
       tuning_wanted_ = std::move(tuning);
       tuning_frames_ = 0;
-    } else if (++tuning_frames_ >= kTuningFrames) {
+    }
+    if (weather_changed || (!fresh && ++tuning_frames_ >= kTuningFrames)) {
+      tuning_weather_ = weather;
       // Which hooks the change concerns, by the #defines that differ.
       const auto value = [](const std::string& s, const char* name) {
         const size_t at = s.find(name);
@@ -536,7 +773,8 @@ void ShaderReplacer::Poll() {
       bool water = false;  // the water (water_hooks.hlsli)
       for (const char* name : {"kWaveStrength ", "kWaveSteepness ", "kNoiseShare ", "kWindAngle ",
                                "kWaveSpeed ", "kWaterReflect ", "kWaveSize ",
-                               "kHarbourClarity ", "kWaterDistort ", "kHarbourWaves "})
+                               "kHarbourClarity ", "kWaterDistort ", "kHarbourWaves ",
+                               "kSunWaves ", "kWaterFog ", "PGR4_WATER_LIVE "})
         water |= value(tuning_wanted_, name) != value(tuning_, name);
       // The final composition's highlights (highlights_hooks.hlsli).
       const bool highlights =
@@ -544,7 +782,11 @@ void ShaderReplacer::Poll() {
           value(tuning_wanted_, "kBloom ") != value(tuning_, "kBloom ");
       std::lock_guard<std::mutex> lock(mutex_);
       tuning_ = tuning_wanted_;
-      uint32_t queued = 0;
+      uint32_t queued = 0, stale = 0;
+      // A shader compiling now may have read the tunings before this change (Compile reads them
+      // when it starts): compiled again once done (pgr4_native_tune_requeue_pending).
+      if (REXCVAR_GET(pgr4_native_tune_requeue_pending))
+        for (const void* key : pending_) stale += stale_.insert(key).second;
       for (auto& [key, code] : compiled_) {
         if (!code || code->empty() || pending_.count(key)) continue;
         const auto* translation = static_cast<const DxbcShader::Translation*>(key);
@@ -570,7 +812,9 @@ void ShaderReplacer::Poll() {
           for (int k = 0; k < 2; ++k) workers_.emplace_back([this] { Work(); });
         jobs_cv_.notify_all();
       }
-      REXLOG_INFO("PGR4 native shaders: tunings changed, {} shaders compiled again", queued);
+      REXLOG_INFO("PGR4 native shaders: tunings changed, {} shaders compiled again, {} compiling "
+                  "again once done (water weather {}{})",
+                  queued, stale, weather, weather_changed ? ", at once" : "");
       return;
     }
   }
@@ -659,6 +903,7 @@ void ShaderReplacer::Work() {
     auto code = std::make_unique<std::vector<uint8_t>>(Compile(*job.translation, job.hash));
     std::lock_guard<std::mutex> lock(mutex_);
     pending_.erase(job.translation);
+    const bool stale = stale_.erase(job.translation) > 0;  // a tuning changed while it compiled
     if (job.epoch != files_epoch_) continue;  // reloaded meanwhile: compiled again on demand
     auto& slot = compiled_[job.translation];
     if (!slot) {
@@ -672,6 +917,13 @@ void ShaderReplacer::Work() {
     // waiting for it (draw.cpp: Pipeline::awaiting_hlsl); counting up here at each one remade
     // every replaced shader's pipelines hundreds of times while a hooks file compiled.
     if (job.replace) generation_.fetch_add(1, std::memory_order_acq_rel);
+    // Its code made with the tunings before the last change: compiled again with the current ones.
+    if (stale && pending_.insert(job.translation).second) {
+      jobs_.push_back({job.translation, job.hash, files_epoch_, true});
+      jobs_cv_.notify_one();
+      REXLOG_INFO("PGR4 native shaders: {:016X} compiled again (a tuning changed while it compiled)",
+                  job.hash);
+    }
   }
 }
 

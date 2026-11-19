@@ -35,6 +35,35 @@
 #ifndef PGR4_TUNE_kWaveSize
 #define PGR4_TUNE_kWaveSize 0.1
 #endif
+#ifndef PGR4_TUNE_kSunWaves
+#define PGR4_TUNE_kSunWaves 1.0
+#endif
+#ifndef PGR4_TUNE_kWaterFog
+#define PGR4_TUNE_kWaterFog 1.0
+#endif
+// Local change (17/11/2026, Tazz: in heavy fog the water and its reflections hardly showed): the
+// game's fog over the water (its distance and height fog, the same as the scenery's: c10.w, c11)
+// times this, 1 the game's; tools/water_patch.py scales its amount, before its exp2, by it.
+// Local change (18/11/2026, Tazz: a slider's change came seconds later, or not at all, and the
+// waves' speed made them jump): PGR4_WATER_LIVE (pgr4_native_water_live), the tuning read from the
+// draw's constants (pgr4_water, draw.cpp: the race's weather's, each frame) instead of compiled in,
+// and the waves' clock run by the renderer: each wave's phase and the noise's drift advanced by the
+// frame's time times the speed (no jump when the speed or the size changes, whatever the frame rate).
+//   pgr4_water[0]: strength, steepness, noise share, size; [1]: wind angle, reflection, sun on the
+//   waves, fog; [2], [3]: the eight waves' phases (radians); [4]: the two noise layers' drift.
+#ifndef PGR4_WATER_LIVE
+#define PGR4_WATER_LIVE 0
+#endif
+#if PGR4_WATER_LIVE
+#define kWaterFog (pgr4_water[1].w)
+#define kWaveStrength (pgr4_water[0].x)
+#define kWaveSteepness (pgr4_water[0].y)
+#define kNoiseShare (pgr4_water[0].z)
+#define kWindAngle (pgr4_water[1].x)
+#define kWaterReflect (pgr4_water[1].y)
+#define kWaveSize (pgr4_water[0].w)
+#else
+static const float kWaterFog = PGR4_TUNE_kWaterFog;
 static const float kWaveStrength = PGR4_TUNE_kWaveStrength;  // the detail's slope in the height map's units (0: the game's)
 static const float kWaveSteepness = PGR4_TUNE_kWaveSteepness;  // the waves' slope: larger is choppier
 static const float kNoiseShare = PGR4_TUNE_kNoiseShare;    // the moving noise's part, against the regular waves
@@ -42,6 +71,22 @@ static const float kWindAngle = PGR4_TUNE_kWindAngle;      // the wind's directi
 static const float kWaveSpeed = PGR4_TUNE_kWaveSpeed;      // the waves' time runs this much faster
 static const float kWaterReflect = PGR4_TUNE_kWaterReflect;  // the scenery's reflection (0: the game's sky alone)
 static const float kWaveSize = PGR4_TUNE_kWaveSize;  // the waves' and patches' size (1: 0.4 to 7 m)
+#endif
+// Local change (17/11/2026, Tazz: the water glittered in heavy fog): the sun's reflection on the
+// fine waves, 1 as before, 0 on the game's smooth water (its soft spot), the rest of the water
+// keeping the waves. In fog the game still lights its water with the sun (c6, c7), which the waves
+// broke into glitter. The patched shader's Shade (tools/water_patch.py) shades its body,
+// XeWaterShade, once at 1; below, also with the sun's light (c7) times xe_sun and the waves times
+// xe_waves: the output is affine in c7, so what the sun adds on either water is the body with it
+// less the body without it.
+#if PGR4_WATER_LIVE
+#define kSunWaves (pgr4_water[1].z)
+#else
+static const float kSunWaves = PGR4_TUNE_kSunWaves;
+#endif
+static float xe_sun = 1.0;    // the sun's light (c7) times this in the body being shaded
+static float xe_waves = 1.0;  // the fine waves times this
+static bool xe_scene = true;  // the scenery's reflection traced (it cancels out of the sun's part)
 
 static float2 xe_wave_slope = 0.0;   // the detail's slope at the pixel (height map units per uv)
 static float2 xe_wave_centre = 0.0;  // the pixel's height map coordinates
@@ -56,8 +101,17 @@ float2 XeNoiseGrad(float2 p) {
   float2 i = floor(p), f = frac(p);
   float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
   float2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+#if PGR4_WATER_LIVE
+  // Repeating every 1024 cells: the drift, wrapped as often (draw.cpp), moves on without a jump.
+  const float2 i1 = i + 1.0;
+  i -= 1024.0 * floor(i / 1024.0);
+  const float2 j = i1 - 1024.0 * floor(i1 / 1024.0);
+  float2 ga = XeHash2(i), gb = XeHash2(float2(j.x, i.y));
+  float2 gc = XeHash2(float2(i.x, j.y)), gd = XeHash2(j);
+#else
   float2 ga = XeHash2(i), gb = XeHash2(i + float2(1, 0));
   float2 gc = XeHash2(i + float2(0, 1)), gd = XeHash2(i + float2(1, 1));
+#endif
   float va = dot(ga, f), vb = dot(gb, f - float2(1, 0));
   float vc = dot(gc, f - float2(0, 1)), vd = dot(gd, f - float2(1, 1));
   return ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd) +
@@ -76,7 +130,11 @@ float2 XeWaveSlope(float2 w, float t, float footprint) {
     float wavenumber = 6.2832 / length;
     float speed = sqrt(9.81 / wavenumber);
     float fade = saturate(length / (4.0 * footprint) - 1.0);
+#if PGR4_WATER_LIVE
+    float phase = wavenumber * dot(d, w) - pgr4_water[2 + (k >> 2)][k & 3] + k * 1.7;
+#else
     float phase = wavenumber * (dot(d, w) - speed * t) + k * 1.7;
+#endif
     // A slope of kWaveSteepness at the crests, so the same steepness at every size.
     slope += d * cos(phase) * kWaveSteepness * fade;
   }
@@ -86,7 +144,11 @@ float2 XeWaveSlope(float2 w, float t, float footprint) {
   [unroll] for (int n = 0; n < 2; ++n) {
     float scale = (n == 0 ? 0.55 : 1.9) / kWaveSize;  // cycles per metre
     float fade = saturate(1.0 / (scale * 4.0 * footprint) - 1.0);
+#if PGR4_WATER_LIVE
+    float2 p = w * scale + (n == 0 ? pgr4_water[4].xy : pgr4_water[4].zw);
+#else
     float2 p = w * scale + wind * t * (0.35 + 0.4 * n) * scale;
+#endif
     slope += XeNoiseGrad(p) * scale * kWaveSteepness * kNoiseShare * 0.35 / scale * fade;
   }
   return slope;
@@ -107,7 +169,12 @@ void XeWaterBegin(XeInput i) {
     // metres per uv: inverse(du) * dw (both row-vector maps from the screen).
     const float2x2 inv = float2x2(du[1].y, -du[0].y, -du[1].x, du[0].x) / det;
     const float2x2 m = mul(inv, dw);  // rows: d(w)/d(u), d(w)/d(v)
-    xe_wave_slope = mul(m, XeWaveSlope(w, pgr4_time.x * kWaveSpeed, footprint)) * kWaveStrength;
+    xe_wave_slope =
+#if PGR4_WATER_LIVE
+        mul(m, XeWaveSlope(w, 0.0, footprint)) * (kWaveStrength * xe_waves);
+#else
+        mul(m, XeWaveSlope(w, pgr4_time.x * kWaveSpeed, footprint)) * (kWaveStrength * xe_waves);
+#endif
   } else {
     xe_wave_slope = 0.0;
   }
@@ -126,6 +193,7 @@ float4 XeWaterHeight(float4 height, float2 uv) {
 // map fetch's direction, in the world), projected by the water's own clip transform (its VS's
 // c4-c7). The sky where the ray finds nothing.
 float3 XeSceneReflection(float3 sky, float3 dir, float3 origin) {
+  if (!xe_scene) return sky;
   float fade;
   const float3 color = XeTraceScene(origin, dir, float3(0.0, 1.0, 0.0), 0, 1e30, 0.0, 0.0, fade);
   return lerp(sky, color, fade * kWaterReflect);

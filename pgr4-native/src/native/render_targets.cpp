@@ -2,6 +2,7 @@
 // model (one host target per guest surface, no EDRAM emulation).
 #include "render_targets.h"
 
+#include "command_recorder.h"
 #include "guest_memory.h"
 #include "hook_args.h"
 #include "log.h"
@@ -322,6 +323,9 @@ bool RenderTargets::Create(RenderTarget* rt, uint32_t height) {
       return false;
     }
   }
+  // Local change (18/11/2026): the view is read when OMSetRenderTargets and the clears are made on
+  // the list: those recorded before it are made first (command_recorder.h).
+  DrainCommandRecording();
   if (rt->depth) {
     D3D12_DEPTH_STENCIL_VIEW_DESC v = {};
     v.Format = rt->view_format;

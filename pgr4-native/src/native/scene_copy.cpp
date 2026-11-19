@@ -3,12 +3,24 @@
 
 #include "d3d12_device.h"
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
 #include <d3dcompiler.h>
 
 #include <algorithm>
 #include <cstring>
+
+// Local change (19/11/2026, Tazz: « regarde autour des motos y'a comme un flou bizarre »): the wet
+// roads' running average (kAccumLevel, no reprojection) kept what moved on screen for a few frames:
+// a smeared ghost of the bikes around them, mirrored by the road. Before each mix, the average is
+// clamped to the range (min, max) of the current level's 3x3 texels around it: where a bike went
+// away, its old colours fall out of the range and are dropped; a rain drop of this frame is in its
+// texels' range with the road behind it, so the average still smooths the drops out. Read at each
+// frame.
+REXCVAR_DEFINE_BOOL(pgr4_native_road_average_clamp, true, "PGR4 native",
+                    "Wet roads: the reflections' running average clamped to the current image "
+                    "(no ghost of the moving vehicles)");
 
 namespace pgr4::native {
 
@@ -50,7 +62,9 @@ void main(uint2 p : SV_DispatchThreadID) {
 }
 )";
 
-// The running average of a level (set_accumulate): weight asfloat(size.x), half_size its size.
+// The running average of a level (set_accumulate): weight asfloat(size.x), half_size its size;
+// size.y not 0: the average clamped to the current level's 3x3 texels first
+// (pgr4_native_road_average_clamp).
 constexpr char kAccumHlsl[] = R"(
 cbuffer constants : register(b0) { uint2 size; uint2 half_size; };
 Texture2D<float4> level : register(t0);
@@ -58,7 +72,20 @@ RWTexture2D<float4> average : register(u0);
 [numthreads(8, 8, 1)]
 void main(uint2 p : SV_DispatchThreadID) {
   if (any(p >= half_size)) return;
-  average[p] = lerp(average[p], level.Load(int3(p, 0)), asfloat(size.x));
+  const float4 now = level.Load(int3(p, 0));
+  float4 before = average[p];
+  if (size.y != 0u) {
+    const int2 last = int2(half_size) - 1;
+    float4 lo = now, hi = now;
+    [unroll] for (int y = -1; y <= 1; ++y)
+    [unroll] for (int x = -1; x <= 1; ++x) {
+      const float4 c = level.Load(int3(clamp(int2(p) + int2(x, y), 0, last), 0));
+      lo = min(lo, c);
+      hi = max(hi, c);
+    }
+    before = clamp(before, lo, hi);
+  }
+  average[p] = lerp(before, now, asfloat(size.x));
 }
 )";
 
@@ -348,7 +375,8 @@ bool SceneCopy::Take(ID3D12GraphicsCommandList* list, RenderTargets& targets,
     const float weight = accum_fresh_ ? 1.0f : kAccumWeight;
     uint32_t weight_bits;
     std::memcpy(&weight_bits, &weight, 4);
-    const CopyConstants ac = {{weight_bits, 0}, {aw, ah}};
+    const CopyConstants ac = {{weight_bits, REXCVAR_GET(pgr4_native_road_average_clamp) ? 1u : 0u},
+                              {aw, ah}};
     list->SetPipelineState(accum_pso_.Get());
     D3D12_GPU_DESCRIPTOR_HANDLE g = gpu;
     g.ptr += uint64_t(base) * stride_;
@@ -373,6 +401,28 @@ bool SceneCopy::Take(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   list->ResourceBarrier(n, rb);
   color_state_ = depth_state_ = read;
   return true;
+}
+
+void SceneCopy::CopyDepthTexel(ID3D12GraphicsCommandList* list, ID3D12Resource* buffer,
+                               uint32_t x, uint32_t y) {
+  if (!depth_ || !buffer || x >= width_ || y >= height_) return;
+  D3D12_RESOURCE_BARRIER b =
+      TransitionBarrier(depth_.Get(), depth_state_, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  list->ResourceBarrier(1, &b);
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = buffer;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint.Offset = 0;
+  dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_FLOAT, 1, 1, 1,
+                                   D3D12_TEXTURE_DATA_PITCH_ALIGNMENT};
+  D3D12_TEXTURE_COPY_LOCATION src = {};
+  src.pResource = depth_.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  src.SubresourceIndex = 0;
+  const D3D12_BOX box = {x, y, 0, x + 1, y + 1, 1};
+  list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+  b = TransitionBarrier(depth_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, depth_state_);
+  list->ResourceBarrier(1, &b);
 }
 
 }  // namespace pgr4::native
