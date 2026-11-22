@@ -108,6 +108,11 @@ enum Str {
   kCheckPad,
   kPadMissing,
   kPrecompile,  // the precompile step's bar: "<text> 1240 / 3639"
+  // Local change (22/11/2026): the volumetric effects' row, its help, its two values.
+  kVolumetric,
+  kVolumetricHelp,
+  kEffectsOn,
+  kEffectsOff,
   kStrCount
 };
 
@@ -168,6 +173,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Controller",
         L"None: connect a controller",
         L"Preparing the shaders",
+        L"VOLUMETRIC EFFECTS",
+        L"Volumetric fog and lights in races. On: their shaders are prepared too (a longer first start) and the game's GRAPHICS menu offers them.",
+        L"ON",
+        L"OFF",
     },
     {  // fr
         L"JOUER",
@@ -225,6 +234,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Manette",
         L"Aucune : branchez une manette",
         L"Préparation des shaders",
+        L"EFFETS VOLUMÉTRIQUES",
+        L"Brouillard et lumières volumétriques en course. Activés : leurs shaders sont aussi préparés (premier lancement plus long) et le menu GRAPHICS du jeu les propose.",
+        L"ACTIVÉS",
+        L"DÉSACTIVÉS",
     },
     {  // de
         L"SPIELEN",
@@ -282,6 +295,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Controller",
         L"Keiner: Controller anschließen",
         L"Shader werden vorbereitet",
+        L"VOLUMETRISCHE EFFEKTE",
+        L"Volumetrischer Nebel und Lichter in Rennen. An: ihre Shader werden mit vorbereitet (längerer erster Start), und das Grafikmenü des Spiels bietet sie an.",
+        L"AN",
+        L"AUS",
     },
     {  // es
         L"JUGAR",
@@ -339,6 +356,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Mando",
         L"Ninguno: conecta un mando",
         L"Preparando los shaders",
+        L"EFECTOS VOLUMÉTRICOS",
+        L"Niebla y luces volumétricas en carrera. Activados: sus shaders también se preparan (primer inicio más largo) y el menú de gráficos del juego los ofrece.",
+        L"ACTIVADOS",
+        L"DESACTIVADOS",
     },
     {  // it
         L"GIOCA",
@@ -396,6 +417,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Controller",
         L"Nessuno: collega un controller",
         L"Preparazione degli shader",
+        L"EFFETTI VOLUMETRICI",
+        L"Nebbia e luci volumetriche in gara. Attivi: anche i loro shader vengono preparati (primo avvio più lungo) e il menu grafica del gioco li propone.",
+        L"ATTIVI",
+        L"DISATTIVATI",
     },
     {  // cz
         L"HRÁT",
@@ -453,6 +478,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Ovladač",
         L"Žádný: připojte ovladač",
         L"Příprava shaderů",
+        L"OBJEMOVÉ EFEKTY",
+        L"Objemová mlha a světla v závodech. Zapnuto: připraví se i jejich shadery (delší první spuštění) a nabídka grafiky ve hře je nabídne.",
+        L"ZAPNUTO",
+        L"VYPNUTO",
     },
     {  // hu
         L"JÁTÉK",
@@ -510,6 +539,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Kontroller",
         L"Nincs: csatlakoztass egy kontrollert",
         L"Árnyalók előkészítése",
+        L"VOLUMETRIKUS EFFEKTEK",
+        L"Volumetrikus köd és fények versenyben. Be: a shadereik is elkészülnek (hosszabb első indítás), és a játék grafikai menüje felkínálja őket.",
+        L"BE",
+        L"KI",
     },
     {  // pl
         L"GRAJ",
@@ -567,6 +600,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Kontroler",
         L"Brak: podłącz kontroler",
         L"Przygotowywanie shaderów",
+        L"EFEKTY WOLUMETRYCZNE",
+        L"Wolumetryczna mgła i światła w wyścigach. Włączone: ich shadery też są przygotowywane (dłuższe pierwsze uruchomienie), a menu grafiki gry je oferuje.",
+        L"WŁĄCZONE",
+        L"WYŁĄCZONE",
     },
     {  // ru
         L"ИГРАТЬ",
@@ -624,6 +661,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Геймпад",
         L"Нет: подключите геймпад",
         L"Подготовка шейдеров",
+        L"ОБЪЁМНЫЕ ЭФФЕКТЫ",
+        L"Объёмный туман и свет в гонках. Вкл.: их шейдеры тоже готовятся (первый запуск дольше), и меню графики игры их предлагает.",
+        L"ВКЛ.",
+        L"ВЫКЛ.",
     },
     {  // ja
         L"プレイ",
@@ -681,6 +722,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"コントローラー",
         L"なし：コントローラーを接続してください",
         L"シェーダーを準備中",
+        L"ボリューメトリック効果",
+        L"レース中のボリューメトリックフォグとライト。オン：シェーダーも準備され（初回起動が長くなります）、ゲームのグラフィック設定に表示されます。",
+        L"オン",
+        L"オフ",
     },
     {  // ko
         L"플레이",
@@ -738,6 +783,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"컨트롤러",
         L"없음: 컨트롤러를 연결하세요",
         L"셰이더 준비 중",
+        L"볼류메트릭 효과",
+        L"레이스 중 볼류메트릭 안개와 조명. 켜기: 셰이더도 준비되며(첫 실행이 길어짐) 게임의 그래픽 메뉴에 표시됩니다.",
+        L"켜기",
+        L"끄기",
     },
     {  // tc
         L"開始遊戲",
@@ -795,6 +844,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"控制器",
         L"無：請連接控制器",
         L"正在準備著色器",
+        L"體積效果",
+        L"比賽中的體積霧與光線。開啟：其著色器也會一併準備（首次啟動較久），遊戲的圖形選單會提供此選項。",
+        L"開啟",
+        L"關閉",
     },
     {  // sc
         L"开始游戏",
@@ -852,6 +905,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"控制器",
         L"无：请连接控制器",
         L"正在准备着色器",
+        L"体积效果",
+        L"比赛中的体积雾与光线。开启：其着色器也会一并准备（首次启动较久），游戏的图形菜单会提供此选项。",
+        L"开启",
+        L"关闭",
     },
 };
 
@@ -1028,6 +1085,8 @@ struct State {
   int dlc_count = 0;  // PGR4's DLC packages in dlc_dir
   int language = 0;  // index in kLanguages
   int network = 0;   // 0 automatic, else 1 + index in adapters
+  // Local change (22/11/2026): the volumetric effects (pgr4_native_volumetric_effects), off by default.
+  bool volumetric = false;
   std::vector<Adapter> adapters;
   std::wstring profile;
 
@@ -1451,6 +1510,7 @@ void Load() {
   g.network = 0;
   for (size_t i = 0; i < g.adapters.size(); ++i)
     if (g.adapters[i].ip == lan_ip) g.network = int(i) + 1;
+  g.volumetric = ReadSetting("pgr4_native_volumetric_effects") == "true";
 
   // The release's layout found on its own: game\ and title-update\ beside the launcher (the
   // folders pgr4.exe looks for itself).
@@ -1506,7 +1566,7 @@ void Load() {
 // ---------------------------------------------------------------------------------------------
 // The menu.
 
-enum class Row { kPlay, kVcRedist, kName, kGameDir, kUpdate, kDlc, kLanguage, kNetwork, kQuit };
+enum class Row { kPlay, kVcRedist, kName, kGameDir, kUpdate, kDlc, kLanguage, kNetwork, kVolumetric, kQuit };
 
 std::vector<Row> g_rows;
 int g_selected = 0;
@@ -1531,6 +1591,7 @@ void BuildRows() {
   if (g.game_ok && (!kHasBuiltInDlc || g.dlc_count == 0)) g_rows.push_back(Row::kDlc);
   g_rows.push_back(Row::kLanguage);
   g_rows.push_back(Row::kNetwork);
+  g_rows.push_back(Row::kVolumetric);  // local change (22/11/2026)
   g_rows.push_back(Row::kQuit);
   auto index = [](Row row) {
     for (int i = 0; i < int(g_rows.size()); ++i)
@@ -1590,6 +1651,12 @@ void Step(Row row, int delta) {
     g.network = (g.network + delta + n) % n;
     WriteSetting("net_lan_ip",
                  g.network ? Literal(g.adapters[g.network - 1].ip) : std::string("''"));
+  } else if (row == Row::kVolumetric) {
+    g.volumetric = !g.volumetric;
+    WriteSetting("pgr4_native_volumetric_effects", g.volumetric ? "true" : "false");
+    // Turned on: the game's option on too (Tazz: "l'option est là et activée par défaut"); the
+    // player may turn it off in the game's GRAPHICS menu.
+    if (g.volumetric) WriteSetting("pgr4_native_volumetric", "true");
   }
 }
 
@@ -1874,6 +1941,7 @@ void Activate(HWND hwnd, Row row) {
       break;
     case Row::kLanguage:
     case Row::kNetwork:
+    case Row::kVolumetric:
       Step(row, 1);
       break;
     case Row::kQuit:
@@ -2045,6 +2113,7 @@ std::wstring RowLabel(Row row) {
     case Row::kName: return T(kName);
     case Row::kLanguage: return T(kLanguage);
     case Row::kNetwork: return T(kNetwork);
+    case Row::kVolumetric: return T(kVolumetric);
     case Row::kQuit: return T(kQuit);
   }
   return {};
@@ -2060,6 +2129,7 @@ std::wstring RowHelp(Row row) {
     case Row::kName: return T(kNameHelp);
     case Row::kLanguage: return T(kLanguageHelp);
     case Row::kNetwork: return T(kNetworkHelp);
+    case Row::kVolumetric: return T(kVolumetricHelp);
     case Row::kQuit: return T(kQuitHelp);
   }
   return {};
@@ -2081,11 +2151,14 @@ std::wstring RowValue(Row row) {
     case Row::kNetwork:
       return g.network ? g.adapters[g.network - 1].name + L" " + g.adapters[g.network - 1].ip
                        : T(kAuto);
+    case Row::kVolumetric: return g.volumetric ? T(kEffectsOn) : T(kEffectsOff);
     default: return {};
   }
 }
 
-bool IsSpinner(Row row) { return row == Row::kLanguage || row == Row::kNetwork; }
+bool IsSpinner(Row row) {
+  return row == Row::kLanguage || row == Row::kNetwork || row == Row::kVolumetric;
+}
 
 void DrawBackdrop() {
   g_render->FillRectangle(D2D1::RectF(0, 0, kWidth, kHeight), g_backdrop.Get());

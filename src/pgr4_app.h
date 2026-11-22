@@ -17,6 +17,8 @@ void Pgr4MigrateSettings();  // src/pgr4_profile.cpp: settings whose defaults ch
 void Pgr4BringWindowToFront();
 // src/pgr4_profile.cpp: started by the launcher to compile the shaders only.
 bool Pgr4Precompiling();
+// src/pgr4_profile.cpp: the log file started afresh (pgr4_log_fresh), before the SDK opens it.
+void Pgr4FreshLog(rex::LogConfig& config);
 // src/pgr4_profile.cpp: false (the launcher opened instead) when pgr4.exe was started on its own.
 bool Pgr4StartedByLauncher();
 // src/pgr4_hooks.cpp: the game's 16:9 made the frame's own aspect (1280 x render height).
@@ -33,7 +35,10 @@ class Pgr4App : public rex::ReXApp {
 
   // No log file unless one is asked for (log_file in pgr4.toml, or --log_file): without a name for
   // them, the SDK makes no numbered logs beside the executable.
-  void OnConfigureLogging(rex::LogConfig& config) override { config.app_name.clear(); }
+  void OnConfigureLogging(rex::LogConfig& config) override {
+    config.app_name.clear();
+    Pgr4FreshLog(config);
+  }
 
   // Started on its own (not by PGR4Launcher): the launcher opened, nothing set up, the game exits.
   bool SetupEnvironment() override {

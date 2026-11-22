@@ -596,7 +596,7 @@ float4 Shade(XeInput i) {
     { float4 t141 = (r6.yyzw + (-r4.xxyz)); float t142 = exp2(r6.x); r6.y = t141.y; r6.z = t141.z; r6.w = t141.w; r6.x = t142; ps = t142; }
   }
   if (xe_jump == 0) {
-    { float4 t143 = (XeMul(r6.yzww, r6.xxxx) + r4.xyzz); r6.x = t143.x; r6.y = t143.y; r6.z = t143.z; }
+    { float4 t143 = XeFog(r6.yzww, r6.xxxx, r4.xyzz, 1); r6.x = t143.x; r6.y = t143.y; r6.z = t143.z; }
   }
   if (xe_jump == 0) {
     { float4 t144 = XeMul(r6.xyzz, c12.yyyy); r7.x = t144.x; r7.y = t144.y; r7.z = t144.z; }

@@ -6,7 +6,7 @@
 # fences and interrupts; F9 switches between the two).
 # The version of these settings: an older pgr4.toml is brought up to date once at the
 # game's start (src/pgr4_profile.cpp).
-pgr4_settings_version = 3
+pgr4_settings_version = 7
 pgr4_native = true
 pgr4_native_primary = true
 # The frame rate unlocked from the console's 30 (the game's presentation interval).
@@ -36,6 +36,9 @@ pgr4_native_dlss_jitter_sign = 1
 pgr4_native_dlss_fg_mvec_x = 1
 pgr4_native_dlss_fg_mvec_y = 1
 pgr4_native_dlss_fg_frames = 1
+# With DLSS Frame Generation, wait for the GPU at the end of every frame (CPU and GPU in step):
+# against a wrong sky in the cars' reflections, at the cost of some frames per second. Off.
+pgr4_native_gpu_serialize_fg = false
 pgr4_native_frame_generation = false
 pgr4_native_upscaler_width = 1280
 pgr4_native_upscaler_height = 720

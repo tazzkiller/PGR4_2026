@@ -1374,6 +1374,16 @@ float Pgr4FrameSeconds() {
   return float(double(std::clamp(smooth_ns, kMinStepNs, kMaxStepNs)) * 1e-9);
 }
 
+// Local change (pgr4 project, 20/11/2026): the last measured time step itself, unsmoothed, in
+// seconds (1/60 s until measured, at most 0.1 s): for what counts real time frame by frame (the
+// console frames of sub_824C6FD8's hook), where the ~1/2 s average above lagged behind a hitch or
+// a change of frame rate.
+float Pgr4FrameStepSeconds() {
+  const int64_t step_ns = g_drawn_step_ns.load(std::memory_order_relaxed);
+  if (step_ns <= 0) return 1.0f / 60.0f;
+  return float(double(std::min<int64_t>(step_ns, 100'000'000)) * 1e-9);
+}
+
 // Whether the game runs faster than the console's 30 FPS.
 bool Pgr4FrameRateUnlocked() {
   return pgr4::native::NativeRenderer::PacesFrames() || Pgr4Enable60Fps();
@@ -1427,5 +1437,25 @@ REX_HOOK_RAW(sub_826DEA78) {
   if (TrackState(pgr4::native::NativeRenderer::Live())) {
     pgr4::native::profile::Scope scope(pgr4::native::profile::kImmediateVs);
     pgr4::native::GuestState().AfterImmediateVs(base, r.data());
+  }
+}
+
+// Local change (21/11/2026, the volumetric fog's pass to run between the opaque scene and what is
+// drawn over it): the game's transparent world, sub_823B3490 (work/rea: sub_824CE250 draws the
+// opaque world, sub_8238CFD0, then the cars, water and crowds, then this one through sub_8238D058:
+// the transparent instances, sub_823B3378, then its sorted list from the first entry flagged
+// 0xC0000000, sub_823B0610). Also called for the track's reflections and the cube maps. A marker
+// at its start (1) and end (2), in the draws' own order (the queue's, a pending draw sent first).
+REX_EXTERN(__imp__sub_823B3490);
+REX_HOOK_RAW(sub_823B3490) {
+  pgr4::native::NativeRenderer* const r = pgr4::native::NativeRenderer::Live();
+  if (r) {
+    QueuePendingVertices(r, base);
+    r->OnWorldMarker(1);
+  }
+  __imp__sub_823B3490(ctx, base);
+  if (r) {
+    QueuePendingVertices(r, base);
+    r->OnWorldMarker(2);
   }
 }

@@ -1,5 +1,7 @@
 #include "shader_cache.h"
 
+#include "hang_probe.h"  // local change: the freeze probe
+
 #include "d3d12_device.h"    // GpuVendorId
 #include "render_targets.h"  // DrawResolutionScale
 
@@ -14,6 +16,10 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+// Local change (22/11/2026): a new shader's analysis outside the cache's lock.
+REXCVAR_DEFINE_BOOL(pgr4_native_shader_analyze_unlocked, true, "PGR4 native",
+                    "A new shader's ucode analyzed outside the shader cache's lock, several at once "
+                    "(off: one at a time, under the lock)");
 REXCVAR_DEFINE_STRING(pgr4_native_shader_dump_dir, "", "PGR4 native",
                       "Write every translation (DXBC) to <dir>/<ucode hash>_<modification>.<vs|ps>"
                       ".dxbc as it is made, and every shader's ucode disassembly to "
@@ -60,12 +66,30 @@ ShaderCache::~ShaderCache() = default;
 DxbcShader* ShaderCache::Load(rex::graphics::xenos::ShaderType type, const uint32_t* guest_ucode,
                               uint32_t dword_count) {
   uint64_t hash = XXH3_64bits(guest_ucode, size_t(dword_count) * sizeof(uint32_t));
-  std::lock_guard<std::mutex> lock(load_mutex_);
+  std::unique_lock<std::mutex> lock(load_mutex_);
+  // Local change (22/11/2026, pgr4_native_shader_analyze_unlocked): AnalyzeUcode touches only the
+  // shader and the text buffer given: outside the lock, a buffer of its own, one ucode by one
+  // thread at a time (another Load of it waits).
+  {
+    HangMark hang_mark(HangWhat::kLoadWait, hash);  // local change: the freeze probe
+    load_cv_.wait(lock, [&] { return !loading_.count(hash); });
+  }
   auto it = shaders_.find(hash);
   if (it != shaders_.end()) return it->second.get();
   auto t = std::chrono::steady_clock::now();
   auto shader = std::make_unique<DxbcShader>(type, hash, guest_ucode, dword_count);
-  shader->AnalyzeUcode(disasm_buffer_);
+  if (REXCVAR_GET(pgr4_native_shader_analyze_unlocked)) {
+    loading_.insert(hash);
+    lock.unlock();
+    rex::string::StringBuffer buffer;
+    HangMark hang_mark(HangWhat::kAnalyzing, hash);
+    shader->AnalyzeUcode(buffer);
+    lock.lock();
+    loading_.erase(hash);
+    load_cv_.notify_all();
+  } else {
+    shader->AnalyzeUcode(disasm_buffer_);
+  }
   stats_.analyze_us += Us(t);
   if (!REXCVAR_GET(pgr4_native_shader_dump_dir).empty()) {
     char name[40];
@@ -89,16 +113,42 @@ const DxbcShader* ShaderCache::Find(uint64_t hash) {
   return it != shaders_.end() ? it->second.get() : nullptr;
 }
 
-DxbcShader::Translation* ShaderCache::Translate(DxbcShader& shader, uint64_t modification) {
+std::unique_ptr<DxbcShaderTranslator> ShaderCache::MakeTranslator() const {
+  return std::make_unique<DxbcShaderTranslator>(
+      rex::ui::GraphicsProvider::GpuVendorID(GpuVendorId()), /*bindless=*/true,
+      /*edram_rov_used=*/false, /*gamma_render_target_as_unorm8=*/false,
+      /*msaa_2x_supported=*/true, DrawResolutionScale(), DrawResolutionScale());
+}
+
+DxbcShader::Translation* ShaderCache::Translate(DxbcShader& shader, uint64_t modification,
+                                                DxbcShaderTranslator* own) {
+  // Local change (22/11/2026): the translation outside translate_mutex_, one shader by one thread
+  // at a time (busy_): DxbcShaderTranslator::PostTranslation fills the shader's bindings at its
+  // first translation, and they are read once Translate returns.
+  std::unique_lock<std::mutex> lock(translate_mutex_);
+  {
+    HangMark hang_mark(HangWhat::kTranslateWait, shader.ucode_data_hash());  // the freeze probe
+    busy_cv_.wait(lock, [&] { return !busy_.count(&shader); });
+  }
   bool is_new = false;
   DxbcShader::Translation* translation = shader.GetOrCreateTranslation(modification, &is_new);
   if (is_new) {
+    busy_.insert(&shader);
+    lock.unlock();
     auto t = std::chrono::steady_clock::now();
-    translator_.TranslateAnalyzedShader(*translation);
+    if (own) {
+      HangMark hang_mark(HangWhat::kTranslating, shader.ucode_data_hash());
+      own->TranslateAnalyzedShader(*translation);
+    } else {
+      std::unique_lock<std::mutex> own_lock(own_translator_mutex_, std::defer_lock);
+      {
+        HangMark hang_wait(HangWhat::kTranslatorLock, shader.ucode_data_hash());
+        own_lock.lock();
+      }
+      HangMark hang_mark(HangWhat::kTranslating, shader.ucode_data_hash());
+      translator_.TranslateAnalyzedShader(*translation);
+    }
     double us = Us(t);
-    stats_.translate_us += us;
-    stats_.max_translate_us = std::max(stats_.max_translate_us, us);
-    ++stats_.translations;
     if (!REXCVAR_GET(pgr4_native_shader_dump_dir).empty() && translation->is_valid()) {
       char name[64];
       std::snprintf(name, sizeof(name), "%016llX_%016llX.%s.dxbc",
@@ -108,11 +158,17 @@ DxbcShader::Translation* ShaderCache::Translate(DxbcShader& shader, uint64_t mod
       DumpFile(name, binary.data(), binary.size());
     }
     if (!translation->is_valid()) {
-      ++stats_.failures;
       REXLOG_ERROR("pgr4 native: {} shader {:016X} modification {:016X} failed to translate",
                    shader.type() == rex::graphics::xenos::ShaderType::kVertex ? "vertex" : "pixel",
                    shader.ucode_data_hash(), modification);
     }
+    lock.lock();
+    stats_.translate_us += us;
+    stats_.max_translate_us = std::max(stats_.max_translate_us, us);
+    ++stats_.translations;
+    if (!translation->is_valid()) ++stats_.failures;
+    busy_.erase(&shader);
+    busy_cv_.notify_all();
   }
   return translation->is_valid() ? translation : nullptr;
 }

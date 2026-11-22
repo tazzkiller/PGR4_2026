@@ -41,6 +41,16 @@ REXCVAR_DEFINE_INT32(pgr4_native_texture_memory_hard_mb, -1, "PGR4 native",
                      "Texture memory above which the least recently used textures are evicted, "
                      "once no frame in flight uses them (0: no limit; -1: 30 % of the video "
                      "memory budget, at least 1024)");
+// Local change (22/11/2026, Tazz: "le cache de textures a dépassé son budget, faut l'augmenter",
+// universal): 30 % and 45 % of the budget for -1 (15 % and 30 % before). A race of 13 min reached
+// the soft 1683 MB (15 % of an RTX 4070 Ti's 11226 MB, 47334 textures) and then evicted hundreds
+// of textures every 2 s, made again as they came back. Still shares of what Windows gives this
+// process on its adapter, so every card and the Steam Deck get theirs; the guards stay: textures
+// unused evicted over 90 % of the video memory or with the view heap 3/4 full (EvictOverBudget),
+// no HD upload over 95 %.
+REXCVAR_DEFINE_BOOL(pgr4_native_texture_memory_wider, true, "PGR4 native",
+                    "Texture memory limits of -1: 30 % (soft) and 45 % (hard) of the video memory "
+                    "budget instead of 15 % and 30 %");
 #endif
 
 #include <algorithm>
@@ -262,8 +272,9 @@ TextureCache::TextureCache(ID3D12Device* device, rex::memory::Memory* memory)
     if (mb < 0) return std::max(floor_mb << 20, video / 100 * percent);
     return mb > 0 ? uint64_t(mb) << 20 : ~0ull;
   };
-  budget_.soft_bytes = limit(REXCVAR_GET(pgr4_native_texture_memory_soft_mb), 15, 512);
-  budget_.hard_bytes = limit(REXCVAR_GET(pgr4_native_texture_memory_hard_mb), 30, 1024);
+  const bool wider = REXCVAR_GET(pgr4_native_texture_memory_wider);
+  budget_.soft_bytes = limit(REXCVAR_GET(pgr4_native_texture_memory_soft_mb), wider ? 30 : 15, 512);
+  budget_.hard_bytes = limit(REXCVAR_GET(pgr4_native_texture_memory_hard_mb), wider ? 45 : 30, 1024);
   REXLOG_INFO("PGR4 native textures: video memory budget {} MB ({} MB used); textures soft {} "
               "MB, hard {} MB", video >> 20, video_usage_ >> 20, budget_.soft_bytes >> 20,
               budget_.hard_bytes >> 20);
@@ -1075,6 +1086,41 @@ void TextureCache::ResetResolved(Texture& t) {
 bool TextureCache::Unchanged(TextureHandle entry) const {
   const Slot& s = slots_[entry.slot];
   return s.generation == entry.generation && Clean(*s.texture);
+}
+
+bool TextureCache::MissedByWatch(TextureHandle entry) {
+  const Slot& s = slots_[entry.slot];
+  if (s.generation != entry.generation || !GuardMissed(*s.texture)) return false;
+  const Texture& t = *s.texture;
+  ++missed_by_watch_.count;
+  missed_by_watch_.address = t.key.base_page << 12;
+  missed_by_watch_.width = t.key.width;
+  missed_by_watch_.height = t.key.height;
+  missed_by_watch_.format = uint32_t(t.key.format);
+  return true;
+}
+
+TextureCache::MissedCount TextureCache::TakeMissedByWatch() {
+  return std::exchange(missed_by_watch_, MissedCount{});
+}
+
+bool TextureCache::HdSettled(TextureHandle entry) {
+  const Slot& s = slots_[entry.slot];
+  if (s.generation != entry.generation) return true;  // Unchanged says so
+  const Texture& t = *s.texture;
+  // The conditions of Get's memo (GetMemo), besides Clean and the generation.
+  if (!t.hd_pending && !(t.hd_current && (t.alias == t.hd.Get()) != HdOnFor(t.hd_hash)))
+    return true;
+  ++hd_unsettled_.count;
+  hd_unsettled_.address = t.key.base_page << 12;
+  hd_unsettled_.width = t.key.width;
+  hd_unsettled_.height = t.key.height;
+  hd_unsettled_.format = uint32_t(t.key.format);
+  return false;
+}
+
+TextureCache::MissedCount TextureCache::TakeHdUnsettled() {
+  return std::exchange(hd_unsettled_, MissedCount{});
 }
 
 void TextureCache::Touch(TextureHandle entry, uint64_t frame_fence) {

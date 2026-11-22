@@ -59,6 +59,21 @@ void Pgr4MotionBlurStepHook(PPCRegister& f0) { f0.f64 = double(Pgr4MotionBlurSte
 // (lfs f13 from 0x82001170) becomes the frame's measured time step.
 void Pgr4MenuRepeatStepHook(PPCRegister& f13) { f13.f64 = double(Pgr4FrameSeconds()); }
 
+// Local change (20/11/2026, the frame-rate audit): the console frames' count (sub_824C6FD8 below:
+// the kudos tick, the collisions' and the crowd's console frames) and the music's fades counted
+// real time by Pgr4FrameSeconds, an average over about 1/2 s made for the motion blur's strength:
+// after a hitch or a change of frame rate they were wrong for that long. pgr4_game_frame_time gives
+// them the last measured step, unsmoothed (real time, the pause too). Read at each call.
+// Not for the cockpit's head (pgr4_cockpit_head_fix): given the game's frame time (0x82A81330,
+// read in its slerp) the whole cockpit view jumped from frame to frame at 72 frames a second,
+// standing still on a bike (captures 20/11/2026, alternated: 1.6-1.7 mean change between frames
+// without, 3.2-3.4 with; 1.2 with the head fix off), so it keeps Pgr4FrameSeconds until the time
+// its camera update is given is read in the code.
+REXCVAR_DEFINE_BOOL(pgr4_game_frame_time, true, "PGR4",
+                    "The console frames' count and the music's fades follow the last frame's real "
+                    "time instead of a 1/2 s average");
+float Pgr4FrameStepSeconds();  // pgr4-native pgr4_d3d_trace.cpp
+
 // The cockpit camera's head smoothing (sub_827DA5C0): slerp(old, target, HeadAmount) each frame
 // was tuned on the console's 30 FPS. At 120 fps it caught up four times as often (68 % of the gap
 // per 1/30 s instead of 25 %): the head stuck to the car body and its every shake reached the
@@ -326,6 +341,13 @@ float BeF(const uint8_t* p) {
   return std::bit_cast<float>(uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 |
                               p[3]);
 }
+// A guest address's bytes on the host. The recompiled code (REX_PHYS_HOST_OFFSET, Windows) puts the
+// 4 KB physical heap, 0xE0000000 up, 0x1000 further on: base + address alone is a page short there.
+// The pose and bone buffers live there (20/11/2026).
+uint8_t* GuestBytes(uint8_t* base, uint32_t a) { return base + a + (a >= 0xE0000000u ? 0x1000u : 0u); }
+const uint8_t* GuestBytes(const uint8_t* base, uint32_t a) {
+  return base + a + (a >= 0xE0000000u ? 0x1000u : 0u);
+}
 void PutBeF(uint8_t* p, float f) {
   const uint32_t v = std::bit_cast<uint32_t>(f);
   for (int i = 0; i < 4; ++i) p[i] = uint8_t(v >> (24 - 8 * i));
@@ -384,6 +406,13 @@ extern float g_pgr4_car_back[3];
 extern float g_pgr4_car_pos[3];
 extern bool g_pgr4_game_paused;
 extern float g_pgr4_car_yaw_rate;
+REXCVAR_DEFINE_BOOL(pgr4_cockpit_input_watch, false, "PGR4",
+                    "Development: note which code writes the view camera's head target and place "
+                    "(+320 to +447; page watch, once a run)");
+namespace {
+void WriteWatchStart(uint8_t* base, uint32_t table, uint32_t count);  // below
+void WriteWatchReport(std::initializer_list<uint32_t> pages);
+}  // namespace
 REXCVAR_DEFINE_BOOL(pgr4_ui_clock_probe, false, "PGR4",
                     "Development: the UI's frame time and the game clock's, in the log");
 void Pgr4BringWindowToFront();  // src/pgr4_menu.cpp
@@ -394,7 +423,9 @@ REX_HOOK_RAW(sub_824C6FD8) {
   ++g_frame_no;
   {
     // A frame of 1/30 s, give or take 3 %, is one console frame (at a 30 FPS limit, every frame).
-    const double step = std::clamp(double(Pgr4FrameSeconds()) * 30.0, 0.0, 1.0);
+    const double seconds = REXCVAR_GET(pgr4_game_frame_time) ? double(Pgr4FrameStepSeconds())
+                                                              : double(Pgr4FrameSeconds());
+    const double step = std::clamp(seconds * 30.0, 0.0, 1.0);
     g_console_credit += step > 0.97 ? 1.0 : step;
     g_console_frame_start.store(g_console_credit >= 1.0, std::memory_order_relaxed);
     if (g_console_credit >= 1.0) {
@@ -413,6 +444,17 @@ REX_HOOK_RAW(sub_824C6FD8) {
     }
   }
   Pgr4CadenceFrame(base);  // development: the frame-rate audit's counts
+  // pgr4_cockpit_input_watch: which code writes the view camera's +320 to +447 (its head target
+  // +320, the place it hangs from +400, the head +416; sub_827DA5C0 reads them), the page watch
+  // once a run, reported every 2 s.
+  if (REXCVAR_GET(pgr4_cockpit_input_watch)) {
+    WriteWatchStart(base, 0x82C91D00 + 320, 2);
+    static auto last = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - last > std::chrono::seconds(2)) {
+      last = std::chrono::steady_clock::now();
+      WriteWatchReport({0, 1});
+    }
+  }
   __imp__sub_824C6FD8(ctx, base);
   // The game's clock (seconds, stands still in the pause and the photo mode; measured 04/11/2026):
   // unchanged for some frames, paused.
@@ -777,6 +819,17 @@ std::unordered_map<uint32_t, PoseTime> g_pose_time;
 // car's velocities not landing where the next step puts it (an every-frame carry from the step,
 // tried the same day, was worse: 4.07 to 4.85 m/s for 4.12 to 4.52).
 constexpr float kExtendLow = -1.0f, kExtendHigh = 2.0f;
+// Local change (20/11/2026, the frame-rate audit): in the menus the mix comes before the frame's
+// steps, so the game's time is up to as many steps past the last as the frame will run: one above
+// 60 frames a second (a fraction down to -1), two from 30 to 60 (down to -2). Below -1 the pose
+// fell back to the velocity carry (sub_82417B50, 6 % short when a step came in; one frame in three
+// at 44 frames a second), and the wheels to the last step's pose. pgr4_vehicle_pose_extend_two_steps
+// lets the mix carry on to -2: the console's 30 FPS and everything above mixed the same way. Read
+// at each call.
+REXCVAR_DEFINE_BOOL(pgr4_vehicle_pose_extend_two_steps, true, "PGR4",
+                    "The cars' mix carried on up to two steps past the last (menus from 30 to 60 "
+                    "frames a second) instead of one");
+float ExtendLow() { return REXCVAR_GET(pgr4_vehicle_pose_extend_two_steps) ? -2.0f : kExtendLow; }
 thread_local bool t_pose_extend = false;  // set around sub_82445CB8's call
 // Local change (18/11/2026, Tazz: the hubcaps flicker, seen in DLSS-G's Depth/MVec Alignment view
 // once every 8 frames at 68 frames a second): sub_82445CB8 mixes a car's body between its last two
@@ -996,6 +1049,7 @@ struct WriteWatch {
   uintptr_t lo = 0, hi = 0;          // host pages protected
   uint32_t table = 0, count = 0;     // guest table, entries
   uint8_t* base = nullptr;
+  uint32_t host_offset = 0;          // the physical heap's (GuestBytes)
   uintptr_t image = 0;
   static constexpr uint32_t kMax = 8192;
   PageWrite writes[kMax];
@@ -1017,7 +1071,7 @@ LONG CALLBACK WriteWatchHandler(EXCEPTION_POINTERS* e) {
     if (t_watch_slot != ~0u) {
       PageWrite& r = w.writes[t_watch_slot];
       // The word written (4-byte aligned), after the write.
-      r.value = WheelBeU32(w.base + (r.guest & ~3u));
+      r.value = WheelBeU32(GuestBytes(w.base, r.guest & ~3u));
     }
     t_watch_page = 0;
     t_watch_slot = ~0u;
@@ -1032,7 +1086,7 @@ LONG CALLBACK WriteWatchHandler(EXCEPTION_POINTERS* e) {
   const uintptr_t page = at & ~uintptr_t(4095);
   DWORD old;
   VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &old);
-  const uint32_t guest = uint32_t(at - reinterpret_cast<uintptr_t>(w.base));
+  const uint32_t guest = uint32_t(at - reinterpret_cast<uintptr_t>(w.base) - w.host_offset);
   t_watch_slot = ~0u;
   if (guest >= w.table && guest < w.table + w.count * 64) {
     const uint32_t i = w.n.fetch_add(1, std::memory_order_relaxed);
@@ -1060,8 +1114,9 @@ void WriteWatchStart(uint8_t* base, uint32_t table, uint32_t count) {
   w.table = table;
   w.count = count;
   w.image = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-  w.lo = reinterpret_cast<uintptr_t>(base + table) & ~uintptr_t(4095);
-  w.hi = (reinterpret_cast<uintptr_t>(base + table + count * 64) + 4095) & ~uintptr_t(4095);
+  w.host_offset = uint32_t(GuestBytes(base, table) - (base + table));
+  w.lo = reinterpret_cast<uintptr_t>(GuestBytes(base, table)) & ~uintptr_t(4095);
+  w.hi = (reinterpret_cast<uintptr_t>(GuestBytes(base, table) + count * 64) + 4095) & ~uintptr_t(4095);
   w.handler = AddVectoredExceptionHandler(1, WriteWatchHandler);
   w.on = true;
   WriteWatchProtect(PAGE_READONLY);
@@ -1279,8 +1334,11 @@ REX_HOOK_RAW(sub_823B3A78) {
   }
 }
 REX_EXTERN(__imp__sub_82445CB8);
+// The vehicle's physics and where it keeps its velocities (pgr4_character_accel_steps, below).
+void Pgr4NoteVehiclePhysics(const uint8_t* base, uint32_t pose, uint32_t physics);
 REX_HOOK_RAW(sub_82445CB8) {
   const uint32_t pose = ctx.r3.u32;
+  Pgr4NoteVehiclePhysics(base, pose, ctx.r4.u32);
   // Its fraction, as it computes it (g_pose_time above). In the menus the update comes before the
   // frame's physics steps: the fraction is mostly below its range, the pose a step's.
   const float x = BeF(base + 0x82A17640), t = BeF(base + 0x82A8131C + 24),
@@ -1290,7 +1348,7 @@ REX_HOOK_RAW(sub_82445CB8) {
   const float fraction =
       base[0x82A81378] == 0 ? 0.0f : x > 0 ? (x + float(n - 1) * h - t) / x : 0.0f;
   const bool extend = REXCVAR_GET(pgr4_vehicle_pose_extend) && base[0x82A81378] != 0 &&
-                      (fraction < lo || fraction > hi) && fraction >= kExtendLow &&
+                      (fraction < lo || fraction > hi) && fraction >= ExtendLow() &&
                       fraction <= kExtendHigh;
   const bool mixed = extend || (!(fraction < lo) && !(fraction > hi));
   // A car's (physics +16 == 0: sub_82445CB8's wheel loop at 0x824460F8; a bike's goes elsewhere).
@@ -1373,7 +1431,7 @@ REX_HOOK_RAW(sub_82445CB8) {
 // sub_82445CB8's range bounds (lfs f0 of 0x82258A6C's 0.001 at 0x82445DE8, of 0x8218BCC0's 0.999
 // at 0x82445E2C, each compared with the fraction f31 next), out of the way while t_pose_extend.
 void Pgr4PoseLowBoundHook(PPCRegister& f0) {
-  if (t_pose_extend) f0.f64 = double(kExtendLow) - 1.0;
+  if (t_pose_extend) f0.f64 = double(ExtendLow()) - 1.0;
 }
 void Pgr4PoseHighBoundHook(PPCRegister& f0) {
   if (t_pose_extend) f0.f64 = double(kExtendHigh) + 1.0;
@@ -1465,9 +1523,15 @@ REX_HOOK_RAW(sub_827D4688) {
   if (cuts) NoteCameraCut(base, zone_before);
 }
 REX_EXTERN(__imp__sub_8264A358);
+namespace pgr4::native {
+void PrewarmAtRaceLoad();  // pgr4-native draw.cpp (pgr4_native_prewarm_relaxed)
+}
 REX_HOOK_RAW(sub_8264A358) {
   Pgr4RaceWeather(base);
   Pgr4AutopilotRouteString(base, ctx.r4.u32);
+  // Local change (22/11/2026): the loading waits for the prewarm's end (its fast mode), so the race
+  // starts with nothing left to prepare.
+  pgr4::native::PrewarmAtRaceLoad();
   __imp__sub_8264A358(ctx, base);
 }
 REX_EXTERN(__imp__sub_82416BA0);
@@ -1589,6 +1653,46 @@ REXCVAR_DEFINE_BOOL(pgr4_character_accel_window, true, "PGR4",
                     "its smoothing by time, at any frame rate");
 REXCVAR_DEFINE_BOOL(pgr4_character_ragdoll_time, true, "PGR4",
                     "Characters' ragdolls: each step the frame's real time instead of 1/30 s");
+// Local change (20/11/2026, a player: the driver jitters in the vehicle selection at 72 frames a
+// second, not at 60 or 90). pgr4_character_accel_window takes the vehicle's velocities 1/30 s ago
+// between the two frame samples around then: right for velocities that move on at each frame, not
+// for those that move on at the 1/60 s physics steps (a staircase). Those it got right only where
+// 1/30 s is a whole number of frames (60, 90, 120 frames a second); at 72 (2.4 frames) the old
+// velocity fell inside a stair and the acceleration swung with a 6-frame period (5 steps in 6
+// frames), times Character.Ragdoll.VehicleForceScale (18).
+// What writes them (probes and a page watch, 20/11/2026, 72 frames a second, a car and a bike, the
+// menus and a race): sub_82484C60 (r4 the character's vehicle body, r5 the vehicle), called after
+// the frame's vehicle update (sub_82437C18) and before the frame's steps (the race's sub_824C6398,
+// the menus' sub_82639A28), writes the body's velocities (+112) as the vehicle's +880 (its velocity,
+// as pgr4_freeze_car zeroes it) turned by its rows at +12560, +12576, +12592. The vehicle update
+// writes those rows at every frame (238 frames of 238, none in a step: they turn with the drawn
+// car). +880 is no step's either: the pose mix (sub_82445CB8, in that update) copies it once a
+// frame from the physics' velocity getter (its table's +112; +912 from +108). That field is sampled
+// at the end of each step's physics (sub_823058C8, both loops); that the step writes it is what
+// the match below checks at every frame. So the body's velocities are a staircase turned by a
+// rotation that moves on at every frame: on a frame without a step they barely moved, then jumped
+// (4 to 5 times the change of the other frames).
+// pgr4_character_accel_steps: their change over the console's frame (1/30 s, two steps), each part
+// where it moves: rows1 v1 - rows0 v0 = rows1 (v1 - v0) + (rows1 - rows0) v0, with v1 the
+// physics' velocity at the step the body has and v0 that of two steps before it, both sampled at
+// the end of each step (a step counted without physics, past 6 a frame or with the steps' flag
+// off, holds the one before), and rows0 the rows 1/30 s of the game's time (0x82A8131C +24)
+// before, between the two frames around then. A bike's rider (sub_824817D8 -> sub_82475A30, no
+// sub_82484C60) has the physics' velocity as it is: then simply v1 - v0. The angular velocities
+// are the physics' as they are for both (sub_82475A30 copies +912; sub_82484C60 turns only the
+// velocity): w1 - w0. Then the same at any frame rate. Only when the body's velocities are that
+// (to 1e-4): else, velocities that move on only at the steps as the vehicle
+// update's step count saw them, else the window over time. With pgr4_character_accel_window;
+// read at each call.
+REXCVAR_DEFINE_BOOL(pgr4_character_accel_steps, true, "PGR4",
+                    "Characters' ragdolls: the vehicle's acceleration from its velocities at the "
+                    "physics steps and its turn over time (1/30 s), the same at any frame rate");
+REXCVAR_DEFINE_BOOL(pgr4_character_velocity_watch, false, "PGR4",
+                    "Development, with pgr4_character_accel_probe: note which code writes the "
+                    "probed character's vehicle velocities (page watch, once a run)");
+REXCVAR_DEFINE_BOOL(pgr4_character_accel_probe, false, "PGR4",
+                    "Development: log each character's vehicle velocity, acceleration and where it "
+                    "came from, for 240 calls from when it is switched on");
 namespace {
 struct VelocitySample {
   double time;
@@ -1599,68 +1703,873 @@ struct VelocityHistory {
   std::vector<VelocitySample> samples;  // oldest first, the last 0.2 s
 };
 std::unordered_map<uint32_t, VelocityHistory> g_character_velocities;  // by sub_8249C3E0's r3
+struct VehicleStep {
+  int32_t n;  // the step count after the step
+  float v[3];
+  float w[3];
+};
+// Each vehicle's physics (sub_82445CB8's r4 for its pose, the vehicle + 736) and where that keeps
+// its velocity and angular velocity: the offsets the getters at its table's +112 and +108 load
+// (li r11,N; lvx128 v0,r4,r11; stvx128 v0,r0,r3; blr: 944 and 960 for table 0x82002740, 464 and
+// 480 for 0x82006F00, read 20/11/2026). The step's physics writes them; sub_82445CB8 copies them
+// to the vehicle's +880 and +912 once a frame.
+struct VehiclePhysics {
+  uint32_t physics = 0, v_at = 0, w_at = 0;
+};
+std::mutex g_vehicle_physics_mutex;
+std::unordered_map<uint32_t, VehiclePhysics> g_vehicle_physics;  // by vehicle
+struct RowsSample {
+  double time;  // the game's time
+  float m[9];
+};
+// A character's vehicle body as sub_82475A30 (its velocities copied as they are) and sub_82484C60
+// (a car's velocity turned by the vehicle's rows after it) last wrote it: the vehicle, the frames,
+// the vehicle's rows (the last 0.2 s of the game's time), and the vehicle's physics' velocities at
+// the end of each step (the last 12).
+struct BodyVehicle {
+  uint32_t vehicle = 0;
+  uint64_t frame = 0, rows_frame = 0;  // the last frames sub_82475A30 and sub_82484C60 wrote it
+  std::vector<RowsSample> rows;
+  std::vector<VehicleStep> steps;  // from its physics
+};
+std::mutex g_body_vehicles_mutex;
+std::unordered_map<uint32_t, BodyVehicle> g_body_vehicles;  // by body
+std::atomic<int32_t> g_vehicle_update_n{0};  // the step count when sub_82437C18 began
+// Each character's velocities as the vehicle update's step count saw them (one sample a frame whose
+// update came after a new step), and the last frame they moved on while that count did not.
+struct UpdateSteps {
+  std::vector<VehicleStep> samples;  // the last 8 steps
+  uint64_t moved_between = 0;
+};
+std::unordered_map<uint32_t, UpdateSteps> g_character_update_steps;  // by sub_8249C3E0's r3
+int g_accel_probe_left = 0;
+int32_t StepCount(const uint8_t* base) {
+  const uint8_t* np = base + 0x82A17644;
+  return int32_t(uint32_t(np[0]) << 24 | uint32_t(np[1]) << 16 | uint32_t(np[2]) << 8 | np[3]);
+}
 uint32_t BeU32At(const uint8_t* p) {
   return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
 }
+// The last sample at or before step n (none: nullptr).
+const VehicleStep* VehicleStepAt(const std::vector<VehicleStep>& steps, int32_t n) {
+  for (auto it = steps.rbegin(); it != steps.rend(); ++it)
+    if (it->n <= n) return &*it;
+  return nullptr;
+}
+bool SameVector(const float a[3], const float b[3]) {
+  return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+}
+// The rows at time t, between the two samples around it (the oldest while the history is
+// shorter); the time they are at.
+double RowsAt(const std::vector<RowsSample>& rows, double t, float out[9]) {
+  if (rows.front().time >= t) {
+    std::copy(rows.front().m, rows.front().m + 9, out);
+    return rows.front().time;
+  }
+  size_t i = 1;
+  while (i + 1 < rows.size() && rows[i].time < t) ++i;
+  const RowsSample& a = rows[i - 1];
+  const RowsSample& b = rows[i];
+  const double f = b.time > a.time ? std::clamp((t - a.time) / (b.time - a.time), 0.0, 1.0) : 1.0;
+  for (int k = 0; k < 9; ++k) out[k] = float(a.m[k] + (b.m[k] - a.m[k]) * f);
+  return a.time + (b.time - a.time) * f;
+}
+}  // namespace
+void Pgr4NoteVehiclePhysics(const uint8_t* base, uint32_t pose, uint32_t physics) {
+  if (!REXCVAR_GET(pgr4_character_accel_window) || !REXCVAR_GET(pgr4_character_accel_steps)) return;
+  if (pose < 0x40000000 + 736 || physics < 0x40000000) return;
+  const uint32_t vehicle = pose - 736;
+  std::lock_guard lock(g_vehicle_physics_mutex);
+  const auto known = g_vehicle_physics.find(vehicle);
+  if (known != g_vehicle_physics.end() && known->second.physics == physics) return;
+  if (g_vehicle_physics.size() > 64) g_vehicle_physics.clear();  // vehicles long gone
+  // The getter's load offset, as its code has it: li r11,N; lvx128 v0,r4,r11; ...; blr at +12.
+  auto loaded = [&](uint32_t getter) -> uint32_t {
+    if (getter < 0x82000000 || getter >= 0x83000000) return 0;
+    const uint32_t li = BeU32At(base + getter), ret = BeU32At(base + getter + 12);
+    return (li >> 16) == 0x3960 && ret == 0x4E800020 ? (li & 0xFFFF) : 0;
+  };
+  const uint32_t table = BeU32At(base + physics);
+  VehiclePhysics& q = g_vehicle_physics[vehicle];
+  q = {physics, loaded(BeU32At(base + table + 112)), loaded(BeU32At(base + table + 108))};
+  if (g_accel_probe_left > 0)
+    REXLOG_INFO("PGR4 accel probe: vehicle {:08X} physics {:08X} table {:08X}: velocity at +{}, "
+                "angular velocity at +{}", vehicle, physics, table, q.v_at, q.w_at);
+}
+// Local change (20/11/2026, the frame-rate audit; replaces pgr4_character_ragdoll_time when on):
+// pgr4_character_ragdoll_time stepped the ragdoll by the frame's time, one step a frame. Its
+// physics is tuned on the step (read 20/11/2026): sub_824B4938 multiplies every servo's and
+// limit's gain and damping by 1/h, sub_824B2760 damps the velocities by 0.99 a step, the
+// constraints' biases are per step: with steps of 1/72 or 1/144 s the driver moved differently.
+// pgr4_character_ragdoll_steps keeps the console's: sub_824B6438 (r3 the ragdoll, f1 the frame's
+// time, one call a frame per character, on the characters' thread) runs once per 1/30 s of the
+// frames' time (0, 1, 2 or more a frame, from an accumulator; 4 at most), each a step of 1/30 s as
+// on the console. A frame with no time (the pause, f1 = 0) runs the game's call as it is (its
+// step without the integration). For the drawing (sub_824B44F8, r3 the ragdoll: it reads each
+// body's place +0 and quaternion +16, bodies at ragdoll + 23216 + 80 i, their count at +35520),
+// the bodies are mixed between the last two steps by the fraction of a step the accumulator holds
+// (places straight, quaternions mixed and normalized), then put back: the pose of one step before
+// the frame's time, always between two steps the physics reached. Carried past the last step
+// instead (as pgr4_vehicle_pose_extend carries a car), the rider jerked at each step (Tazz,
+// 20/11/2026: « le ragdoll a de petites saccades »): its servos turn it every step, not on a
+// straight line. The ragdoll is in its vehicle's frame (the rider's root body at 0, 0, 0 in every
+// step, riding and through many falls, probe 20/11/2026), so the step's lag is only the rider's
+// motion on the vehicle. Read at each call.
+REXCVAR_DEFINE_BOOL(pgr4_character_ragdoll_steps, true, "PGR4",
+                    "Characters' ragdolls: steps of 1/30 s as on the console (as many as the time "
+                    "needs), drawn between the last two");
+namespace {
+constexpr uint32_t kRagdollBodies = 23216, kRagdollBodyCount = 35520, kRagdollStride = 80;
+constexpr double kRagdollStep = 1.0 / 30.0;
+struct RagdollSteps {
+  uint32_t count = 0;
+  uint64_t frame = 0;
+  double time = 0.0;  // the frames' time not stepped yet
+  bool has_before = false;
+  std::vector<float> before, last;  // places and quaternions (7 floats a body), the last two steps
+};
+std::mutex g_ragdolls_mutex;
+std::unordered_map<uint32_t, RagdollSteps> g_ragdolls;  // by ragdoll
+uint32_t RagdollCount(const uint8_t* base, uint32_t ragdoll) {
+  return std::min<uint32_t>(BeU32At(base + ragdoll + kRagdollBodyCount), 64);
+}
+void ReadBodies(const uint8_t* base, uint32_t ragdoll, uint32_t count, std::vector<float>& out) {
+  out.resize(size_t(count) * 7);
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint8_t* b = base + ragdoll + kRagdollBodies + kRagdollStride * i;
+    for (int k = 0; k < 3; ++k) out[7 * i + k] = BeF(b + 4 * k);
+    for (int k = 0; k < 4; ++k) out[7 * i + 3 + k] = BeF(b + 16 + 4 * k);
+  }
+}
 }  // namespace
 void Pgr4RagdollRateHook(PPCRegister& f0, PPCRegister& f1) {
+  if (REXCVAR_GET(pgr4_character_ragdoll_steps)) return;  // the game's 1/30 s
   if (!REXCVAR_GET(pgr4_character_ragdoll_time) || !(f1.f64 > 0.0)) return;
   f0.f64 = 1.0 / std::clamp(f1.f64, 0.001, 1.0 / 30.0);
+}
+namespace {
+bool PoseProbeLine();  // pgr4_character_pose_probe (below)
+}  // namespace
+namespace {
+void PoseStatsRagdollStep(uint32_t ragdoll, double dt, int steps);
+void PoseStatsRagdollDrawn(const uint8_t* base, uint32_t ragdoll, uint32_t pose, double weight,
+                           char how, float f);
+void PoseStatsCharacter(const uint8_t* base, uint32_t perso, double dt);
+void PoseStatsBones(uint8_t* base, uint32_t skeleton, uint32_t out, const std::vector<float>& now);
+}  // namespace
+REX_EXTERN(__imp__sub_824B6438);
+void Pgr4CadenceCount(int i);  // the frame-rate audit's counts (below)
+REX_HOOK_RAW(sub_824B6438) {
+  Pgr4CadenceCount(80);
+  const uint32_t ragdoll = ctx.r3.u32;
+  if (PoseProbeLine())
+    REXLOG_INFO("PGR4 pose probe: frame {} ragdoll step call (sub_824B6438) ragdoll {:08X} r4 {:08X} "
+                "f1 {:.5f}", g_frame_no, ragdoll, ctx.r4.u32, ctx.f1.f64);
+  const double dt = ctx.f1.f64;
+  if (!REXCVAR_GET(pgr4_character_ragdoll_steps) || ragdoll < 0x40000000 || !(dt > 0.0)) {
+    if (ragdoll >= 0x40000000) {
+      std::lock_guard lock(g_ragdolls_mutex);
+      if (!REXCVAR_GET(pgr4_character_ragdoll_steps)) g_ragdolls.erase(ragdoll);
+    }
+    if (ragdoll >= 0x40000000) PoseStatsRagdollStep(ragdoll, dt, -1);
+    __imp__sub_824B6438(ctx, base);
+    return;
+  }
+  const uint32_t count = RagdollCount(base, ragdoll);
+  RagdollSteps r;
+  {
+    std::lock_guard lock(g_ragdolls_mutex);
+    if (g_ragdolls.size() > 64) g_ragdolls.clear();  // ragdolls long gone
+    r = g_ragdolls[ragdoll];
+  }
+  // Another body count, or none stepped for half a second: a step now, no carry until two.
+  if (r.count != count || g_frame_no > r.frame + 30) r = {count, 0, kRagdollStep, false, {}, {}};
+  r.frame = g_frame_no;
+  r.time += std::min(dt, 0.25);
+  const PPCContext in = ctx;
+  int steps = 0;
+  while (r.time >= kRagdollStep - 1e-9 && steps < 4) {
+    ReadBodies(base, ragdoll, count, r.before);
+    ctx = in;
+    __imp__sub_824B6438(ctx, base);
+    r.time -= kRagdollStep;
+    ++steps;
+  }
+  if (steps == 4) r.time = std::min(r.time, kRagdollStep);  // far behind: no catching up
+  if (steps) {
+    ReadBodies(base, ragdoll, count, r.last);
+    r.has_before = true;
+  } else {
+    ctx = in;
+  }
+  if (g_accel_probe_left > 0)
+    REXLOG_INFO("PGR4 ragdoll steps: frame {} ragdoll {:08X} dt {:.5f} steps {} time left {:.5f} "
+                "bodies {} first body at {:.3f} {:.3f} {:.3f}",
+                g_frame_no, ragdoll, dt, steps, r.time, count, count ? r.last[0] : 0.0f,
+                count ? r.last[1] : 0.0f, count ? r.last[2] : 0.0f);
+  PoseStatsRagdollStep(ragdoll, dt, steps);
+  std::lock_guard lock(g_ragdolls_mutex);
+  g_ragdolls[ragdoll] = std::move(r);
+}
+// Development (20/11/2026, the AI riders drawn in two poses after some loads, a race's intro and
+// the pause included, also before today's changes): each character's update on the characters'
+// thread (sub_82474DA8, r3 the character, f1 its time; the counter +1760 that sub_82496680 moves
+// on when the time is not 0; the two poses' buffers +2440 and +2436), the ragdoll node
+// (sub_8249CCD8, r4 the record: +136 / +140 against the state pick its branch, +292 resets, +128
+// the pose, +132 the time, the bit 0 of *(+120) after) and the ragdoll pose's drawing
+// (sub_824B44F8, r3 the ragdoll, r4 the pose, f1 the weight), 900 lines from when it is switched
+// on.
+REXCVAR_DEFINE_BOOL(pgr4_character_pose_probe, false, "PGR4",
+                    "Development: log the characters' updates, ragdoll nodes and ragdoll pose "
+                    "drawings for 900 lines from when it is switched on");
+namespace {
+std::atomic<int> g_pose_probe_lines{0};
+bool PoseProbeLine() {
+  // The detail lines: 300 every 2 s (re-armed by the summary), so the probe never goes quiet.
+  return REXCVAR_GET(pgr4_character_pose_probe) && g_pose_probe_lines.fetch_sub(1) > 0;
+}
+// The continuous summary (pgr4_character_pose_probe), every 2 s, no budget: for each ragdoll its
+// step calls (stepped, run as is), its drawings (interpolated by pgr4_character_ragdoll_steps, drawn
+// as they are and why), the interpolation's fraction, the drawn pose and weight, and how far the drawn
+// bodies move between drawings; for each character its updates; for each skeleton its bone outputs
+// (sub_82493138). "Back and forth": an output far from the last one but near the one before (the
+// change from two back under 0.3 of the change from the last, the last over 0.005), which steady
+// motion never does. A skeleton doing it in over a third of its outputs is flagged FAULTY and the first
+// one's output buffer page-watched (once a run) to name its writers.
+struct BackAndForth {
+  std::vector<float> prev, prev2;
+  uint64_t calls = 0, back = 0, same_frame = 0, last_frame = ~0ull;
+  float d1_max = 0.0f, d1_sum = 0.0f, back_d1_max = 0.0f;
+  void Add(const std::vector<float>& now, uint64_t frame) {
+    ++calls;
+    if (frame == last_frame) ++same_frame;
+    last_frame = frame;
+    if (prev.size() == now.size()) {
+      float d1 = 0.0f, d2 = -1.0f;
+      for (size_t i = 0; i < now.size(); ++i) d1 = std::max(d1, std::abs(now[i] - prev[i]));
+      if (prev2.size() == now.size()) {
+        d2 = 0.0f;
+        for (size_t i = 0; i < now.size(); ++i) d2 = std::max(d2, std::abs(now[i] - prev2[i]));
+      }
+      d1_max = std::max(d1_max, d1);
+      d1_sum += d1;
+      if (d2 >= 0.0f && d1 > 0.005f && d2 < 0.3f * d1) ++back, back_d1_max = std::max(back_d1_max, d1);
+    }
+    prev2 = std::move(prev);
+    prev = now;
+  }
+  void Reset() { calls = back = same_frame = 0, d1_max = d1_sum = back_d1_max = 0.0f; }
+  std::string Text() const {
+    return fmt::format("{} ({} in a frame already) move max {:.4f} mean {:.4f}, back and forth {} "
+                       "(largest {:.4f})", calls, same_frame, d1_max, calls ? d1_sum / calls : 0.0f,
+                       back, back_d1_max);
+  }
+};
+struct RagdollStats {
+  uint64_t step_calls = 0, steps = 0, as_is = 0, zero_dt = 0, ours = 0, other = 0, no_history = 0,
+           off = 0;
+  float f_min = 2.0f, f_max = -1.0f, w_min = 2.0f, w_max = -1.0f;
+  double dt_sum = 0.0;
+  std::set<uint32_t> poses;
+  BackAndForth drawn;
+};
+struct CharacterStats {
+  uint64_t calls = 0, same_frame = 0, last_frame = ~0ull, zero_dt = 0;
+  double dt_sum = 0.0;
+  uint32_t counter_first = 0, counter_last = 0, a = 0, b = 0;
+};
+struct SkeletonStats {
+  std::set<uint32_t> outs;
+  BackAndForth bones;
+  uint32_t last_out = 0;
+};
+std::mutex g_pose_stats_mutex;
+std::map<uint32_t, RagdollStats> g_pose_ragdolls;
+std::map<uint32_t, CharacterStats> g_pose_characters;
+std::map<uint32_t, SkeletonStats> g_pose_skeletons;
+void PoseStatsSummary(uint8_t* base) {
+  static auto last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(2)) return;
+  last = now;
+  g_pose_probe_lines = 300;
+  uint32_t faulty_out = 0, faulty_skeleton = 0;
+  for (auto& [ragdoll, r] : g_pose_ragdolls) {
+    if (!r.step_calls && !r.drawn.calls) continue;
+    std::string poses;
+    for (const uint32_t p : r.poses) poses += fmt::format(" {:08X}", p);
+    REXLOG_INFO("PGR4 pose summary: frame {} ragdoll {:08X}: step calls {} (stepped {} times; run as "
+                "is {}, time 0 in {}) time {:.3f} s; drawn {}; interpolated {} (fraction {:.3f}..{:.3f}), "
+                "as they are: bodies set otherwise {}, no history {}, steps off {}; weight "
+                "{:.3f}..{:.3f}; poses{}", g_frame_no, ragdoll, r.step_calls, r.steps, r.as_is,
+                r.zero_dt, r.dt_sum, r.drawn.Text(), r.ours, r.f_min, r.f_max, r.other, r.no_history,
+                r.off, r.w_min, r.w_max, poses);
+    BackAndForth keep = std::move(r.drawn);
+    keep.Reset();
+    r = {};
+    r.drawn = std::move(keep);
+  }
+  for (auto& [perso, c] : g_pose_characters) {
+    if (!c.calls) continue;
+    REXLOG_INFO("PGR4 pose summary: frame {} character {:08X}: updates {} ({} in a frame already, time "
+                "0 in {}) time {:.3f} s, counter {} -> {}, poses A {:08X} B {:08X}", g_frame_no, perso,
+                c.calls, c.same_frame, c.zero_dt, c.dt_sum, c.counter_first, c.counter_last, c.a, c.b);
+    const uint64_t lf = c.last_frame;
+    c = {};
+    c.last_frame = lf;
+  }
+  for (auto& [skeleton, k] : g_pose_skeletons) {
+    if (!k.bones.calls) continue;
+    std::string outs;
+    for (const uint32_t o : k.outs) outs += fmt::format(" {:08X}", o);
+    const bool faulty = k.bones.calls >= 20 && k.bones.back * 3 > k.bones.calls;
+    REXLOG_INFO("PGR4 pose summary: frame {} skeleton {:08X}: bone outputs {}; outputs{}{}", g_frame_no,
+                skeleton, k.bones.Text(), outs, faulty ? " FAULTY" : "");
+    if (faulty && !faulty_out) faulty_out = k.last_out, faulty_skeleton = skeleton;
+    k.bones.Reset();
+    k.outs.clear();
+  }
+  static bool watched = false;
+  if (faulty_out && !watched) {
+    watched = true;
+    REXLOG_INFO("PGR4 pose summary: skeleton {:08X} goes back and forth: its output {:08X} watched",
+                faulty_skeleton, faulty_out);
+    const uint32_t count = std::min<uint32_t>(BeU32At(GuestBytes(base, faulty_skeleton + 4)), 256);
+    WriteWatchStart(base, faulty_out, (24 * count + 63) / 64);
+  }
+  WriteWatchReport({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19});
+}
+void PoseStatsRagdollStep(uint32_t ragdoll, double dt, int steps) {
+  if (!REXCVAR_GET(pgr4_character_pose_probe)) return;
+  std::lock_guard lock(g_pose_stats_mutex);
+  RagdollStats& r = g_pose_ragdolls[ragdoll];
+  ++r.step_calls;
+  if (steps < 0) ++r.as_is; else r.steps += uint64_t(steps);
+  if (!(dt > 0.0)) ++r.zero_dt;
+  r.dt_sum += dt;
+}
+// how: 'i' interpolated, 'o' bodies set otherwise, 'n' no history, 'x' steps off.
+void PoseStatsRagdollDrawn(const uint8_t* base, uint32_t ragdoll, uint32_t pose, double weight,
+                           char how, float f) {
+  if (!REXCVAR_GET(pgr4_character_pose_probe)) return;
+  std::vector<float> bodies;
+  ReadBodies(base, ragdoll, RagdollCount(base, ragdoll), bodies);
+  std::lock_guard lock(g_pose_stats_mutex);
+  RagdollStats& r = g_pose_ragdolls[ragdoll];
+  r.drawn.Add(bodies, g_frame_no);
+  if (how == 'i') ++r.ours, r.f_min = std::min(r.f_min, f), r.f_max = std::max(r.f_max, f);
+  else if (how == 'o') ++r.other;
+  else if (how == 'n') ++r.no_history;
+  else ++r.off;
+  r.w_min = std::min(r.w_min, float(weight));
+  r.w_max = std::max(r.w_max, float(weight));
+  if (r.poses.size() < 8) r.poses.insert(pose);
+}
+void PoseStatsCharacter(const uint8_t* base, uint32_t perso, double dt) {
+  if (!REXCVAR_GET(pgr4_character_pose_probe)) return;
+  std::lock_guard lock(g_pose_stats_mutex);
+  CharacterStats& c = g_pose_characters[perso];
+  const uint32_t counter = BeU32At(base + perso + 1760);
+  if (!c.calls) c.counter_first = counter;
+  c.counter_last = counter;
+  ++c.calls;
+  if (c.last_frame == g_frame_no) ++c.same_frame;
+  c.last_frame = g_frame_no;
+  if (dt == 0.0) ++c.zero_dt;
+  c.dt_sum += dt;
+  c.a = BeU32At(base + perso + 2440);
+  c.b = BeU32At(base + perso + 2436);
+}
+void PoseStatsBones(uint8_t* base, uint32_t skeleton, uint32_t out, const std::vector<float>& now) {
+  if (!REXCVAR_GET(pgr4_character_pose_probe)) return;
+  std::lock_guard lock(g_pose_stats_mutex);
+  SkeletonStats& k = g_pose_skeletons[skeleton];
+  k.bones.Add(now, g_frame_no);
+  if (k.outs.size() < 8) k.outs.insert(out);
+  k.last_out = out;
+  PoseStatsSummary(base);
+}
+}  // namespace
+REX_EXTERN(__imp__sub_82474DA8);
+REX_HOOK_RAW(sub_82474DA8) {
+  const uint32_t perso = ctx.r3.u32;
+  const double dt = ctx.f1.f64;
+  const uint32_t counter_before = BeU32At(base + perso + 1760);
+  const uint64_t frame_in = g_frame_no;
+  __imp__sub_82474DA8(ctx, base);
+  if (perso >= 0x40000000) PoseStatsCharacter(base, perso, dt);
+  if (REXCVAR_GET(pgr4_character_pose_probe) && dt == 0.0 && perso >= 0x40000000) {
+    // While paused: each 4-byte word of the character (+0 to +3200) that changed since the last
+    // call, its old and new value (as a float and in hex), the first 16.
+    static std::mutex m;
+    static std::unordered_map<uint32_t, std::vector<uint8_t>> snapshots;
+    std::lock_guard lock(m);
+    auto& snap = snapshots[perso];
+    const uint8_t* now = base + perso;
+    if (snap.size() == 3200) {
+      std::string changed;
+      int n = 0, total = 0;
+      for (uint32_t o = 0; o < 3200; o += 4) {
+        if (std::memcmp(snap.data() + o, now + o, 4) == 0) continue;
+        ++total;
+        if (n++ < 16)
+          changed += fmt::format(" +{} {:08X}->{:08X} ({:.4g}->{:.4g})", o, BeU32At(snap.data() + o),
+                                 BeU32At(now + o), BeF(snap.data() + o), BeF(now + o));
+      }
+      if (total && PoseProbeLine())
+        REXLOG_INFO("PGR4 pose probe: frame {} paused character {:08X}: {} words changed:{}",
+                    g_frame_no, perso, total, changed);
+    }
+    snap.assign(now, now + 3200);
+  }
+  if (PoseProbeLine()) {
+    // The two poses' bone buffers (24 bytes a bone): their first 64 bones hashed, to see a still
+    // character (the pause) drawn from bones that change.
+    auto bones = [&](uint32_t at) -> uint64_t {
+      const uint32_t buf = BeU32At(base + perso + at);
+      if (buf < 0x40000000) return 0;
+      uint64_t h = 1469598103934665603ull;  // FNV-1a
+      const uint8_t* b = GuestBytes(base, buf);
+      for (uint32_t i = 0; i < 24 * 52; ++i) h = (h ^ b[i]) * 1099511628211ull;
+      return h;
+    };
+    REXLOG_INFO("PGR4 pose probe: frame {} -> {} character {:08X} dt {:.5f} counter {} -> {} pose A "
+                "{:08X} {:016X} B {:08X} {:016X}", frame_in, g_frame_no, perso, dt, counter_before,
+                BeU32At(base + perso + 1760), BeU32At(base + perso + 2440), bones(2440),
+                BeU32At(base + perso + 2436), bones(2436));
+  }
+}
+namespace {
+uint64_t PoseHash(const uint8_t* base, uint32_t at, uint32_t size) {
+  if (at < 0x40000000 || !size) return 0;
+  uint64_t h = 1469598103934665603ull;  // FNV-1a
+  const uint8_t* p = GuestBytes(base, at);
+  for (uint32_t i = 0; i < size; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  return h;
+}
+// A call on the characters' path: its arguments, and for the ragdoll node's branches (r3 the
+// state, r4 the record) the state's first word against the record's +136 and +140.
+void PoseTrace(const uint8_t* base, const PPCContext& ctx, const char* what, bool branch) {
+  if (!PoseProbeLine()) return;
+  if (branch)
+    REXLOG_INFO("PGR4 pose probe: frame {} {} state {:08X} (*state {}) record {:08X} +136 {} +140 {} "
+                "+292 {} f1 {:.5f}", g_frame_no, what, ctx.r3.u32, BeU32At(base + ctx.r3.u32),
+                ctx.r4.u32, BeU32At(base + ctx.r4.u32 + 136), BeU32At(base + ctx.r4.u32 + 140),
+                base[ctx.r4.u32 + 292], ctx.f1.f64);
+  else
+    REXLOG_INFO("PGR4 pose probe: frame {} {} r3 {:08X} r4 {:08X} r5 {:08X} r6 {:08X} f1 {:.5f}",
+                g_frame_no, what, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.f1.f64);
+}
+}  // namespace
+#define PGR4_POSE_TRACE(name, what, branch)                                                      REX_EXTERN(__imp__##name);                                                                     REX_HOOK_RAW(name) {                                                                             PoseTrace(base, ctx, what, branch);                                                            __imp__##name(ctx, base);                                                                    }
+// The ragdoll node's branches (sub_8249CCD8): the first pass, a reset, the normal one (by the
+// body's flag), the second pass of the frame (the pose reused, no step).
+PGR4_POSE_TRACE(sub_8249C098, "branch C098 (reset, body flag)", true)
+PGR4_POSE_TRACE(sub_8249C6B0, "branch C6B0 (reset)", true)
+PGR4_POSE_TRACE(sub_8249C1F0, "branch C1F0 (normal, body flag)", true)
+PGR4_POSE_TRACE(sub_8249C9E0, "branch C9E0 (normal)", true)
+PGR4_POSE_TRACE(sub_8249BFC0, "branch BFC0 (reused)", true)
+PGR4_POSE_TRACE(sub_82496680, "counter step (sub_82496680)", false)
+PGR4_POSE_TRACE(sub_824968C8, "pose graph (sub_824968C8)", false)
+PGR4_POSE_TRACE(sub_82474950, "pose buffers reset (sub_82474950)", false)
+// The ragdoll pose's weight (sub_8249FED8 returns it in f1).
+REX_EXTERN(__imp__sub_8249FED8);
+REX_HOOK_RAW(sub_8249FED8) {
+  const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32;
+  __imp__sub_8249FED8(ctx, base);
+  if (PoseProbeLine())
+    REXLOG_INFO("PGR4 pose probe: frame {} ragdoll weight (sub_8249FED8) r3 {:08X} r4 {:08X} -> {:.4f}",
+                g_frame_no, r3, r4, ctx.f1.f64);
+}
+// The bones made for the drawing (sub_82493138: r3 the skeleton, its bone count at +4; r4 the
+// output, 24 bytes a bone, hashed after).
+REX_EXTERN(__imp__sub_82493138);
+REX_HOOK_RAW(sub_82493138) {
+  const uint32_t skeleton = ctx.r3.u32, out = ctx.r4.u32;
+  const uint32_t count = skeleton >= 0x40000000 ? std::min<uint32_t>(BeU32At(base + skeleton + 4), 256) : 0;
+  __imp__sub_82493138(ctx, base);
+  if (!REXCVAR_GET(pgr4_character_pose_probe) || out < 0x40000000 || !count) return;
+  // The output as floats (6 a bone), against this skeleton's last two outputs.
+  static std::mutex m;
+  static std::unordered_map<uint32_t, std::pair<std::vector<float>, std::vector<float>>> last;
+  std::vector<float> now(size_t(count) * 6);
+  const uint8_t* const bones = GuestBytes(base, out);
+  for (size_t i = 0; i < now.size(); ++i) now[i] = BeF(bones + 4 * uint32_t(i));
+  std::lock_guard lock(m);
+  auto& [prev, prev2] = last[skeleton];
+  float d1 = 0.0f, d2 = 0.0f;
+  size_t at1 = 0;
+  for (size_t i = 0; i < now.size(); ++i) {
+    if (prev.size() == now.size() && std::abs(now[i] - prev[i]) > d1) d1 = std::abs(now[i] - prev[i]), at1 = i;
+    if (prev2.size() == now.size()) d2 = std::max(d2, std::abs(now[i] - prev2[i]));
+  }
+  if (PoseProbeLine())
+    REXLOG_INFO("PGR4 pose probe: frame {} bones out (sub_82493138) skeleton {:08X} bones {} out {:08X} "
+                "{:016X} change from the last {:.5f} (bone {} float {}: {:.5f} -> {:.5f}), from the one "
+                "before {:.5f}", g_frame_no, skeleton, count, out, PoseHash(base, out, 24 * count), d1,
+                at1 / 6, at1 % 6, prev.size() == now.size() ? prev[at1] : 0.0f, now[at1], d2);
+  PoseStatsBones(base, skeleton, out, now);
+  prev2 = std::move(prev);
+  prev = std::move(now);
+}
+REX_EXTERN(__imp__sub_8249CCD8);
+REX_HOOK_RAW(sub_8249CCD8) {
+  const uint32_t rec = ctx.r4.u32;
+  const uint8_t* r = base + rec;
+  const uint32_t r136 = BeU32At(r + 136), r140 = BeU32At(r + 140), r128 = BeU32At(r + 128);
+  const float dt = BeF(r + 132);
+  const uint8_t r292 = r[292];
+  __imp__sub_8249CCD8(ctx, base);
+  if (PoseProbeLine())
+    REXLOG_INFO("PGR4 pose probe: frame {} ragdoll node record {:08X} dt {:.5f} +136 {} +140 {} +292 {} "
+                "+128 {:08X} ragdoll pose bit {}", g_frame_no, rec, dt, r136, r140, r292, r128,
+                BeU32At(r + 120) >= 0x40000000 ? BeU32At(base + BeU32At(r + 120)) & 1 : 9u);
+}
+// The drawing of a ragdoll's pose (see pgr4_character_ragdoll_steps above).
+REX_EXTERN(__imp__sub_824B44F8);
+REX_HOOK_RAW(sub_824B44F8) {
+  const uint32_t ragdoll = ctx.r3.u32;
+  if (REXCVAR_GET(pgr4_character_pose_probe) && ragdoll >= 0x40000000) {
+    static std::mutex m;
+    static std::unordered_map<uint32_t, std::vector<float>> last;
+    const uint32_t count = RagdollCount(base, ragdoll);
+    std::vector<float> now;
+    ReadBodies(base, ragdoll, count, now);
+    std::lock_guard lock(m);
+    auto& prev = last[ragdoll];
+    float d = 0.0f;
+    if (prev.size() == now.size())
+      for (size_t i = 0; i < now.size(); ++i) d = std::max(d, std::abs(now[i] - prev[i]));
+    if (PoseProbeLine())
+      REXLOG_INFO("PGR4 pose probe: frame {} ragdoll pose drawn: ragdoll {:08X} pose {:08X} weight {:.3f} "
+                  "bodies {} change from the last drawing {:.5f}", g_frame_no, ragdoll, ctx.r4.u32,
+                  ctx.f1.f64, count, d);
+    prev = std::move(now);
+  }
+  std::vector<uint8_t> kept;
+  char how = 'x';
+  float how_f = 0.0f;
+  if (REXCVAR_GET(pgr4_character_ragdoll_steps) && ragdoll >= 0x40000000) {
+    how = 'n';
+    std::lock_guard lock(g_ragdolls_mutex);
+    const auto it = g_ragdolls.find(ragdoll);
+    const uint32_t count = RagdollCount(base, ragdoll);
+    // Only while the bodies are still our last step's, bit for bit: a ragdoll the game set
+    // otherwise since (a reset, a load giving its address to another rider, the race's intro
+    // where it draws riders without stepping them) is drawn as it is, and its history dropped.
+    bool ours = it != g_ragdolls.end() && it->second.has_before && it->second.count == count &&
+                it->second.last.size() == size_t(count) * 7;
+    if (ours) {
+      std::vector<float> now;
+      ReadBodies(base, ragdoll, count, now);
+      ours = std::memcmp(now.data(), it->second.last.data(), now.size() * sizeof(float)) == 0;
+      if (!ours) g_ragdolls.erase(it), how = 'o';
+    }
+    if (ours) {
+      const RagdollSteps& r = it->second;
+      const float f = float(std::clamp(r.time / kRagdollStep, 0.0, 1.0));
+      how = 'i';
+      how_f = f;
+      kept.assign(base + ragdoll + kRagdollBodies,
+                  base + ragdoll + kRagdollBodies + kRagdollStride * count);
+      for (uint32_t i = 0; i < count; ++i) {
+        uint8_t* b = base + ragdoll + kRagdollBodies + kRagdollStride * i;
+        const float* a = &r.before[7 * i];
+        const float* l = &r.last[7 * i];
+        for (int k = 0; k < 3; ++k) PutBeF(b + 4 * k, a[k] + (l[k] - a[k]) * f);
+        // The quaternion between the last two steps, f of the way, the nearer sign.
+        float dot = 0.0f;
+        for (int k = 0; k < 4; ++k) dot += a[3 + k] * l[3 + k];
+        const float s = dot < 0.0f ? -1.0f : 1.0f;
+        float q[4], len = 0.0f;
+        for (int k = 0; k < 4; ++k) {
+          q[k] = s * a[3 + k] + (l[3 + k] - s * a[3 + k]) * f;
+          len += q[k] * q[k];
+        }
+        if (!(len > 1e-12f)) continue;
+        len = std::sqrt(len);
+        for (int k = 0; k < 4; ++k) PutBeF(b + 16 + 4 * k, q[k] / len);
+      }
+    }
+  }
+  if (ragdoll >= 0x40000000) PoseStatsRagdollDrawn(base, ragdoll, ctx.r4.u32, ctx.f1.f64, how, how_f);
+  __imp__sub_824B44F8(ctx, base);
+  if (!kept.empty()) std::memcpy(base + ragdoll + kRagdollBodies, kept.data(), kept.size());
 }
 REX_EXTERN(__imp__sub_8249C3E0);
 REX_HOOK_RAW(sub_8249C3E0) {
   const uint32_t state = ctx.r3.u32;
   uint8_t* const st = base + state;
   const uint8_t* const r = base + ctx.r4.u32;
-  const uint8_t* const body = base + BeU32At(r + 116);
+  const uint32_t body_at = BeU32At(r + 116);
+  const uint8_t* const body = base + body_at;
   const float dt = BeF(r + 132);
   // The game's own reset (another vehicle, or its +292 set): no history to go by.
   const bool same = BeU32At(st) == BeU32At(r + 140) && r[292] == 0;
+  static bool probe_was = false;
+  const bool probe_on = REXCVAR_GET(pgr4_character_accel_probe);
+  if (probe_on && !probe_was) g_accel_probe_left = 240;
+  probe_was = probe_on;
   if (!REXCVAR_GET(pgr4_character_accel_window) || !same || !(dt > 1e-5f) || dt > 0.25f) {
     g_character_velocities.erase(state);
-  } else {
-    VelocityHistory& h = g_character_velocities[state];
-    h.clock += dt;
-    VelocitySample now{h.clock, {}, {}};
-    for (int k = 0; k < 3; ++k) {
-      now.v[k] = BeF(body + 112 + 4 * k);
-      now.w[k] = BeF(body + 124 + 4 * k);
-    }
-    h.samples.push_back(now);
-    while (h.samples.size() > 2 && h.samples[1].time < h.clock - 0.2) h.samples.erase(h.samples.begin());
-    // The velocities 1/30 s ago, between the two samples around then; the oldest while the
-    // history is shorter.
-    const double target = h.clock - 1.0 / 30.0;
+    g_character_update_steps.erase(state);
+    __imp__sub_8249C3E0(ctx, base);
+    return;
+  }
+  float v[3], w[3];
+  for (int k = 0; k < 3; ++k) {
+    v[k] = BeF(body + 112 + 4 * k);
+    w[k] = BeF(body + 124 + 4 * k);
+  }
+  // Over time: the velocities 1/30 s ago, between the two frame samples around then (the oldest
+  // while the history is shorter).
+  VelocityHistory& hist = g_character_velocities[state];
+  const bool v_changed = hist.samples.empty() || !SameVector(hist.samples.back().v, v);
+  const bool w_changed = hist.samples.empty() || !SameVector(hist.samples.back().w, w);
+  hist.clock += dt;
+  hist.samples.push_back({hist.clock, {v[0], v[1], v[2]}, {w[0], w[1], w[2]}});
+  while (hist.samples.size() > 2 && hist.samples[1].time < hist.clock - 0.2)
+    hist.samples.erase(hist.samples.begin());
+  double av[3] = {}, aw[3] = {};
+  bool window_ok = false;
+  {
+    const double target = hist.clock - 1.0 / 30.0;
     float old_v[3], old_w[3];
     double span = 0.0;
-    if (h.samples.front().time >= target) {
-      span = h.clock - h.samples.front().time;
-      std::copy(h.samples.front().v, h.samples.front().v + 3, old_v);
-      std::copy(h.samples.front().w, h.samples.front().w + 3, old_w);
+    if (hist.samples.front().time >= target) {
+      span = hist.clock - hist.samples.front().time;
+      std::copy(hist.samples.front().v, hist.samples.front().v + 3, old_v);
+      std::copy(hist.samples.front().w, hist.samples.front().w + 3, old_w);
     } else {
       span = 1.0 / 30.0;
       size_t i = 1;
-      while (h.samples[i].time < target) ++i;
-      const VelocitySample& a = h.samples[i - 1];
-      const VelocitySample& b = h.samples[i];
+      while (hist.samples[i].time < target) ++i;
+      const VelocitySample& a = hist.samples[i - 1];
+      const VelocitySample& b = hist.samples[i];
       const double f = b.time > a.time ? (target - a.time) / (b.time - a.time) : 1.0;
       for (int k = 0; k < 3; ++k) {
         old_v[k] = float(a.v[k] + (b.v[k] - a.v[k]) * f);
         old_w[k] = float(a.w[k] + (b.w[k] - a.w[k]) * f);
       }
     }
-    if (span > 1e-4) {
-      // The last call's velocities such that (now - last) / dt is that acceleration.
+    window_ok = span > 1e-4;
+    if (window_ok)
       for (int k = 0; k < 3; ++k) {
-        const double av = (now.v[k] - old_v[k]) / span, aw = (now.w[k] - old_w[k]) / span;
-        PutBeF(st + 48 + 4 * k, float(now.v[k] - av * dt));
-        PutBeF(st + 64 + 4 * k, float(now.w[k] - aw * dt));
+        av[k] = (v[k] - old_v[k]) / span;
+        aw[k] = (w[k] - old_w[k]) / span;
       }
-      const double s = ctx.f1.f64;
-      if (s > 0.0 && s < 1.0) ctx.f1.f64 = 1.0 - std::pow(1.0 - s, double(dt) * 30.0);
+  }
+  // From the vehicle's steps and rows (see above).
+  bool from_steps = false, w_from_steps = false, rows_turned = false, update_steps = false,
+       moved_between = false;
+  uint32_t vehicle = 0;
+  int32_t step = 0;
+  double rows_span = 0.0;
+  const char* why = "";
+  if (REXCVAR_GET(pgr4_character_accel_steps)) {
+    const double h = double(BeF(base + 0x82001170));
+    const int32_t un = g_vehicle_update_n.load();
+    {
+      std::lock_guard lock(g_body_vehicles_mutex);
+      const auto it = g_body_vehicles.find(body_at);
+      if (it == g_body_vehicles.end() || it->second.frame != g_frame_no) {
+        why = " (no vehicle wrote it this frame)";
+      } else if (!(h > 0.0)) {
+        why = " (no step length)";
+      } else {
+        const BodyVehicle& bv = it->second;
+        vehicle = bv.vehicle;
+        const VehicleStep* now_step = VehicleStepAt(bv.steps, un);
+        const VehicleStep* before = VehicleStepAt(bv.steps, un - 2);
+        auto close = [](double a, double b) { return std::abs(a - b) <= 1e-4 * (1.0 + std::abs(b)); };
+        if (!now_step || !before) {
+          why = " (steps not sampled yet)";
+        } else {
+          step = now_step->n;
+          // The velocities: the physics' as they are (sub_82475A30: a bike's), or turned by the
+          // vehicle's rows (sub_82484C60 after it: a car's).
+          bool raw = true, turned = !bv.rows.empty() && bv.rows_frame == g_frame_no;
+          const float* m1 = turned ? bv.rows.back().m : nullptr;
+          for (int k = 0; k < 3; ++k) {
+            raw = raw && close(now_step->v[k], v[k]);
+            if (turned)
+              turned = close(m1[3 * k] * now_step->v[0] + m1[3 * k + 1] * now_step->v[1] +
+                                 m1[3 * k + 2] * now_step->v[2],
+                             v[k]);
+          }
+          if (turned) {
+            from_steps = true;
+            rows_turned = true;
+            float m0[9];
+            const double t1 = bv.rows.back().time;
+            rows_span = t1 - RowsAt(bv.rows, t1 - 1.0 / 30.0, m0);
+            for (int k = 0; k < 3; ++k) {
+              double a = 0.0;
+              for (int j = 0; j < 3; ++j) {
+                a += m1[3 * k + j] * (now_step->v[j] - before->v[j]) / (2.0 * h);
+                if (rows_span > 1e-4)
+                  a += (m1[3 * k + j] - m0[3 * k + j]) / rows_span * before->v[j];
+              }
+              av[k] = a;
+            }
+          } else if (raw) {
+            from_steps = true;
+            for (int k = 0; k < 3; ++k) av[k] = (now_step->v[k] - before->v[k]) / (2.0 * h);
+          } else {
+            why = " (not its physics' velocity)";
+          }
+          // The angular velocities: the physics' as they are (both).
+          w_from_steps = from_steps;
+          for (int k = 0; w_from_steps && k < 3; ++k) w_from_steps = close(now_step->w[k], w[k]);
+          if (w_from_steps)
+            for (int k = 0; k < 3; ++k) aw[k] = (now_step->w[k] - before->w[k]) / (2.0 * h);
+        }
+      }
+    }
+    // Velocities that move on only at the steps and are not their vehicle's +880 turned: the steps
+    // as the vehicle update's count saw them, one a frame, a step it did not see (two in a frame,
+    // below 60 frames a second) between its neighbours. Those that moved on while that count did
+    // not, in the last 120 frames, move on at each frame: the window over time.
+    UpdateSteps& u = g_character_update_steps[state];
+    VehicleStep sample{un, {v[0], v[1], v[2]}};
+    if (u.samples.empty() || un < u.samples.back().n || un > u.samples.back().n + 16) {
+      u.samples = {sample};
+    } else if (un > u.samples.back().n) {
+      u.samples.push_back(sample);
+      while (u.samples.front().n < un - 8) u.samples.erase(u.samples.begin());
+    } else if (!SameVector(u.samples.back().v, v)) {
+      u.moved_between = g_frame_no;
+    }
+    moved_between = u.moved_between && g_frame_no < u.moved_between + 120;
+    if (!from_steps && !moved_between && h > 0.0) {
+      const VehicleStep& at = u.samples.back();
+      const int32_t target = at.n - 2;
+      const VehicleStep& oldest = u.samples.front();
+      float old_v[3];
+      int32_t span = 0;
+      if (oldest.n >= target) {
+        span = at.n - oldest.n;
+        std::copy(oldest.v, oldest.v + 3, old_v);
+      } else {
+        span = 2;
+        size_t i = 1;
+        while (u.samples[i].n < target) ++i;
+        const VehicleStep& a = u.samples[i - 1];
+        const VehicleStep& b = u.samples[i];
+        const double f = double(target - a.n) / double(b.n - a.n);
+        for (int k = 0; k < 3; ++k) old_v[k] = float(a.v[k] + (b.v[k] - a.v[k]) * f);
+      }
+      if (span > 0) {
+        update_steps = true;
+        for (int k = 0; k < 3; ++k) av[k] = (at.v[k] - old_v[k]) / (double(span) * h);
+      }
     }
   }
+  if (from_steps || update_steps || window_ok) {
+    // The last call's velocities such that (velocities now - last) / dt is that acceleration.
+    for (int k = 0; k < 3; ++k) {
+      PutBeF(st + 48 + 4 * k, float(v[k] - av[k] * dt));
+      PutBeF(st + 64 + 4 * k, float(w[k] - aw[k] * dt));
+    }
+    const double weight = ctx.f1.f64;
+    if (weight > 0.0 && weight < 1.0) ctx.f1.f64 = 1.0 - std::pow(1.0 - weight, double(dt) * 30.0);
+  }
+  if (g_accel_probe_left > 0) {
+    --g_accel_probe_left;
+    // pgr4_character_velocity_watch: which code writes these velocities (the page watch on
+    // body +112, 64 bytes, once a run; its writes reported each probed call).
+    if (REXCVAR_GET(pgr4_character_velocity_watch)) {
+      WriteWatchStart(base, body_at + 112, 1);
+      WriteWatchReport({0});
+    }
+    REXLOG_INFO("PGR4 accel probe: frame {} state {:08X} n {} update n {} dt {:.5f} v {:.6f} {:.6f} "
+                "{:.6f}{} angular {:.6f} {:.6f} {:.6f}{} acceleration {:.3f} {:.3f} {:.3f} from {}",
+                g_frame_no, state, StepCount(base), g_vehicle_update_n.load(), dt, v[0], v[1], v[2],
+                v_changed ? "" : " (unchanged)", w[0], w[1], w[2], w_changed ? "" : " (unchanged)",
+                av[0], av[1], av[2],
+                from_steps ? fmt::format("vehicle {:08X} step {}, {} (angular {})", vehicle, step,
+                                         rows_turned ? fmt::format("turned, rows over {:.4f} s",
+                                                                   rows_span)
+                                                     : std::string("as they are"),
+                                         w_from_steps ? "too" : "over time")
+                : update_steps ? fmt::format("the update's steps{}", why)
+                               : fmt::format("time{}{}",
+                                             moved_between ? ", moved between steps" : "", why));
+  }
   __imp__sub_8249C3E0(ctx, base);
+}
+// The frame's vehicle update: the step count when it begins (see above).
+REX_EXTERN(__imp__sub_82437C18);
+REX_HOOK_RAW(sub_82437C18) {
+  g_vehicle_update_n = StepCount(base);
+  __imp__sub_82437C18(ctx, base);
+}
+// The character's vehicle body written from the vehicle (see above): the vehicle and its rows, by
+// the game's time.
+REX_EXTERN(__imp__sub_82484C60);
+REX_HOOK_RAW(sub_82484C60) {
+  const uint32_t body = ctx.r4.u32, car = ctx.r5.u32;
+  if (REXCVAR_GET(pgr4_character_accel_window) && REXCVAR_GET(pgr4_character_accel_steps) &&
+      body >= 0x40000000 && car >= 0x40000000) {
+    const double t = double(BeF(base + 0x82A8131C + 24));
+    RowsSample rows{t, {}};
+    for (int r = 0; r < 3; ++r)
+      for (int k = 0; k < 3; ++k) rows.m[3 * r + k] = BeF(base + car + 12560 + 16 * r + 4 * k);
+    std::lock_guard lock(g_body_vehicles_mutex);
+    if (g_body_vehicles.size() > 64) g_body_vehicles.clear();  // bodies long gone
+    BodyVehicle& bv = g_body_vehicles[body];
+    if (bv.vehicle != car) bv = {car, 0, 0, {}, {}};
+    bv.frame = bv.rows_frame = g_frame_no;
+    if (!bv.rows.empty() && t < bv.rows.back().time) bv.rows.clear();  // the time started over
+    if (!bv.rows.empty() && t == bv.rows.back().time) bv.rows.pop_back();  // paused: the same time
+    bv.rows.push_back(rows);
+    while (bv.rows.size() > 2 && bv.rows[1].time < t - 0.2) bv.rows.erase(bv.rows.begin());
+  }
+  __imp__sub_82484C60(ctx, base);
+}
+// sub_82475A30 (r4 the character's vehicle body, r5 the vehicle's pose, the vehicle + 736): copies
+// the pose's +144 and +176 (the vehicle's +880 and +912) to the body's +112 and +124 as they are
+// (read 20/11/2026); a bike's by sub_824817D8, a car's by sub_82484C60 before it turns the velocity.
+REX_EXTERN(__imp__sub_82475A30);
+REX_HOOK_RAW(sub_82475A30) {
+  const uint32_t body = ctx.r4.u32, pose = ctx.r5.u32;
+  if (REXCVAR_GET(pgr4_character_accel_window) && REXCVAR_GET(pgr4_character_accel_steps) &&
+      body >= 0x40000000 && pose >= 0x40000000 + 736) {
+    std::lock_guard lock(g_body_vehicles_mutex);
+    if (g_body_vehicles.size() > 64) g_body_vehicles.clear();  // bodies long gone
+    BodyVehicle& bv = g_body_vehicles[body];
+    if (bv.vehicle != pose - 736) bv = {pose - 736, 0, 0, {}, {}};
+    bv.frame = g_frame_no;
+  }
+  __imp__sub_82475A30(ctx, base);
+}
+// A step's physics (both loops): the physics' velocities of each vehicle a character's body was
+// written from.
+REX_EXTERN(__imp__sub_823058C8);
+REX_HOOK_RAW(sub_823058C8) {
+  __imp__sub_823058C8(ctx, base);
+  if (!REXCVAR_GET(pgr4_character_accel_window) || !REXCVAR_GET(pgr4_character_accel_steps)) return;
+  const int32_t n = StepCount(base);
+  std::lock_guard lock(g_body_vehicles_mutex);
+  for (auto& [body, bv] : g_body_vehicles) {
+    if (g_frame_no > bv.frame + 30) continue;  // no longer written
+    VehiclePhysics p;
+    {
+      std::lock_guard plock(g_vehicle_physics_mutex);
+      const auto it = g_vehicle_physics.find(bv.vehicle);
+      if (it != g_vehicle_physics.end()) p = it->second;
+    }
+    if (p.physics < 0x40000000 || !p.v_at || !p.w_at) continue;
+    VehicleStep sample{n, {}, {}};
+    for (int k = 0; k < 3; ++k) {
+      sample.v[k] = BeF(base + p.physics + p.v_at + 4 * k);
+      sample.w[k] = BeF(base + p.physics + p.w_at + 4 * k);
+    }
+    if (!bv.steps.empty() && bv.steps.back().n > n) bv.steps.clear();  // the count started over
+    if (!bv.steps.empty() && bv.steps.back().n == n) bv.steps.pop_back();  // the same step again
+    bv.steps.push_back(sample);
+    while (bv.steps.front().n < n - 12) bv.steps.erase(bv.steps.begin());
+  }
 }
 
 // pgr4_net_start_probe: the network race start check (sub_8265C268, NetRaceCore.RaceStartSynchronized:
@@ -3100,7 +4009,11 @@ PGR4_CADENCE(76, sub_824841D0)
 PGR4_CADENCE(77, sub_82485478)
 PGR4_CADENCE(78, sub_8248E700)
 PGR4_CADENCE(79, sub_824945B8)
-PGR4_CADENCE(80, sub_824B6438)
+// 80, sub_824B6438: counted by its hook (pgr4_character_ragdoll_steps), Pgr4CadenceCount.
+void Pgr4CadenceCount(int i) {
+  if (g_cadence_on.load(std::memory_order_relaxed))
+    g_cadence_calls[i].fetch_add(1, std::memory_order_relaxed);
+}
 PGR4_CADENCE(81, sub_824B86F8)
 PGR4_CADENCE(82, sub_824DC5E8)
 PGR4_CADENCE(83, sub_824FD038)
@@ -3508,6 +4421,24 @@ REXCVAR_DEFINE_BOOL(pgr4_audio_crowd_delay_by_time, true, "PGR4",
 REXCVAR_DEFINE_BOOL(pgr4_audio_collisions_by_console_frame, true, "PGR4",
                     "Collision sounds: the strongest impact of each console frame (1/30 s) sent, "
                     "as at 30 FPS, instead of one event a game frame");
+// Local change (20/11/2026, the frame-rate audit): the console frame above counted by the frames'
+// times held 1, 2 or 3 physics steps at 72 or 144 frames a second (its 1/30 s fell across the
+// frames), so a steady scrape changed strength from one sending to the next. The impacts are kept
+// at the physics steps (read 20/11/2026): sub_82694278 (a car's sound r3, the key r4, f1 the
+// strength) and sub_8268DCE8 (a bike's) write the slot of that key (+2208 / +2144 + 48 i, the
+// count at 0x82A84480; strength +32, flag +44) when f1 is stronger; sub_82697550 the scenery's
+// (+1248..+1295 of the collisions r3, strength +1280, flag +1296, always set). Each frame's
+// sending (sub_82696278, sub_8268FCD0, sub_82698628) sends the flagged slots and resets them all
+// (flag 0, strength 0x82258A0C's). pgr4_audio_collisions_by_steps: each kept impact is tagged with
+// its two physics steps (the console's frame: steps 2k + 1 and 2k + 2 by the step count n); a
+// sending sends the slots whose two steps are done and keeps the others for the next; a slot that
+// holds two steps done when the next two's first impact comes (two steps in a frame, from 30 to 60
+// frames a second) is set aside and reset first, and sent at the next sending. The strongest of
+// each 1/30 s of physics, the same at any frame rate. Replaces
+// pgr4_audio_collisions_by_console_frame when on. Read at each call.
+REXCVAR_DEFINE_BOOL(pgr4_audio_collisions_by_steps, true, "PGR4",
+                    "Collision sounds: the strongest impact of each two physics steps (1/30 s), "
+                    "the same at any frame rate");
 REXCVAR_DEFINE_BOOL(pgr4_audio_rate_probe, false, "PGR4",
                     "Development: the music's fades, the crowd's delay and the collision events "
                     "per second, in the log");
@@ -3550,8 +4481,12 @@ void AudioRateLog(const uint8_t* base) {
   r.since = now;
 }
 // A music fade step (at `at`) scaled for the call; `kept` is the game's, put back after.
+// With pgr4_game_frame_time (20/11/2026), the real frame time instead of the game's: the music
+// fades in real time like the console's frames, the pause and the menus included, where the game's
+// frame time is 0 and the game's fixed step a call came back (10 calls, 0.07 s at 144 FPS).
 void MusicStep(uint8_t* base, uint32_t at, bool active, float& kept, bool& scaled) {
-  const float dt = BeF(base + 0x82A81330);
+  const float dt =
+      REXCVAR_GET(pgr4_game_frame_time) ? Pgr4FrameStepSeconds() : BeF(base + 0x82A81330);
   kept = BeF(base + at);
   scaled = active && REXCVAR_GET(pgr4_music_fade_by_time) && dt > 0.0f;
   if (scaled) PutBeF(base + at, float(double(kept) * 30.0 * double(dt)));
@@ -3582,7 +4517,8 @@ void MusicRun(AudioFadeRun& run, bool active_before, bool active_after, uint32_t
 // no console frame, the slot (in the sound `obj`, the 48 bytes of key `key` from `first`) is kept
 // to be put back after the update, and nothing is sent.
 bool HoldCollision(uint8_t* base, uint32_t obj, uint32_t key, uint32_t first) {
-  if (!REXCVAR_GET(pgr4_audio_collisions_by_console_frame) ||
+  if (REXCVAR_GET(pgr4_audio_collisions_by_steps) ||
+      !REXCVAR_GET(pgr4_audio_collisions_by_console_frame) ||
       g_console_frame_start.load(std::memory_order_relaxed))
     return false;
   const uint32_t count = std::min(Be32(base, 0x82A84480), 64u);
@@ -3600,6 +4536,76 @@ bool HoldCollision(uint8_t* base, uint32_t obj, uint32_t key, uint32_t first) {
 void PutBackCollisions(uint8_t* base) {
   for (const HeldSlot& h : g_held_collisions) std::memcpy(base + h.address, h.bytes, 48);
   g_held_collisions.clear();
+}
+// pgr4_audio_collisions_by_steps: each slot's kept impact and its two steps, and one set aside.
+struct KeptWindow {
+  int32_t window = 0;
+  bool set_aside = false;
+  uint8_t bytes[49];
+};
+std::unordered_map<uint32_t, KeptWindow> g_kept_windows;  // by slot address
+struct Partial {
+  uint32_t address, size;
+  uint8_t bytes[49];
+};
+std::vector<Partial> g_partial_windows;  // kept back over a sending, put back after
+bool CollisionsBySteps() { return REXCVAR_GET(pgr4_audio_collisions_by_steps); }
+int32_t StepNow(const uint8_t* base) { return int32_t(Be32(base, 0x82A17644)); }
+int32_t ImpactWindow(const uint8_t* base) { return (StepNow(base) - 1) >> 1; }
+bool WindowDone(const uint8_t* base, int32_t window) { return (StepNow(base) >> 1) > window; }
+// Before an impact is kept in `slot` (`size` bytes, flag at `flag`, strength at `strength`): a
+// slot that still holds two steps done (not sent yet) is set aside (the stronger of two such) and
+// reset as a sending resets it.
+void BeforeKeep(uint8_t* base, uint32_t slot, uint32_t size, uint32_t flag, uint32_t strength) {
+  if (g_kept_windows.size() > 512) g_kept_windows.clear();
+  KeptWindow& k = g_kept_windows[slot];
+  if (!base[flag] || k.window >= ImpactWindow(base)) return;
+  if (!k.set_aside || BeF(base + strength) > BeF(k.bytes + (strength - slot))) {
+    std::memcpy(k.bytes, base + slot, size);
+    k.set_aside = true;
+  }
+  base[flag] = 0;
+  std::memcpy(base + strength, base + 0x82258A0C, 4);
+}
+void AfterKeep(const uint8_t* base, uint32_t slot, uint32_t flag, bool flagged_before) {
+  KeptWindow& k = g_kept_windows[slot];
+  const int32_t window = ImpactWindow(base);
+  if (base[flag] && (!flagged_before || k.window < window)) k.window = window;
+}
+// Before a sending: a slot set aside goes out now (what it holds kept back for later), a slot whose
+// two steps are not done is kept back.
+void BeforeSending(uint8_t* base, uint32_t slot, uint32_t size, uint32_t flag) {
+  const auto it = g_kept_windows.find(slot);
+  const bool flagged = base[flag] != 0;
+  const bool done = it == g_kept_windows.end() || WindowDone(base, it->second.window);
+  if (it != g_kept_windows.end() && it->second.set_aside) {
+    if (flagged) {
+      Partial p{slot, size, {}};
+      std::memcpy(p.bytes, base + slot, size);
+      g_partial_windows.push_back(p);
+    }
+    std::memcpy(base + slot, it->second.bytes, size);
+    it->second.set_aside = false;
+    ++g_audio_rate.held;
+    return;
+  }
+  if (flagged && !done) {
+    Partial p{slot, size, {}};
+    std::memcpy(p.bytes, base + slot, size);
+    g_partial_windows.push_back(p);
+    base[flag] = 0;
+    ++g_audio_rate.held;
+  }
+}
+void AfterSending(uint8_t* base) {
+  for (const Partial& p : g_partial_windows) std::memcpy(base + p.address, p.bytes, p.size);
+  g_partial_windows.clear();
+}
+// The slots of a car's or bike's sound `obj` from `first`.
+template <typename F>
+void ForSlots(const uint8_t* base, uint32_t obj, uint32_t first, F&& f) {
+  const uint32_t count = std::min(Be32(base, 0x82A84480), 64u);
+  for (uint32_t i = 0; i < count; ++i) f(obj + first + 48 * i);
 }
 }  // namespace
 REX_EXTERN(__imp__sub_8269D850);
@@ -3633,7 +4639,9 @@ REX_EXTERN(__imp__sub_82698628);
 REX_HOOK_RAW(sub_82698628) {
   const uint32_t c = ctx.r3.u32;
   const bool console_frame = g_console_frame_start.load(std::memory_order_relaxed);
-  const bool hold_world = REXCVAR_GET(pgr4_audio_collisions_by_console_frame) && !console_frame;
+  const bool by_steps = CollisionsBySteps();
+  const bool hold_world =
+      !by_steps && REXCVAR_GET(pgr4_audio_collisions_by_console_frame) && !console_frame;
   const bool hold_crowd = REXCVAR_GET(pgr4_audio_crowd_delay_by_time) && !console_frame;
   const bool active = base[c + 1236] != 0;
   const bool pending = base[c + 1296] != 0;
@@ -3648,7 +4656,9 @@ REX_HOOK_RAW(sub_82698628) {
     ++g_audio_rate.world;
     g_audio_rate.strongest = std::max(g_audio_rate.strongest, BeF(base + c + 1280));
   }
+  if (by_steps) BeforeSending(base, c + 1248, 49, c + 1296);
   __imp__sub_82698628(ctx, base);
+  if (by_steps) AfterSending(base);
   if (held) std::memcpy(base + c + 1248, kept, 49);
   if (hold_crowd && Be32(base, c + 1312) == counter + 1) PutBe32(base + c + 1312, counter);
   if (!REXCVAR_GET(pgr4_audio_rate_probe)) {
@@ -3677,7 +4687,11 @@ REX_HOOK_RAW(sub_82695700) {
 REX_EXTERN(__imp__sub_82696278);
 REX_HOOK_RAW(sub_82696278) {
   g_held_collisions.clear();
+  const bool by_steps = CollisionsBySteps();
+  if (by_steps)
+    ForSlots(base, ctx.r3.u32, 2208, [&](uint32_t s) { BeforeSending(base, s, 48, s + 44); });
   __imp__sub_82696278(ctx, base);
+  if (by_steps) AfterSending(base);
   PutBackCollisions(base);
 }
 REX_EXTERN(__imp__sub_8268F3A0);
@@ -3692,8 +4706,57 @@ REX_HOOK_RAW(sub_8268F3A0) {
 REX_EXTERN(__imp__sub_8268FCD0);
 REX_HOOK_RAW(sub_8268FCD0) {
   g_held_collisions.clear();
+  const bool by_steps = CollisionsBySteps();
+  if (by_steps)
+    ForSlots(base, ctx.r3.u32, 2144, [&](uint32_t s) { BeforeSending(base, s, 48, s + 44); });
   __imp__sub_8268FCD0(ctx, base);
+  if (by_steps) AfterSending(base);
   PutBackCollisions(base);
+}
+// The keeping of an impact (see pgr4_audio_collisions_by_steps above).
+REX_EXTERN(__imp__sub_82694278);
+REX_HOOK_RAW(sub_82694278) {
+  if (!CollisionsBySteps()) {
+    __imp__sub_82694278(ctx, base);
+    return;
+  }
+  const uint32_t obj = ctx.r3.u32, key = ctx.r4.u32;
+  std::vector<std::pair<uint32_t, bool>> slots;
+  ForSlots(base, obj, 2208, [&](uint32_t s) {
+    if (Be32(base, s) != key) return;
+    BeforeKeep(base, s, 48, s + 44, s + 32);
+    slots.push_back({s, base[s + 44] != 0});
+  });
+  __imp__sub_82694278(ctx, base);
+  for (const auto& [s, flagged] : slots) AfterKeep(base, s, s + 44, flagged);
+}
+REX_EXTERN(__imp__sub_8268DCE8);
+REX_HOOK_RAW(sub_8268DCE8) {
+  if (!CollisionsBySteps()) {
+    __imp__sub_8268DCE8(ctx, base);
+    return;
+  }
+  const uint32_t obj = ctx.r3.u32, key = ctx.r4.u32;
+  std::vector<std::pair<uint32_t, bool>> slots;
+  ForSlots(base, obj, 2144, [&](uint32_t s) {
+    if (Be32(base, s) != key) return;
+    BeforeKeep(base, s, 48, s + 44, s + 32);
+    slots.push_back({s, base[s + 44] != 0});
+  });
+  __imp__sub_8268DCE8(ctx, base);
+  for (const auto& [s, flagged] : slots) AfterKeep(base, s, s + 44, flagged);
+}
+REX_EXTERN(__imp__sub_82697550);
+REX_HOOK_RAW(sub_82697550) {
+  if (!CollisionsBySteps()) {
+    __imp__sub_82697550(ctx, base);
+    return;
+  }
+  const uint32_t c = ctx.r3.u32;
+  BeforeKeep(base, c + 1248, 49, c + 1296, c + 1280);
+  const bool flagged = base[c + 1296] != 0;
+  __imp__sub_82697550(ctx, base);
+  AfterKeep(base, c + 1248, c + 1296, flagged);
 }
 
 // --- The photo mode's camera (mode 513, sub_827D2400), updated at each frame of the photo mode

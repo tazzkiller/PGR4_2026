@@ -31,6 +31,7 @@
 #include "shader_translate.h"
 
 #include <atomic>
+#include <cstring>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -59,8 +60,31 @@ class ShaderReplacer {
     reflections_ = on;
   }
   uint64_t generation() const { return generation_.load(std::memory_order_acquire); }
+  // Local change (21/11/2026, a probe): the replacements whose compilation failed since the start,
+  // and the last one's ucode hash (draw.cpp's flare probe; 402 failed unseen that afternoon).
+  uint64_t failures() const { return failures_.load(std::memory_order_relaxed); }
+  uint64_t last_failure() const { return last_failure_.load(std::memory_order_relaxed); }
+  // A #define of the tunings as last compiled with (TuningDefines: "kFlare ", ...), its value's
+  // text; empty when none yet.
+  std::string CompiledTuning(const char* name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t at = tuning_.find(name);
+    if (at == std::string::npos) return {};
+    const size_t from = at + std::strlen(name), end = tuning_.find(char(10), from);
+    return tuning_.substr(from, end == std::string::npos ? std::string::npos : end - from);
+  }
   // Local change (pgr4 project): changes whenever Has may answer otherwise (the files, on/off,
   // the reflections, the decals' light): the draws' memo of their shaders' answers is keyed by it.
+  // Local change (22/11/2026): what the replacements' bytecode is made from (the files and their
+  // write times, the tunings compiled in, on/off and the decals' light; both states of the
+  // reflections are precompiled), for the launcher's precompile to tell whether the pipelines it
+  // compiled before are still the same (draw.cpp PrecompileAndExit).
+  uint64_t ContentStamp();
+  // Local change (22/11/2026): ContentStamp's parts, (name, value): each HLSL file with its time,
+  // the tunings, the switches (the precompile names those that changed).
+  std::vector<std::pair<std::string, std::string>> ContentStampParts();
+  // The compiled replacements kept in <dir>\cache (their .cso files), for the same check.
+  size_t CachedCount() const;
   uint64_t stamp() const {
     return generation() * 8 + (enabled_ ? 1 : 0) + (reflections_ ? 2 : 0) +
            (decal_light_off_ ? 4 : 0) + uint64_t(files_.size()) * 0x100000000ull;
@@ -73,6 +97,12 @@ class ShaderReplacer {
   // Local change (pgr4 project): a car paint's replacement (it includes car_paint_hooks.hlsli).
   bool IsCarPaint(uint64_t hash) const;
   bool IsCarShader(uint64_t hash) const;  // its paint or its other parts (car_reflect_hooks)
+  // Local change (21/11/2026): a replacement reading the volumetric fog's volume (its file includes
+  // fog_volume_hooks.hlsli: shader_translate.h SystemConstantsWithSun::fog_volume).
+  bool UsesFogVolume(uint64_t hash) const { return enabled_ && fog_volume_files_.count(hash) != 0; }
+  // Local change (21/11/2026): replacements with the fog laid by the shader (their file has XeFog
+  // at the game's fog ending; their prelude defines it).
+  bool UsesFogShader(uint64_t hash) const { return enabled_ && fog_shader_files_.count(hash) != 0; }
   // Local change (pgr4 project): whether this translation's replacement is compiling in the
   // background (Get returned nullptr for it meanwhile).
   bool Pending(const DxbcShader::Translation& translation) {
@@ -110,6 +140,8 @@ class ShaderReplacer {
   // (pgr4_native_decal_light_off; their files name pgr4_decal_light), used only while it is on.
   bool decal_light_off_ = false;
   std::unordered_set<uint64_t> decal_files_;
+  std::unordered_set<uint64_t> fog_volume_files_;  // UsesFogVolume (ClassifyFiles)
+  std::unordered_set<uint64_t> fog_shader_files_;  // UsesFogShader (ClassifyFiles)
   void ClassifyFiles();  // reflection_files_ from files_ (mutex_ held or not shared yet)
   std::string tuning_;  // TuningDefines as last compiled with
   std::string tuning_wanted_;   // a changed tuning, applied once it held kTuningFrames
@@ -121,6 +153,7 @@ class ShaderReplacer {
   // Counted up by a reload (Poll) and by each background compilation that finishes, so that the
   // replaced shaders' pipelines are made again with what is compiled.
   std::atomic<uint64_t> generation_{0};
+  std::atomic<uint64_t> failures_{0}, last_failure_{0};  // failures(), last_failure()
   uint64_t files_epoch_ = 0;  // counted up by a reload: older background results are dropped
   uint32_t poll_ = 0;
   std::mutex mutex_;

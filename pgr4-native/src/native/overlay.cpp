@@ -37,6 +37,60 @@ REXCVAR_DECLARE(bool, pgr4_native_reactive_mask);
 REXCVAR_DECLARE(bool, pgr4_native_scaled_cube);
 REXCVAR_DECLARE(bool, pgr4_native_shader_replace);
 REXCVAR_DECLARE(bool, pgr4_native_gtao);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric);  // local change (20/11/2026): volumetrics.cpp
+REXCVAR_DECLARE(double, pgr4_native_volumetric_strength);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_density);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_distance);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_fog);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_fog_variation);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_fog_size);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_fog_sun);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_phase);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_fog_phase);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_range);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_mist);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_mist_height);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_mist_distance);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_height_scale);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_eye_height);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_thickness);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_wind);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_wind_angle);
+REXCVAR_DECLARE(int32_t, pgr4_native_volumetric_steps);
+REXCVAR_DECLARE(int32_t, pgr4_native_volumetric_shadow_steps);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_debug);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_lights);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_ground);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_fog_camera);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_eye_from_camera);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_fog_c12);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_transparents);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_visible_height);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_strength);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_range);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_reach);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_light_over_bulb);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_light_smooth);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_halo);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_halo_size);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_mist_detail);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_mist_detail_size);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_texture);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_texture_size);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_temporal);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_light_per_pixel);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_light_flare_place);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_cone);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_cone_soft);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_cone_top);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_cone_around);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_light_flare_colour);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_phase);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_red);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_green);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_blue);
+REXCVAR_DECLARE(int32_t, pgr4_native_volumetric_light_count);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_core);
 REXCVAR_DECLARE(int32_t, pgr4_native_ao_method);
 REXCVAR_DECLARE(int32_t, pgr4_native_xegtao_quality);
 REXCVAR_DECLARE(int32_t, pgr4_native_xegtao_denoise);
@@ -96,6 +150,8 @@ REXCVAR_DECLARE(double, pgr4_native_tune_harbour_distort);
 REXCVAR_DECLARE(double, pgr4_native_tune_harbour_waves);
 REXCVAR_DECLARE(double, pgr4_native_tune_highlights);
 REXCVAR_DECLARE(double, pgr4_native_tune_bloom);
+REXCVAR_DECLARE(double, pgr4_native_tune_flare);
+REXCVAR_DECLARE(double, pgr4_native_tune_flare_halo);
 REXCVAR_DECLARE(double, pgr4_native_tune_water_reflect);
 REXCVAR_DECLARE(double, pgr4_native_tune_water_sun_waves);  // shader_replace.cpp
 REXCVAR_DECLARE(double, pgr4_native_tune_water_haze);
@@ -199,6 +255,54 @@ std::string SaveRendererSettings(bool upscaler_on) {
       {"pgr4_native_msaa", std::to_string(REXCVAR_GET(pgr4_native_msaa))},
       {"pgr4_native_anisotropy", std::to_string(REXCVAR_GET(pgr4_native_anisotropy))},
       {"pgr4_native_gtao", REXCVAR_GET(pgr4_native_gtao) ? "true" : "false"},
+      {"pgr4_native_volumetric", REXCVAR_GET(pgr4_native_volumetric) ? "true" : "false"},
+      {"pgr4_native_volumetric_strength", rex::cvar::GetFlagByName("pgr4_native_volumetric_strength")},
+      {"pgr4_native_volumetric_density", rex::cvar::GetFlagByName("pgr4_native_volumetric_density")},
+      {"pgr4_native_volumetric_distance", rex::cvar::GetFlagByName("pgr4_native_volumetric_distance")},
+      {"pgr4_native_volumetric_fog", REXCVAR_GET(pgr4_native_volumetric_fog) ? "true" : "false"},
+      {"pgr4_native_volumetric_fog_variation", rex::cvar::GetFlagByName("pgr4_native_volumetric_fog_variation")},
+      {"pgr4_native_volumetric_fog_size", rex::cvar::GetFlagByName("pgr4_native_volumetric_fog_size")},
+      {"pgr4_native_volumetric_fog_sun", rex::cvar::GetFlagByName("pgr4_native_volumetric_fog_sun")},
+      {"pgr4_native_volumetric_phase", rex::cvar::GetFlagByName("pgr4_native_volumetric_phase")},
+      {"pgr4_native_volumetric_fog_phase", rex::cvar::GetFlagByName("pgr4_native_volumetric_fog_phase")},
+      {"pgr4_native_volumetric_range", rex::cvar::GetFlagByName("pgr4_native_volumetric_range")},
+      {"pgr4_native_volumetric_mist", rex::cvar::GetFlagByName("pgr4_native_volumetric_mist")},
+      {"pgr4_native_volumetric_mist_height", rex::cvar::GetFlagByName("pgr4_native_volumetric_mist_height")},
+      {"pgr4_native_volumetric_mist_distance", rex::cvar::GetFlagByName("pgr4_native_volumetric_mist_distance")},
+      {"pgr4_native_volumetric_height_scale", rex::cvar::GetFlagByName("pgr4_native_volumetric_height_scale")},
+      {"pgr4_native_volumetric_eye_height", rex::cvar::GetFlagByName("pgr4_native_volumetric_eye_height")},
+      {"pgr4_native_volumetric_thickness", rex::cvar::GetFlagByName("pgr4_native_volumetric_thickness")},
+      {"pgr4_native_volumetric_wind", rex::cvar::GetFlagByName("pgr4_native_volumetric_wind")},
+      {"pgr4_native_volumetric_wind_angle", rex::cvar::GetFlagByName("pgr4_native_volumetric_wind_angle")},
+      {"pgr4_native_volumetric_steps", rex::cvar::GetFlagByName("pgr4_native_volumetric_steps")},
+      {"pgr4_native_volumetric_shadow_steps", rex::cvar::GetFlagByName("pgr4_native_volumetric_shadow_steps")},
+      {"pgr4_native_volumetric_lights", rex::cvar::GetFlagByName("pgr4_native_volumetric_lights")},
+      {"pgr4_native_volumetric_light_strength", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_strength")},
+      {"pgr4_native_volumetric_light_range", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_range")},
+      {"pgr4_native_volumetric_light_reach", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_reach")},
+      {"pgr4_native_volumetric_light_over_bulb", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_over_bulb")},
+      {"pgr4_native_volumetric_light_smooth", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_smooth")},
+      {"pgr4_native_volumetric_light_halo", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_halo")},
+      {"pgr4_native_volumetric_light_halo_size", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_halo_size")},
+      {"pgr4_native_volumetric_mist_detail", rex::cvar::GetFlagByName("pgr4_native_volumetric_mist_detail")},
+      {"pgr4_native_volumetric_mist_detail_size", rex::cvar::GetFlagByName("pgr4_native_volumetric_mist_detail_size")},
+      {"pgr4_native_volumetric_light_texture", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_texture")},
+      {"pgr4_native_volumetric_light_texture_size", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_texture_size")},
+      {"pgr4_native_volumetric_temporal", rex::cvar::GetFlagByName("pgr4_native_volumetric_temporal")},
+      {"pgr4_native_volumetric_light_per_pixel", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_per_pixel")},
+      {"pgr4_native_volumetric_light_flare_place", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_flare_place")},
+      {"pgr4_native_volumetric_light_cone", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_cone")},
+      {"pgr4_native_volumetric_light_cone_soft", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_cone_soft")},
+      {"pgr4_native_volumetric_light_cone_top", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_cone_top")},
+      {"pgr4_native_volumetric_light_cone_around", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_cone_around")},
+      {"pgr4_native_volumetric_light_flare_colour", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_flare_colour")},
+      {"pgr4_native_volumetric_light_count", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_count")},
+      {"pgr4_native_volumetric_light_core", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_core")},
+      {"pgr4_native_volumetric_light_phase", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_phase")},
+      {"pgr4_native_volumetric_light_red", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_red")},
+      {"pgr4_native_volumetric_light_green", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_green")},
+      {"pgr4_native_volumetric_light_blue", rex::cvar::GetFlagByName("pgr4_native_volumetric_light_blue")},
+      {"pgr4_native_volumetric_ground", rex::cvar::GetFlagByName("pgr4_native_volumetric_ground")},
       {"pgr4_native_ao_method", std::to_string(REXCVAR_GET(pgr4_native_ao_method))},
       {"pgr4_native_xegtao_quality", std::to_string(REXCVAR_GET(pgr4_native_xegtao_quality))},
       {"pgr4_native_xegtao_denoise", std::to_string(REXCVAR_GET(pgr4_native_xegtao_denoise))},
@@ -252,6 +356,10 @@ std::string SaveRendererSettings(bool upscaler_on) {
       {"pgr4_native_tune_sun_sharpness",
        rex::cvar::GetFlagByName("pgr4_native_tune_sun_sharpness")},
       {"pgr4_native_tune_rim", rex::cvar::GetFlagByName("pgr4_native_tune_rim")},
+      {"pgr4_native_tune_flare", rex::cvar::GetFlagByName("pgr4_native_tune_flare")},
+      {"pgr4_native_tune_flare_halo", rex::cvar::GetFlagByName("pgr4_native_tune_flare_halo")},
+      {"pgr4_native_tune_flare_car", rex::cvar::GetFlagByName("pgr4_native_tune_flare_car")},
+      {"pgr4_native_tune_flare_car_halo", rex::cvar::GetFlagByName("pgr4_native_tune_flare_car_halo")},
       {"pgr4_native_tune_glass_reflect",
        rex::cvar::GetFlagByName("pgr4_native_tune_glass_reflect")},
       {"pgr4_native_tune_glass_sky", rex::cvar::GetFlagByName("pgr4_native_tune_glass_sky")},
@@ -669,6 +777,15 @@ Overlay::Actions Overlay::Build(const Info& info) {
     }
   }
 
+  // Local change (21/11/2026): the volumetric fog's settings in their own tab ("Volumetrique").
+  ImGui::SeparatorText("Brouillard volumetrique");
+  {
+    bool volumetric = REXCVAR_GET(pgr4_native_volumetric);
+    if (ImGui::Checkbox("Brouillard volumetrique et lumieres", &volumetric))
+      REXCVAR_SET(pgr4_native_volumetric, volumetric);
+    ImGui::TextDisabled("Tous ses reglages : onglet Volumetrique");
+  }
+
   // Local change (pgr4 project): the ambient occlusion over the scene (scene_effects.h).
   ImGui::SeparatorText("Occlusion ambiante (GTAO)");
   {
@@ -687,7 +804,7 @@ Overlay::Actions Overlay::Build(const Info& info) {
       // Local change (16/11/2026): the method, automatic by default (MSAA: ours; an upscaler:
       // Intel's XeGTAO), forced for comparisons. Both settings shown.
       int method = REXCVAR_GET(pgr4_native_ao_method);
-      static const char* const kMethods[] = {"Auto (MSAA : notre GTAO, upscaler : XeGTAO)",
+      static const char* const kMethods[] = {"Auto (XeGTAO)",
                                              "Toujours notre GTAO", "Toujours XeGTAO"};
       if (ImGui::Combo("Methode", &method, kMethods, 3)) REXCVAR_SET(pgr4_native_ao_method, method);
       ImGui::SeparatorText("XeGTAO (Intel)");
@@ -978,6 +1095,203 @@ Overlay::Actions Overlay::Build(const Info& info) {
     actions.rebuild_pipeline = true;
   }
   ImGui::TextDisabled("Scale et anisotropie : pipeline refait (pause d'un instant)");
+
+    ImGui::EndTabItem();
+  }
+  // Local change (21/11/2026, Tazz: "a tab for everything volumetric"): the volumetric fog, its
+  // lamps, its corrections' switches.
+  if (tabs && ImGui::BeginTabItem("Volumetrique")) {
+  // Local change (20/11/2026): the volumetric light over the scene, an option (volumetrics.h).
+  ImGui::SeparatorText("Brouillard volumetrique");
+  {
+    bool volumetric = REXCVAR_GET(pgr4_native_volumetric);
+    if (ImGui::Checkbox("Brouillard volumetrique et rayons de lumiere", &volumetric))
+      REXCVAR_SET(pgr4_native_volumetric, volumetric);
+    if (volumetric) {
+      float strength = float(REXCVAR_GET(pgr4_native_volumetric_strength));
+      if (ImGui::SliderFloat("Force", &strength, 0.0f, 4.0f, "%.2f"))
+        REXCVAR_SET(pgr4_native_volumetric_strength, double(strength));
+      float density = float(REXCVAR_GET(pgr4_native_volumetric_density));
+      if (ImGui::SliderFloat("Densite de l'air (par metre, temps clair)", &density, 0.0f, 0.05f,
+                             "%.4f"))
+        REXCVAR_SET(pgr4_native_volumetric_density, double(density));
+      float distance = float(REXCVAR_GET(pgr4_native_volumetric_distance));
+      if (ImGui::SliderFloat("Distance couverte (m)", &distance, 20.0f, 400.0f, "%.0f"))
+        REXCVAR_SET(pgr4_native_volumetric_distance, double(distance));
+      bool fog = REXCVAR_GET(pgr4_native_volumetric_fog);
+      if (ImGui::Checkbox("Brouillard du jeu refait en volume", &fog))
+        REXCVAR_SET(pgr4_native_volumetric_fog, fog);
+      if (fog) {
+        float variation = float(REXCVAR_GET(pgr4_native_volumetric_fog_variation));
+        if (ImGui::SliderFloat("Nappes : variation (0 : celui du jeu)", &variation, 0.0f, 1.0f, "%.2f"))
+          REXCVAR_SET(pgr4_native_volumetric_fog_variation, double(variation));
+        float size = float(REXCVAR_GET(pgr4_native_volumetric_fog_size));
+        if (ImGui::SliderFloat("Nappes : taille (m)", &size, 5.0f, 200.0f, "%.0f"))
+          REXCVAR_SET(pgr4_native_volumetric_fog_size, double(size));
+        float fog_sun = float(REXCVAR_GET(pgr4_native_volumetric_fog_sun));
+        if (ImGui::SliderFloat("Soleil dans le brouillard", &fog_sun, 0.0f, 4.0f, "%.2f"))
+          REXCVAR_SET(pgr4_native_volumetric_fog_sun, double(fog_sun));
+        float range = float(REXCVAR_GET(pgr4_native_volumetric_range));
+        if (ImGui::SliderFloat("Volume : profondeur (m)", &range, 50.0f, 1000.0f, "%.0f"))
+          REXCVAR_SET(pgr4_native_volumetric_range, double(range));
+      }
+      float temporal = float(REXCVAR_GET(pgr4_native_volumetric_temporal));
+      if (ImGui::SliderFloat("Brouillard : lissage dans le temps (s, 0 : aucun)", &temporal, 0.0f, 2.0f, "%.2f"))
+        REXCVAR_SET(pgr4_native_volumetric_temporal, double(temporal));
+      float mist_detail = float(REXCVAR_GET(pgr4_native_volumetric_mist_detail));
+      if (ImGui::SliderFloat("Brume au sol : volutes (0 : aucune)", &mist_detail, 0.0f, 1.0f, "%.2f"))
+        REXCVAR_SET(pgr4_native_volumetric_mist_detail, double(mist_detail));
+      float mist_detail_size = float(REXCVAR_GET(pgr4_native_volumetric_mist_detail_size));
+      if (ImGui::SliderFloat("Brume au sol : taille des volutes (m)", &mist_detail_size, 0.5f, 20.0f, "%.1f"))
+        REXCVAR_SET(pgr4_native_volumetric_mist_detail_size, double(mist_detail_size));
+      float mist = float(REXCVAR_GET(pgr4_native_volumetric_mist));
+      if (ImGui::SliderFloat("Brume au sol : epaisseur (x brouillard du jeu)", &mist, 0.0f, 10.0f, "%.2f"))
+        REXCVAR_SET(pgr4_native_volumetric_mist, double(mist));
+      float mist_height = float(REXCVAR_GET(pgr4_native_volumetric_mist_height));
+      if (ImGui::SliderFloat("Brume au sol : hauteur (m)", &mist_height, 0.5f, 30.0f, "%.1f"))
+        REXCVAR_SET(pgr4_native_volumetric_mist_height, double(mist_height));
+      float mist_distance = float(REXCVAR_GET(pgr4_native_volumetric_mist_distance));
+      if (ImGui::SliderFloat("Brume au sol : distance (m)", &mist_distance, 10.0f, 400.0f, "%.0f"))
+        REXCVAR_SET(pgr4_native_volumetric_mist_distance, double(mist_distance));
+      bool ground = REXCVAR_GET(pgr4_native_volumetric_ground);
+      if (ImGui::Checkbox("Brume au sol posee sur le relief (carte du sol)", &ground))
+        REXCVAR_SET(pgr4_native_volumetric_ground, ground);
+      // Local change (21/11/2026): the lamps' light in the fog (the game's light flares).
+      bool lights = REXCVAR_GET(pgr4_native_volumetric_lights);
+      if (ImGui::Checkbox("Lampes qui eclairent le brouillard", &lights))
+        REXCVAR_SET(pgr4_native_volumetric_lights, lights);
+      if (lights) {
+        float light_strength = float(REXCVAR_GET(pgr4_native_volumetric_light_strength));
+        if (ImGui::SliderFloat("Lampes : intensite", &light_strength, 0.0f, 100.0f, "%.1f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_strength, double(light_strength));
+        float light_range = float(REXCVAR_GET(pgr4_native_volumetric_light_range));
+        if (ImGui::SliderFloat("Lampes : distance a laquelle on les prend (m)", &light_range, 5.0f, 300.0f, "%.0f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_range, double(light_range));
+        float light_reach = float(REXCVAR_GET(pgr4_native_volumetric_light_reach));
+        if (ImGui::SliderFloat("Lampes : portee de chaque lampe (m, 0 : l'ancienne)", &light_reach, 0.0f, 150.0f, "%.0f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_reach, double(light_reach));
+        bool over_bulb = REXCVAR_GET(pgr4_native_volumetric_light_over_bulb);
+        if (ImGui::Checkbox("Lampes : halo par-dessus l'ampoule", &over_bulb))
+          REXCVAR_SET(pgr4_native_volumetric_light_over_bulb, over_bulb);
+        float cone = float(REXCVAR_GET(pgr4_native_volumetric_light_cone));
+        if (ImGui::SliderFloat("Lampes : cone vers la route (demi-angle, 0 : tout autour)", &cone, 0.0f, 89.0f, "%.0f deg"))
+          REXCVAR_SET(pgr4_native_volumetric_light_cone, double(cone));
+        float cone_top = float(REXCVAR_GET(pgr4_native_volumetric_light_cone_top));
+        if (ImGui::SliderFloat("Lampes : pointe du cone au-dessus du flare (m)", &cone_top, 0.0f, 3.0f, "%.2f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_cone_top, double(cone_top));
+        float cone_soft = float(REXCVAR_GET(pgr4_native_volumetric_light_cone_soft));
+        if (ImGui::SliderFloat("Lampes : bord du cone adouci", &cone_soft, 0.0f, 60.0f, "%.0f deg"))
+          REXCVAR_SET(pgr4_native_volumetric_light_cone_soft, double(cone_soft));
+        float cone_around = float(REXCVAR_GET(pgr4_native_volumetric_light_cone_around));
+        if (ImGui::SliderFloat("Lampes : lumiere hors du cone", &cone_around, 0.0f, 1.0f, "%.2f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_cone_around, double(cone_around));
+        float halo = float(REXCVAR_GET(pgr4_native_volumetric_light_halo));
+        if (ImGui::SliderFloat("Lampes : halo large et doux (0 : aucun)", &halo, 0.0f, 2.0f, "%.2f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_halo, double(halo));
+        float halo_size = float(REXCVAR_GET(pgr4_native_volumetric_light_halo_size));
+        if (ImGui::SliderFloat("Lampes : taille du halo (m)", &halo_size, 0.5f, 20.0f, "%.1f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_halo_size, double(halo_size));
+        float beam_texture = float(REXCVAR_GET(pgr4_native_volumetric_light_texture));
+        if (ImGui::SliderFloat("Lampes : texture du brouillard dans les faisceaux (0 : aucune)", &beam_texture, 0.0f, 1.0f, "%.2f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_texture, double(beam_texture));
+        float beam_size = float(REXCVAR_GET(pgr4_native_volumetric_light_texture_size));
+        if (ImGui::SliderFloat("Lampes : taille de cette texture (m)", &beam_size, 0.5f, 20.0f, "%.1f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_texture_size, double(beam_size));
+        bool per_pixel = REXCVAR_GET(pgr4_native_volumetric_light_per_pixel);
+        if (ImGui::Checkbox("Lampes : calculees par pixel (net et stable, il faut une portee)", &per_pixel))
+          REXCVAR_SET(pgr4_native_volumetric_light_per_pixel, per_pixel);
+        bool flare_place = REXCVAR_GET(pgr4_native_volumetric_light_flare_place);
+        if (ImGui::Checkbox("Lampes : calees sur leur flare (comme le jeu)", &flare_place))
+          REXCVAR_SET(pgr4_native_volumetric_light_flare_place, flare_place);
+        bool flare_colour = REXCVAR_GET(pgr4_native_volumetric_light_flare_colour);
+        if (ImGui::Checkbox("Lampes : couleur de leur flare (la couleur ci-dessus en teinte)", &flare_colour))
+          REXCVAR_SET(pgr4_native_volumetric_light_flare_colour, flare_colour);
+        bool light_smooth = REXCVAR_GET(pgr4_native_volumetric_light_smooth);
+        if (ImGui::Checkbox("Lampes : fondu quand elles entrent ou sortent", &light_smooth))
+          REXCVAR_SET(pgr4_native_volumetric_light_smooth, light_smooth);
+        int light_count = REXCVAR_GET(pgr4_native_volumetric_light_count);
+        if (ImGui::SliderInt("Lampes : nombre (les plus proches)", &light_count, 0, 64))
+          REXCVAR_SET(pgr4_native_volumetric_light_count, light_count);
+        float light_phase = float(REXCVAR_GET(pgr4_native_volumetric_light_phase));
+        if (ImGui::SliderFloat("Lampes : glow vers soi (g)", &light_phase, 0.0f, 0.95f, "%.2f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_phase, double(light_phase));
+        float light_core = float(REXCVAR_GET(pgr4_native_volumetric_light_core));
+        if (ImGui::SliderFloat("Lampes : taille du glow autour de l'ampoule (m)", &light_core, 0.2f, 10.0f, "%.1f"))
+          REXCVAR_SET(pgr4_native_volumetric_light_core, double(light_core));
+        // The game's own flares on the lamps: set on release (each change compiles the shader).
+        ImGui::SeparatorText("Halo des lampes du jeu (avec ou sans brouillard)");
+        {
+          ImGuiStorage* state = ImGui::GetStateStorage();
+          const auto released = [&](const char* label, double& value, float lo, float hi) {
+            const ImGuiID held = ImGui::GetID(label) + 1;
+            float v = state->GetBool(held + 1) ? state->GetFloat(held) : float(value);
+            ImGui::SliderFloat(label, &v, lo, hi, "%.2f");
+            state->SetBool(held + 1, ImGui::IsItemActive());
+            state->SetFloat(held, v);
+            if (ImGui::IsItemDeactivatedAfterEdit()) value = double(v);
+          };
+          released("Eclat sur l'ampoule (1 : jeu d'origine, 0.75 par defaut)",
+                   FLAGS_pgr4_native_tune_flare_storage_(), 0.0f, 2.0f);
+          released("Glow autour de la lampe et sur la route (1 : jeu d'origine)",
+                   FLAGS_pgr4_native_tune_flare_halo_storage_(), 0.0f, 2.0f);
+        }
+        float colour[3] = {float(REXCVAR_GET(pgr4_native_volumetric_light_red)),
+                           float(REXCVAR_GET(pgr4_native_volumetric_light_green)),
+                           float(REXCVAR_GET(pgr4_native_volumetric_light_blue))};
+        if (ImGui::ColorEdit3("Lampes : couleur", colour, ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR)) {
+          REXCVAR_SET(pgr4_native_volumetric_light_red, double(colour[0]));
+          REXCVAR_SET(pgr4_native_volumetric_light_green, double(colour[1]));
+          REXCVAR_SET(pgr4_native_volumetric_light_blue, double(colour[2]));
+        }
+      }
+      if (ImGui::TreeNode("Reglages fins du brouillard volumetrique")) {
+        // The corrections' switches, to compare (on by default; not saved).
+        const auto check = [](const char* label, bool value, auto set) {
+          bool v = value;
+          if (ImGui::Checkbox(label, &v)) set(v);
+        };
+        check("Camera prise des dessins de brouillard", REXCVAR_GET(pgr4_native_volumetric_fog_camera),
+              [](bool v) { REXCVAR_SET(pgr4_native_volumetric_fog_camera, v); });
+        check("Oeil pris de la camera", REXCVAR_GET(pgr4_native_volumetric_eye_from_camera),
+              [](bool v) { REXCVAR_SET(pgr4_native_volumetric_eye_from_camera, v); });
+        check("Couleur du brouillard x c12.y", REXCVAR_GET(pgr4_native_volumetric_fog_c12),
+              [](bool v) { REXCVAR_SET(pgr4_native_volumetric_fog_c12, v); });
+        check("Drapeaux transparents dans les nappes", REXCVAR_GET(pgr4_native_volumetric_transparents),
+              [](bool v) { REXCVAR_SET(pgr4_native_volumetric_transparents, v); });
+        check("Hauteur visible de la scene", REXCVAR_GET(pgr4_native_volumetric_visible_height),
+              [](bool v) { REXCVAR_SET(pgr4_native_volumetric_visible_height, v); });
+        const auto slider = [](const char* label, double value, float lo, float hi, const char* fmt,
+                               auto set) {
+          float v = float(value);
+          if (ImGui::SliderFloat(label, &v, lo, hi, fmt)) set(double(v));
+        };
+        slider("Diffusion vers l'avant, air (g)", REXCVAR_GET(pgr4_native_volumetric_phase), 0.0f,
+               0.95f, "%.2f", [](double v) { REXCVAR_SET(pgr4_native_volumetric_phase, v); });
+        slider("Diffusion vers l'avant, brouillard (g)", REXCVAR_GET(pgr4_native_volumetric_fog_phase),
+               0.0f, 0.95f, "%.2f", [](double v) { REXCVAR_SET(pgr4_native_volumetric_fog_phase, v); });
+        slider("Air plus fin en montant (m)", REXCVAR_GET(pgr4_native_volumetric_height_scale), 5.0f,
+               500.0f, "%.0f", [](double v) { REXCVAR_SET(pgr4_native_volumetric_height_scale, v); });
+        slider("Hauteur de l'oeil (m)", REXCVAR_GET(pgr4_native_volumetric_eye_height), 0.0f, 20.0f,
+               "%.1f", [](double v) { REXCVAR_SET(pgr4_native_volumetric_eye_height, v); });
+        slider("Epaisseur des obstacles (ombre, m)", REXCVAR_GET(pgr4_native_volumetric_thickness),
+               1.0f, 200.0f, "%.0f", [](double v) { REXCVAR_SET(pgr4_native_volumetric_thickness, v); });
+        slider("Vent (m/s)", REXCVAR_GET(pgr4_native_volumetric_wind), 0.0f, 20.0f, "%.1f",
+               [](double v) { REXCVAR_SET(pgr4_native_volumetric_wind, v); });
+        slider("Direction du vent (degres)", REXCVAR_GET(pgr4_native_volumetric_wind_angle), 0.0f,
+               360.0f, "%.0f", [](double v) { REXCVAR_SET(pgr4_native_volumetric_wind_angle, v); });
+        int steps = REXCVAR_GET(pgr4_native_volumetric_steps);
+        if (ImGui::SliderInt("Pas : air au soleil", &steps, 4, 96))
+          REXCVAR_SET(pgr4_native_volumetric_steps, steps);
+        int shadow_steps = REXCVAR_GET(pgr4_native_volumetric_shadow_steps);
+        if (ImGui::SliderInt("Pas : ombre vers le soleil (0 : sans)", &shadow_steps, 0, 12))
+          REXCVAR_SET(pgr4_native_volumetric_shadow_steps, shadow_steps);
+        ImGui::TreePop();
+      }
+      bool debug = REXCVAR_GET(pgr4_native_volumetric_debug);
+      if (ImGui::Checkbox("Voir la lumiere ajoutee seule", &debug))
+        REXCVAR_SET(pgr4_native_volumetric_debug, debug);
+    }
+  }
 
     ImGui::EndTabItem();
   }

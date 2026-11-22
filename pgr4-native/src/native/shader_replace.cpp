@@ -2,6 +2,8 @@
 // replaced by HLSL of ours. See shader_replace.h.
 #include "shader_replace.h"
 
+#include "hang_probe.h"  // local change: the freeze probe
+
 #include "d3d12_device.h"
 #include "log.h"
 
@@ -47,6 +49,7 @@ REXCVAR_DEFINE_BOOL(pgr4_native_decal_light_off, false, "PGR4 native",
                     "The painted lines' and start line's baked area light left out (it vibrated "
                     "on them in motion): the scenery shader's decals only");
 REXCVAR_DECLARE(bool, pgr4_native_precompile);  // draw.cpp
+REXCVAR_DECLARE(bool, pgr4_native_volumetric);  // volumetrics.cpp: the light flares' tunings
 REXCVAR_DEFINE_BOOL(pgr4_native_enhanced_reflections, true, "PGR4 native",
                     "Our shaders of the cars, the water and the wet roads, and the water's and "
                     "wet roads' scene reflections (the game menu's ENHANCED REFLECTIONS)");
@@ -130,6 +133,36 @@ REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_wave_speed, 0.25, "PGR4 native",
 REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_highlights, 0.0, "PGR4 native",
                       "The final image's highlights eased below white, 0 the game's clip "
                       "(highlights_hooks.hlsli kHighlights)");
+// The game's light flares (AB2BD72DF7FE8E7A.ps.hlsl, 21/11/2026): the full size sprite on the
+// lamp and the small halo pass blurred into the glow around it and on the road, with the
+// volumetric fog's lamps: Tazz's last values (pgr4.toml, 21/11/2026 19:03), 1.0 and 0.02.
+// Without the volumetric fog, V1.45's: 0.75 (the 16/11 fix of its white blob) and the game's halo
+// (pgr4_native_tune_flare_with_volumetric; before, 0.75 and no halo at all, the volumetric fog on
+// or off).
+REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_flare, 1.0, "PGR4 native",
+                      "The game's light flares' brightness on the lamps with the volumetric fog, "
+                      "1 the game's (kFlare)");
+REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_flare_halo, 0.02, "PGR4 native",
+                      "The game's light flares' blurred glow (their 320x180 pass) with the "
+                      "volumetric fog, 1 the game's (kFlareHalo)");
+REXCVAR_DEFINE_BOOL(pgr4_native_tune_flare_with_volumetric, true, "PGR4 native",
+                    "The two flare tunings only with the volumetric fog on; off, V1.45's flares "
+                    "(0.75 and the game's halo). False: the tunings always");
+// Local change (21/11/2026, Tazz: the cars' headlights blown out in the fog, "a line of their own for
+// the volumetric, in the toml"): the cars' flares (psLightFlare drawn by vsLightFlare
+// 246A313B2DFCE07F and the headlights' 87B13831BF0A358D through sub_826CFA60, not the scenery's
+// vsSceneLightFlare 764E294E908A8A4A: draw.cpp marks them in pgr4_dirt.z) with the volumetric fog
+// on: their own tunings, 0.5 (Tazz, 21/11/2026, from a sheet of 1.0, 0.75, 0.5 and 0.35 on the same
+// photo mode frame) and the game's halo. Without the volumetric fog, V1.45's (0.75, Tazz's choice of
+// 31/10/2026). pgr4_native_tune_flare_car_apart off: the scenery's tunings for them too (as before).
+REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_flare_car, 0.5, "PGR4 native",
+                      "The cars' flares (headlights) with the volumetric fog, 1 the game's (kFlareCar)");
+REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_flare_car_halo, 1.0, "PGR4 native",
+                      "The cars' flares' blurred glow with the volumetric fog, 1 the game's "
+                      "(kFlareCarHalo)");
+REXCVAR_DEFINE_BOOL(pgr4_native_tune_flare_car_apart, true, "PGR4 native",
+                    "The cars' flares with their own tunings (pgr4_native_tune_flare_car); off: the "
+                    "scenery's");
 REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_bloom, 1.0, "PGR4 native",
                       "The final image's bloom times this, 1 the game's (highlights_hooks.hlsli kBloom)");
 REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_wave_size, 0.1, "PGR4 native",
@@ -168,10 +201,14 @@ REXCVAR_DEFINE_STRING(pgr4_native_tune_water_rain,
                       "The water in rain (as --pgr4_native_tune_water_clear; by default Tazz's "
                       "tuning of 17/11/2026, in a storm at St Petersburg)");
 // Local change (17/11/2026, Tazz): light rain apart (a weather name with "Light Rain"), the rain's
-// tuning while empty.
-REXCVAR_DEFINE_STRING(pgr4_native_tune_water_light_rain, "", "PGR4 native",
-                      "The water in light rain (as --pgr4_native_tune_water_clear; empty: the "
-                      "rain's, --pgr4_native_tune_water_rain)");
+// tuning while empty. By default Tazz's tuning (his pgr4.toml since 18/11/2026, left out of the
+// code until 21/11/2026: players had the rain's).
+REXCVAR_DEFINE_STRING(pgr4_native_tune_water_light_rain,
+                      "wave_strength=1 wave_steepness=0.08 wave_noise=0.3 wave_size=1 wave_speed=0 "
+                      "wind_angle=0.01 sun_waves=0",
+                      "PGR4 native",
+                      "The water in light rain (as --pgr4_native_tune_water_clear; by default "
+                      "Tazz's tuning; empty: the rain's, --pgr4_native_tune_water_rain)");
 REXCVAR_DEFINE_STRING(pgr4_native_tune_water_snow, "", "PGR4 native",
                       "The water in snow (as --pgr4_native_tune_water_clear)");
 REXCVAR_DEFINE_STRING(pgr4_native_tune_water_icy, "", "PGR4 native",
@@ -378,7 +415,26 @@ std::string ShaderTuningDefines() {
                 REXCVAR_GET(pgr4_native_tune_harbour_distort),
                 REXCVAR_GET(pgr4_native_tune_harbour_waves), double(water.sun_waves),
                 double(water.haze));
-  return live ? std::string(text) + "#define PGR4_WATER_LIVE 1\n" : std::string(text);
+  // The flares: the tunings with the volumetric fog's lamps, V1.45's without it (read at each
+  // Poll: the flare shader compiled again when the option changes).
+  const bool tuned =
+      !REXCVAR_GET(pgr4_native_tune_flare_with_volumetric) || REXCVAR_GET(pgr4_native_volumetric);
+  const double flare_k = tuned ? REXCVAR_GET(pgr4_native_tune_flare) : 0.75;
+  const double flare_halo = tuned ? REXCVAR_GET(pgr4_native_tune_flare_halo) : 1.0;
+  // The cars' (pgr4_dirt.z): their own with the volumetric fog, V1.45's without it.
+  const bool car_apart = REXCVAR_GET(pgr4_native_tune_flare_car_apart);
+  const bool car_tuned = REXCVAR_GET(pgr4_native_volumetric);
+  const double car_k =
+      !car_apart ? flare_k : car_tuned ? REXCVAR_GET(pgr4_native_tune_flare_car) : 0.75;
+  const double car_halo =
+      !car_apart ? flare_halo : car_tuned ? REXCVAR_GET(pgr4_native_tune_flare_car_halo) : 1.0;
+  char flare[256];
+  std::snprintf(flare, sizeof(flare),
+                "#define PGR4_TUNE_kFlare %.6f\n#define PGR4_TUNE_kFlareHalo %.6f\n"
+                "#define PGR4_TUNE_kFlareCar %.6f\n#define PGR4_TUNE_kFlareCarHalo %.6f\n",
+                flare_k, flare_halo, car_k, car_halo);
+  const std::string defines = std::string(text) + flare;
+  return live ? defines + "#define PGR4_WATER_LIVE 1\n" : defines;
 }
 
 std::filesystem::path BesideExe(const std::string& dir) {
@@ -442,7 +498,7 @@ const char* ComponentType(uint32_t t, uint32_t mask_bits) {
 
 // The prelude of a replacement for `translation`, then the main function (after the file).
 bool MakePrelude(const DxbcShader::Translation& translation, std::string* prelude,
-                 std::string* main) {
+                 std::string* main, bool fog_volume, bool fog_shader) {
   const auto& shader = static_cast<const DxbcShader&>(translation.shader());
   const std::vector<uint8_t>& binary = translation.translated_binary();
   const std::vector<SignatureElement> in = ReadSignature(binary, "ISGN", "ISG1");
@@ -477,7 +533,10 @@ bool MakePrelude(const DxbcShader::Translation& translation, std::string* prelud
        "  float4 pgr4_shelter;\n"
        "  float4 pgr4_dirt;\n";
   // Only then, so that the other shaders' text (and their cache) stays the same without it.
-  if (REXCVAR_GET(pgr4_native_water_live)) p << "  float4 pgr4_water[6];\n";
+  // Local change (21/11/2026): the fog's volume after it, for the shaders that read it (only theirs:
+  // the others' text, and cache, stay the same).
+  if (REXCVAR_GET(pgr4_native_water_live) || fog_volume) p << "  float4 pgr4_water[6];\n";
+  if (fog_volume) p << "  float4 pgr4_fog_volume[4];\n";
   p << "};\n";
   const auto& map = shader.constant_register_map();
   const uint32_t floats = map.float_dynamic_addressing ? 256 : std::max(1u, map.float_count);
@@ -578,6 +637,86 @@ bool MakePrelude(const DxbcShader::Translation& translation, std::string* prelud
   }
   p << "};\n#define XE_MOTION_VECTORS " << (motion ? 1 : 0) << "\n";
   p << "#define XE_INTERPOLATORS " << guest << "\n";
+  // Local change (21/11/2026): the fog laid by each shader, in the files with its hook (XeFog);
+  // the others' text, and cache, stay the same.
+  if (fog_shader) {
+    constexpr size_t kFogAt = offsetof(DxbcShaderTranslator::SystemConstants, fog_shader);
+    static_assert(kFogAt >= 256 && kFogAt % 16 == 0);
+    std::string fog = R"hlsl(// Local change (21/11/2026, the fog laid by each shader): XeFog, at the game's fog ending (mad D, B,
+// T, F) in our HLSL, the same as the translator's DxbcShaderTranslator::EmitVolumetricFog (keep
+// them alike): the game's result unless kSysFlag_FogMode is 2 and the volume is made this frame.
+#define PGR4_FOG_SHADER(k) asfloat(xe_system_tail[@TAIL@ + (k)])
+float4 PgrFogMul(float4 a, float4 b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
+// ch: each component's colour channel (0 red, 1 green, 2 blue), its fog operand's component there
+// (21/11/2026, the trees tinted yellow-green: their fog in xy_w, blue in w); XeFogC passes it, XeFog
+// the usual xyz. No local named like a constant (c0, c10...): the shaders define those as macros
+// (21/11/2026: c0 and c10 here broke 402 of them).
+float4 PgrFog(float4 b, float4 t, float4 f, int form, uint4 ch, float4 pos, bool has_pos) {
+  float4 game = PgrFogMul(b, t) + f;
+  uint mode = (xe_system_head[0].x >> @SHIFT@u) & 3u;
+  float4 F0 = PGR4_FOG_SHADER(0), F1 = PGR4_FOG_SHADER(1), F2 = PGR4_FOG_SHADER(2),
+         F3 = PGR4_FOG_SHADER(3);
+  float4 result = game;
+  [branch] if (mode == 2u && F3.w > 0.5 && has_pos) {
+  float tg = saturate(form == 3 ? b.x : t.x);
+  float z = F1.x / (pos.z * F1.y + F1.z);
+  float zc = min(z, F0.x);
+  float wn = saturate(zc / F1.w);
+  float s = zc >= F1.w ? min(max(log2(zc * 2.0) * F0.y - 1.0, 0.0), 63.0) : 0.0;
+  float2 cc = pos.xy * (1.0 / 16.0) - 0.5;
+  float2 cell0 = floor(cc);
+  float2 fr = cc - cell0;
+  int2 cols = int2(F0.zw) - 1;
+  int2 xs = clamp(int2(int(cell0.x), int(cell0.x) + 1), 0, cols.x);
+  int2 ys = clamp(int2(int(cell0.y), int(cell0.y) + 1), 0, cols.y);
+  float sf = floor(s);
+  float fz = s - sf;
+  int k0 = int(sf), k1 = min(k0 + 1, 63);
+  float4 v = 0.0;
+  [unroll] for (int n = 0; n < 8; ++n) {
+    int ox = n & 1, oy = (n >> 1) & 1, oz = n >> 2;
+    float w = (ox ? fr.x : 1.0 - fr.x);
+    w = oy ? w * fr.y : w - w * fr.y;
+    w = oz ? w * fz : w - w * fz;
+    v += xe_textures_3d[8].Load(int4(ox ? xs.y : xs.x, oy ? ys.y : ys.x, oz ? k1 : k0, 0)) * w;
+  }
+  v.rgb *= wn;
+  v.a = (v.a - 1.0) * wn + 1.0;
+  if (F0.x < z) {
+    int2 cn = min(max(int2(pos.xy * (1.0 / 16.0)), 0), cols);
+    float a = xe_textures_2d[9].Load(int4(cn, 0, 0)).x;
+    float tv = a * tg;
+    v.rgb += F2.rgb * (v.a - tv);
+    v.a = tv;
+  }
+  float ratio = min(v.a / max(tg, 1e-6), tg * 2.0 + 1.0);
+  float to = tg * ratio;
+  float scale = to < v.a ? (1.0 - to) / max(1.0 - v.a, 1e-4) : 1.0;
+  // In the mad's components: the volume's light and the fog colour c10 at each one's channel.
+  float3 vl = v.rgb * (scale * F2.w);
+  float4 light = float4(vl[ch.x], vl[ch.y], vl[ch.z], vl[ch.w]);
+  float4 fog_c10 = float4(F3[ch.x], F3[ch.y], F3[ch.z], F3[ch.w]);
+  if (form != 2) light *= fog_c10 > 1e-5 ? f / fog_c10 : 1.0;
+  result = form == 1 ? (b + f) * to + light : form == 2 ? b * to + f : light;
+  }
+  return result;
+}
+#ifdef XE_HAS_POS
+#define XeFog(b, t, f, form) PgrFog((b), (t), (f), (form), uint4(0, 1, 2, 2), i.pos, true)
+#define XeFogC(b, t, f, form, ch) PgrFog((b), (t), (f), (form), (ch), i.pos, true)
+#else
+#define XeFog(b, t, f, form) PgrFog((b), (t), (f), (form), uint4(0, 1, 2, 2), 0.0, false)
+#define XeFogC(b, t, f, form, ch) PgrFog((b), (t), (f), (form), (ch), 0.0, false)
+#endif
+)hlsl";
+    const auto put = [&](const char* key, uint32_t value) {
+      for (size_t at; (at = fog.find(key)) != std::string::npos;)
+        fog.replace(at, std::strlen(key), std::to_string(value));
+    };
+    put("@TAIL@", uint32_t((kFogAt - 256) / 16));
+    put("@SHIFT@", uint32_t(DxbcShaderTranslator::kSysFlag_FogMode_Shift));
+    p << fog;
+  }
   *prelude = p.str();
 
   std::ostringstream m;
@@ -713,9 +852,58 @@ void ShaderReplacer::Initialize() {
 
 std::string ShaderReplacer::TuningDefines() { return ShaderTuningDefines(); }
 
+size_t ShaderReplacer::CachedCount() const {
+  std::error_code ec;
+  size_t n = 0;
+  for (const auto& e : std::filesystem::directory_iterator(dir_ / "cache", ec))
+    if (e.path().extension() == ".cso") ++n;
+  return n;
+}
+
+uint64_t ShaderReplacer::ContentStamp() {
+  std::vector<std::pair<uint64_t, int64_t>> files;
+  bool enabled, decal_light_off;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    files.reserve(files_.size());
+    for (const auto& [hash, time] : files_)
+      files.emplace_back(hash, int64_t(time.time_since_epoch().count()));
+    enabled = enabled_;
+    decal_light_off = decal_light_off_;
+  }
+  std::sort(files.begin(), files.end());
+  const uint64_t h = XXH3_64bits(files.data(), files.size() * sizeof(files[0]));
+  const std::string rest = TuningDefines() + (enabled ? "|on" : "|off") + (decal_light_off ? "|decal" : "");
+  return XXH3_64bits_withSeed(rest.data(), rest.size(), h);
+}
+
+std::vector<std::pair<std::string, std::string>> ShaderReplacer::ContentStampParts() {
+  std::vector<std::pair<uint64_t, int64_t>> files;
+  bool enabled, decal_light_off;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    files.reserve(files_.size());
+    for (const auto& [hash, time] : files_)
+      files.emplace_back(hash, int64_t(time.time_since_epoch().count()));
+    enabled = enabled_;
+    decal_light_off = decal_light_off_;
+  }
+  std::sort(files.begin(), files.end());
+  std::vector<std::pair<std::string, std::string>> parts;
+  parts.reserve(files.size() + 3);
+  parts.emplace_back("tunings", TuningDefines());
+  parts.emplace_back("replacements", enabled ? "on" : "off");
+  parts.emplace_back("decal_light_off", decal_light_off ? "1" : "0");
+  for (const auto& [hash, time] : files)
+    parts.emplace_back(fmt::format("file {:016X}", hash), std::to_string(time));
+  return parts;
+}
+
 void ShaderReplacer::ClassifyFiles() {
   reflection_files_.clear();
   decal_files_.clear();
+  fog_volume_files_.clear();
+  fog_shader_files_.clear();
   for (const auto& [hash, time] : files_) {
     if (hash == kIncludes) continue;
     char name[32];
@@ -728,6 +916,8 @@ void ShaderReplacer::ClassifyFiles() {
         text.find("road_reflect_hooks.hlsli") != std::string::npos)
       reflection_files_.insert(hash);
     if (text.find("pgr4_decal_light") != std::string::npos) decal_files_.insert(hash);
+    if (text.find("fog_volume_hooks.hlsli") != std::string::npos) fog_volume_files_.insert(hash);
+    if (text.find("XeFog") != std::string::npos) fog_shader_files_.insert(hash);
   }
 }
 
@@ -780,6 +970,12 @@ void ShaderReplacer::Poll() {
       const bool highlights =
           value(tuning_wanted_, "kHighlights ") != value(tuning_, "kHighlights ") ||
           value(tuning_wanted_, "kBloom ") != value(tuning_, "kBloom ");
+      // The light flares (AB2BD72DF7FE8E7A.ps.hlsl).
+      const bool flares =
+          value(tuning_wanted_, "kFlare ") != value(tuning_, "kFlare ") ||
+          value(tuning_wanted_, "kFlareHalo ") != value(tuning_, "kFlareHalo ") ||
+          value(tuning_wanted_, "kFlareCar ") != value(tuning_, "kFlareCar ") ||
+          value(tuning_wanted_, "kFlareCarHalo ") != value(tuning_, "kFlareCarHalo ");
       std::lock_guard<std::mutex> lock(mutex_);
       tuning_ = tuning_wanted_;
       uint32_t queued = 0, stale = 0;
@@ -800,8 +996,10 @@ void ShaderReplacer::Poll() {
         const bool uses_wet = text.find("road_reflect_hooks.hlsli") != std::string::npos;
         const bool uses_water = text.find("water_hooks.hlsli") != std::string::npos;
         const bool uses_highlights = text.find("highlights_hooks.hlsli") != std::string::npos;
+        const bool uses_flares = text.find("PGR4_TUNE_kFlare") != std::string::npos;
         if (!((road && uses_road) || (cars && uses_cars) || (wet && uses_wet) ||
-              (water && uses_water) || (highlights && uses_highlights)))
+              (water && uses_water) || (highlights && uses_highlights) ||
+              (flares && uses_flares)))
           continue;
         pending_.insert(key);
         jobs_.push_back({translation, hash, files_epoch_, true});
@@ -900,7 +1098,11 @@ void ShaderReplacer::Work() {
       job = jobs_.front();
       jobs_.pop_front();
     }
-    auto code = std::make_unique<std::vector<uint8_t>>(Compile(*job.translation, job.hash));
+    std::unique_ptr<std::vector<uint8_t>> code;
+    {
+      HangMark hang_mark(HangWhat::kHlslCompile, job.hash);  // local change: the freeze probe
+      code = std::make_unique<std::vector<uint8_t>>(Compile(*job.translation, job.hash));
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     pending_.erase(job.translation);
     const bool stale = stale_.erase(job.translation) > 0;  // a tuning changed while it compiled
@@ -946,7 +1148,8 @@ std::vector<uint8_t> ShaderReplacer::Compile(const DxbcShader::Translation& tran
   std::ifstream f(path, std::ios::binary);
   std::string body((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
   std::string prelude, main;
-  if (body.empty() || !MakePrelude(translation, &prelude, &main)) {
+  if (body.empty() ||
+      !MakePrelude(translation, &prelude, &main, UsesFogVolume(hash), UsesFogShader(hash))) {
     REXLOG_WARN("PGR4 native shaders: {:016X} modification {:016X}: {} (not replaced)", hash,
                 translation.modification(),
                 body.empty() ? "empty file" : "unsupported translation");
@@ -993,6 +1196,8 @@ std::vector<uint8_t> ShaderReplacer::Compile(const DxbcShader::Translation& tran
                                  0, &blob, &errors))) {
     REXLOG_ERROR("PGR4 native shaders: {} failed to compile: {}", file,
                  errors ? static_cast<const char*>(errors->GetBufferPointer()) : "no compiler");
+    failures_.fetch_add(1, std::memory_order_relaxed);
+    last_failure_.store(hash, std::memory_order_relaxed);
     std::ofstream(dir_ / (std::string(file) + ".generated.txt")) << source;
     return code;
   }

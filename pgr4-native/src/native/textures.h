@@ -203,6 +203,27 @@ class TextureCache {
   // and no resolve into it since, so its resource, data, view and shader-read state are
   // unchanged. Callers that memoize bindings check this per texture.
   bool Unchanged(TextureHandle entry) const;
+  // Local change (pgr4 project, 20/11/2026): GuardMissed for a binding bound again without a Get
+  // (callers' memos), once a frame per texture like Get's: true when the texture changed without
+  // its page watch seeing it (now dirty: the caller binds it through Get). A memo that skipped it
+  // drew the riders' bone matrices (156x1 k_32_32_32_32_FLOAT, rewritten by the CPU each frame)
+  // from the copy of a write the watch missed: one of the pose's two buffers stayed on the race
+  // intro's pose, every other frame.
+  bool MissedByWatch(TextureHandle entry);
+  // The textures MissedByWatch found changed since the last call, and the last one's address,
+  // size and format.
+  struct MissedCount {
+    uint64_t count = 0;
+    uint32_t address = 0, width = 0, height = 0, format = 0;
+  };
+  MissedCount TakeMissedByWatch();
+  // Local change (pgr4 project, 20/11/2026): what Get's own memo checks besides Clean, for a binding
+  // bound again without a Get: false while the texture's HD version waits for its file or the
+  // frame's HD budget (TakeHd runs only in Get), or while the HD version shown is not the one
+  // HdOnFor wants (ENHANCED REFLECTIONS switched for the cars' three; the switch is applied only
+  // in Get). The caller then binds it through Get. Counted for TakeHdUnsettled.
+  bool HdSettled(TextureHandle entry);
+  MissedCount TakeHdUnsettled();
   // A binding bound again without a Get is used by the frame completing at frame_fence: keeps
   // its texture from eviction while that frame is in flight. Callers that memoize bindings
   // call this once per frame for each texture they bind that way.
@@ -214,6 +235,18 @@ class TextureCache {
   uint64_t change_epoch() const { return change_epoch_.load(std::memory_order_acquire); }
 
   const Stats& stats() const { return stats_; }
+  // Development (22/11/2026, the race probe): the video memory used and the budget (bytes), as
+  // last read (every 30 Retires; 0 until read).
+  uint64_t video_usage() const { return video_usage_; }
+  // Local change (22/11/2026): the adapter's video memory in use now (QueryVideoMemoryInfo), 0
+  // when unknown (the upscalers' cost, renderer.cpp).
+  uint64_t video_usage_now() const {
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    return adapter_ && SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))
+               ? info.CurrentUsage
+               : 0;
+  }
+  uint64_t video_budget() const { return video_budget_; }
   size_t texture_count() const { return textures_.size(); }
   uint64_t resident_bytes() const { return resident_bytes_; }
 
@@ -326,6 +359,8 @@ class TextureCache {
   uint64_t video_budget_ = 0, video_usage_ = 0;
   uint32_t video_poll_ = 0;
   uint64_t retire_count_ = 0;
+  MissedCount missed_by_watch_;  // MissedByWatch's, since TakeMissedByWatch
+  MissedCount hd_unsettled_;     // HdSettled's false, since TakeHdUnsettled
   // Local change (pgr4 project), debug: the cars' surroundings cube (at kCubeDumpAddress) read
   // back as the cars' shaders bind it, once a frame for the frames RequestCubeDump asked for, to
   // <capture dir>\cube-f<frame>-<face>.bin (.txt: width height row_bytes dxgi_format).

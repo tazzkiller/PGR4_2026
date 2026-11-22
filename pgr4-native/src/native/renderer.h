@@ -63,6 +63,7 @@ class Resolver;
 class TextureCache;
 class Upscaler;
 class SceneEffects;
+class Volumetrics;
 struct ClearCall;
 struct DrawPrep;
 struct DrawState;
@@ -128,6 +129,8 @@ class NativeRenderer {
   // Occlusion queries (occlusion.h), primary mode: after QueryIssue returned, and at the entry
   // of GetData.
   void OnQueryIssue(const uint8_t* base, const HookArgs& args);
+  // Local change: the game's transparent world starts (1) or ends (2) (pgr4_d3d_trace.cpp).
+  void OnWorldMarker(uint32_t id);
   void OnQueryGetData(uint8_t* base, const HookArgs& args);
   // A Swap while the Xenos plugin draws (Live() is null): the renderer switch takes the game
   // back.
@@ -160,6 +163,8 @@ class NativeRenderer {
   // The scene's upscaler while it replaces the scene's MSAA (--pgr4_native_upscaler, switched
   // with bind_upscaler); nullptr otherwise.
   Upscaler* upscaler() { return upscaler_on_ ? upscaler_.get() : nullptr; }
+  // Local change (21/11/2026): the volumetric fog (its volume shared with the draws after it).
+  Volumetrics* volumetrics() { return volumetrics_.get(); }
   // Local change (pgr4 project): settings changed outside the renderer (the game's Graphics page,
   // pgr4_menu.cpp): `fn` sets the cvars and calls the Request* below, on the thread that records
   // the frames at the next frame's start (the cvars it reads there are not written under it).
@@ -326,8 +331,13 @@ class NativeRenderer {
   std::unique_ptr<Presenter> present_;
   std::unique_ptr<OcclusionQueries> occlusion_;  // primary mode with --pgr4_native_occlusion
   std::unique_ptr<Upscaler> upscaler_;
+  // Local change (22/11/2026, pgr4_native_upscaler_keep_other): the other upscaler (DLSS or FSR)
+  // kept once made, with the settings it was made with (UpscalerSettingsKey), for the next switch.
+  std::unique_ptr<Upscaler> parked_upscaler_;
+  std::string parked_key_;
   // Local change: the effects over the scene (scene_effects.h).
   std::unique_ptr<SceneEffects> scene_effects_;
+  std::unique_ptr<Volumetrics> volumetrics_;  // local change (20/11/2026)
   // Local change: DLSS-G's HUD-less image (hudless.h), with Streamline's frame generation.
   std::unique_ptr<HudlessCapture> hudless_capture_;
   std::unique_ptr<Overlay> overlay_;  // local change
@@ -335,6 +345,9 @@ class NativeRenderer {
   // The scene's camera for the FidelityFX effects, found each frame by FindCamera (the defaults
   // until one matches); the upscaler reads it through the pointer set_camera gave it.
   FfxCamera camera_;
+  // Local change (20/11/2026): its clip transform's four rows (world to clip), for the volumetric
+  // light (volumetrics.h).
+  float camera_clip_[16] = {};
   uint32_t camera_scan_ = 0;  // this frame's scene depth draws still to scan for it
   // Development (--pgr4_native_profile, 18/11/2026): the draws by render target
   // (RB_SURFACE_INFO): their count, the cars' among them (VsFamily) and the render thread's time,

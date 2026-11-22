@@ -105,6 +105,14 @@ class DrawRenderer {
     uint64_t pso_pending = 0;   // draws skipped while their pipeline compiles (async)
     uint64_t pso_generic = 0;   // draws on unspecialized shaders while a specialization compiles
     uint64_t pso_wait_us = 0;   // the frame waiting for the pipelines of its skipped draws
+    // Development (22/11/2026, the race probe in draw.cpp): pipelines a draw waited for that
+    // finished this frame, compiled by the driver (of them, volumetric fog variants) or loaded
+    // from the library; their longest compile; the library's saves finished this frame (their
+    // time), and 1 when one is running at the frame's end.
+    uint64_t pso_live_compiled = 0, pso_live_fog = 0, pso_live_loaded = 0, pso_compile_max_us = 0;
+    uint64_t lib_save_us = 0, lib_saving = 0;
+    // The volumetric fog's CPU parts this frame (draw.cpp g_pgr4_vol_ticks), us.
+    uint64_t vol_us[8] = {};
     uint64_t upload_bytes = 0;  // guest memory copied into shared memory
     uint64_t uploads = 0;       // copy regions recorded
     uint64_t textures = 0, textures_missing = 0;  // bindings; missing = null SRV bound

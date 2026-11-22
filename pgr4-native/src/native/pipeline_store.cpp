@@ -7,6 +7,7 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cwchar>
 #include <system_error>
@@ -422,25 +423,37 @@ void PipelineLibrary::Open(ID3D12Device* device, const std::filesystem::path& pa
     REXLOG_WARN("PGR4 native pipelines: no ID3D12Device1, no pipeline library");
     return;
   }
-  blob_ = ReadFile(path);
-  HRESULT hr = E_FAIL;
-  if (!blob_.empty()) {
-    hr = device1->CreatePipelineLibrary(blob_.data(), blob_.size(), IID_PPV_ARGS(&library_));
-    if (FAILED(hr))
-      REXLOG_INFO("PGR4 native pipelines: library {} not usable ({:08X}), starting over",
-                  path.string(), uint32_t(hr));
-  }
-  if (FAILED(hr)) {
-    blob_.clear();
-    library_.Reset();
-    hr = device1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&library_));
-    if (FAILED(hr)) {
-      REXLOG_WARN("PGR4 native pipelines: CreatePipelineLibrary failed {:08X}", uint32_t(hr));
-      library_.Reset();
-      return;
+  // One library from its file, or a new one (blob emptied then).
+  auto open = [&](const std::filesystem::path& file, std::vector<uint8_t>& blob,
+                  Microsoft::WRL::ComPtr<ID3D12PipelineLibrary>& lib) {
+    blob = ReadFile(file);
+    HRESULT hr = E_FAIL;
+    if (!blob.empty()) {
+      hr = device1->CreatePipelineLibrary(blob.data(), blob.size(), IID_PPV_ARGS(&lib));
+      if (FAILED(hr))
+        REXLOG_INFO("PGR4 native pipelines: library {} not usable ({:08X}), starting over",
+                    file.string(), uint32_t(hr));
     }
-  }
+    if (FAILED(hr)) {
+      blob.clear();
+      lib.Reset();
+      hr = device1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&lib));
+      if (FAILED(hr)) {
+        REXLOG_WARN("PGR4 native pipelines: CreatePipelineLibrary failed {:08X}", uint32_t(hr));
+        lib.Reset();
+      }
+    }
+  };
+  open(path, blob_, library_);
+  if (!library_) return;
   REXLOG_INFO("PGR4 native pipelines: library {} ({} KB)", path.string(), blob_.size() / 1024);
+  if (delta_on_) {
+    delta_path_ = path.parent_path() / (path.stem().wstring() + L".delta" + path.extension().wstring());
+    open(delta_path_, delta_blob_, delta_);
+    REXLOG_INFO("PGR4 native pipelines: the small library {} ({} KB){}", delta_path_.string(),
+                delta_blob_.size() / 1024,
+                fold_ ? ": its pipelines found stored in the big one (the precompile)" : "");
+  }
 }
 
 HRESULT PipelineLibrary::Create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
@@ -470,11 +483,21 @@ HRESULT PipelineLibrary::Create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
   if (SUCCEEDED(hr)) {
     *loaded = true;
     loaded_.fetch_add(1, std::memory_order_relaxed);
+  } else if (delta_ && SUCCEEDED(hr = delta_->LoadGraphicsPipeline(name, &desc, IID_PPV_ARGS(out)))) {
+    // Local change (22/11/2026): from the small library; the precompile stores it in the big one.
+    *loaded = true;
+    delta_loaded_.fetch_add(1, std::memory_order_relaxed);
+    if (fold_ && SUCCEEDED(library_->StorePipeline(name, *out))) {
+      folded_.fetch_add(1, std::memory_order_relaxed);
+      dirty_.store(true, std::memory_order_relaxed);
+    }
   } else {
     hr = device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(out));
-    if (SUCCEEDED(hr) && SUCCEEDED(library_->StorePipeline(name, *out))) {
+    // Stored in the small library while playing (local change), in the big one by the precompile.
+    ID3D12PipelineLibrary* target = delta_ && !fold_ ? delta_.Get() : library_.Get();
+    if (SUCCEEDED(hr) && SUCCEEDED(target->StorePipeline(name, *out))) {
       stored_.fetch_add(1, std::memory_order_relaxed);
-      dirty_.store(true, std::memory_order_relaxed);
+      (target == library_.Get() ? dirty_ : delta_dirty_).store(true, std::memory_order_relaxed);
     }
   }
   std::lock_guard<std::mutex> lock(busy_mutex_);
@@ -482,26 +505,62 @@ HRESULT PipelineLibrary::Create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc,
   return hr;
 }
 
-void PipelineLibrary::Save() {
-  if (!library_ || !dirty_.exchange(false, std::memory_order_relaxed)) return;
-  std::vector<uint8_t> data(library_->GetSerializedSize());
-  const HRESULT hr = library_->Serialize(data.data(), data.size());
+bool PipelineLibrary::Write(ID3D12PipelineLibrary* lib, const std::filesystem::path& path,
+                            const char* what) {
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<uint8_t> data(lib->GetSerializedSize());
+  const HRESULT hr = lib->Serialize(data.data(), data.size());
+  const auto t1 = std::chrono::steady_clock::now();
   if (FAILED(hr)) {
     // A pipeline stored since GetSerializedSize (another worker) makes the buffer too small.
-    dirty_.store(true, std::memory_order_relaxed);
-    REXLOG_WARN("PGR4 native pipelines: library Serialize failed {:08X}", uint32_t(hr));
-    return;
+    REXLOG_WARN("PGR4 native pipelines: {} Serialize failed {:08X}", what, uint32_t(hr));
+    return false;
   }
-  std::filesystem::path tmp = path_;
+  std::filesystem::path tmp = path;
   tmp += L".tmp";
   std::FILE* f = _wfopen(tmp.c_str(), L"wb");
-  if (!f) return;
+  if (!f) return false;
   const bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
   std::fclose(f);
   std::error_code ec;
-  if (ok) std::filesystem::rename(tmp, path_, ec);
-  REXLOG_INFO("PGR4 native pipelines: library saved, {} KB ({} loaded, {} stored this run){}",
-              data.size() / 1024, loaded_.load(), stored_.load(), ok && !ec ? "" : " FAILED");
+  if (ok) std::filesystem::rename(tmp, path, ec);
+  const auto t2 = std::chrono::steady_clock::now();
+  REXLOG_INFO("PGR4 native pipelines: {} saved, {} KB ({} loaded, {} from the small library, {} "
+              "moved into the big one, {} stored this run), serialized in {:.0f} ms, written in "
+              "{:.0f} ms{}",
+              what, data.size() / 1024, loaded_.load(), delta_loaded_.load(), folded_.load(),
+              stored_.load(), std::chrono::duration<double, std::milli>(t1 - t0).count(),
+              std::chrono::duration<double, std::milli>(t2 - t1).count(), ok && !ec ? "" : " FAILED");
+  return ok && !ec;
+}
+
+void PipelineLibrary::Save() {
+  if (!library_) return;
+  const bool big_dirty = dirty_.exchange(false, std::memory_order_relaxed);
+  const bool small_dirty = delta_dirty_.exchange(false, std::memory_order_relaxed);
+  if (!big_dirty && !small_dirty && !(fold_ && delta_ && !delta_removed_)) return;
+  // Development (22/11/2026): timed for the race probe (draw.cpp).
+  const auto t0 = std::chrono::steady_clock::now();
+  saving_.store(true, std::memory_order_relaxed);
+  if (big_dirty && !Write(library_.Get(), path_, "library")) dirty_.store(true, std::memory_order_relaxed);
+  if (small_dirty && delta_ && !fold_ && !Write(delta_.Get(), delta_path_, "small library"))
+    delta_dirty_.store(true, std::memory_order_relaxed);
+  // The precompile: the small library's pipelines it asked for are in the big one now, saved; the
+  // small one removed (what it held and nothing asked for compiles again when drawn, into a new one).
+  if (fold_ && delta_ && !delta_removed_ && !dirty_.load(std::memory_order_relaxed) &&
+      !delta_path_.empty()) {
+    std::error_code ec;
+    if (std::filesystem::remove(delta_path_, ec))
+      REXLOG_INFO("PGR4 native pipelines: the small library removed, {} of its pipelines moved into "
+                  "the big one", folded_.load());
+    // Once (its blob kept: the library object made from it reads it until the exit).
+    delta_removed_ = true;
+  }
+  save_us_.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - t0).count()),
+                     std::memory_order_relaxed);
+  saves_.fetch_add(1, std::memory_order_relaxed);
+  saving_.store(false, std::memory_order_relaxed);
 }
 
 }  // namespace pgr4::native

@@ -113,7 +113,7 @@ The optional HD texture pack (`textures_hd.pak`) is not part of this repository.
   started from.
 - [RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock) by dashdogy (MIT): DLSS Multi
   Frame Generation on RTX 40 series GPUs (`pgr4-native/src/native/mfg_unlock*`).
-- [XeGTAO](https://github.com/GameTechDev/XeGTAO) by Intel (MIT): the ambient occlusion under DLSS
-  and FSR.
+- [XeGTAO](https://github.com/GameTechDev/XeGTAO) by Intel (MIT): the ambient occlusion (with DLSS,
+  FSR and MSAA).
 - [PGR4-ReGPU](https://github.com/zer0ducksgiven/PGR4-ReGPU) (MIT): the cars' projected shadow fix
   and the method of recording the driver's calls on their own thread.

@@ -238,7 +238,7 @@ float4 XeWaterShade(XeInput i) {
   { float4 t90 = (XeMul((-r0.xxxx), c11.yyyy) + r1.xxxx) * kWaterFog; r0.x = t90.x; }
   { float t91 = XeMul1(c254.w, r0.x); r0.x = t91; ps = t91; }
   { float4 t92 = (r1.yyzw + (-r2.xxyz)); float t93 = exp2(r0.x); r0.y = t92.y; r0.z = t92.z; r0.w = t92.w; r0.x = t93; ps = t93; }
-  { float4 t94 = (XeMul(r0.yzww, r0.xxxx) + r2.xyzz); r0.x = t94.x; r0.y = t94.y; r0.z = t94.z; }
+  { float4 t94 = XeFog(r0.yzww, r0.xxxx, r2.xyzz, 1); r0.x = t94.x; r0.y = t94.y; r0.z = t94.z; }
   { float4 t95 = XeMul(r0.xyzz, c12.yyyy); float t96 = max(c95.w, c95.w); xe_out.x = t95.x; xe_out.y = t95.y; xe_out.z = t95.z; xe_out.w = t96; ps = t96; }
   return XeFinish(xe_out);
 }

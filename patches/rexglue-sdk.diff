@@ -711,7 +711,7 @@ index a5eaa8f..f760047 100644
                   bool saturate = false) {
      uint32_t dest_write_mask = dest.GetMask();
 diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
-index 3b0fd61..2d65580 100644
+index 3b0fd61..f9089a7 100644
 --- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
 +++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
 @@ -67,7 +67,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
@@ -736,7 +736,7 @@ index 3b0fd61..2d65580 100644
      } vertex;
      struct PixelShaderModification {
        // uint32_t 0.
-@@ -176,6 +182,20 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -176,6 +182,28 @@ class DxbcShaderTranslator : public ShaderTranslator {
        uint32_t dynamic_addressable_register_count : 8;
        // Non-ROV - depth / stencil output mode.
        DepthStencilMode depth_stencil_mode : 2;
@@ -754,10 +754,18 @@ index 3b0fd61..2d65580 100644
 +      // not the depth buffer (a title's blended scenery): the upscaler's depth then is that of
 +      // the surface whose motion it gets.
 +      uint32_t motion_depth : 1;
++      // Local change (pgr4 project, 21/11/2026, the volumetric fog laid by each shader as the game
++      // lays its own): where the game's fog ends in this pixel shader (pgr4-native draw.cpp
++      // FindFogEnding): fog_form 0 none, 1 normal (mad D, B = C - F, T from exp, F), 2 shadow
++      // (faded towards a constant 1), 3 the fog's light alone; fog_address the mad's instruction
++      // (ShaderTranslator::current_alu_address_). The system flags' kSysFlag_FogMode picks what is
++      // done there, per draw. New bits zero in every older modification: none, as before.
++      uint32_t fog_form : 2;
++      uint32_t fog_address : 11;
      } pixel;
  
      explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
-@@ -198,8 +218,22 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -198,8 +226,26 @@ class DxbcShaderTranslator : public ShaderTranslator {
      kBoolLoopConstants,
      kFetchConstants,
      kDescriptorIndices,
@@ -776,11 +784,15 @@ index 3b0fd61..2d65580 100644
 +  static constexpr uint32_t kMotionVectorRenderTarget = xenos::kMaxColorRenderTargets;
 +  // Local change (pgr4 project): Modification::pixel.motion_depth's target (R: the depth).
 +  static constexpr uint32_t kMotionDepthRenderTarget = kMotionVectorRenderTarget + 1;
++  // Local change (pgr4 project, 21/11/2026): the fixed bindless views of the volumetric fog laid by
++  // each shader (pgr4-native draw.cpp kFogVolume, kFogRange; EmitVolumetricFog).
++  static constexpr uint32_t kFogVolumeDescriptor = 8;
++  static constexpr uint32_t kFogRangeDescriptor = 9;
 +
    // Some are referenced in xenos_draw.hlsli - check it too when updating!
    enum : uint32_t {
      kSysFlag_SharedMemoryIsUAV_Shift,
-@@ -236,6 +270,16 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -236,6 +282,21 @@ class DxbcShaderTranslator : public ShaderTranslator {
      // taking into account the potential relation with occlusion queries (but
      // should be safe at least temporarily).
      kSysFlag_ROVDepthStencilEarlyWrite_Shift,
@@ -794,10 +806,15 @@ index 3b0fd61..2d65580 100644
 +    // the pixel shows, otherwise "none" (what is under it keeps its own): kMotionOverlay* below.
 +    kSysFlag_MotionOverlay_Shift,
 +    kSysFlag_MotionOverlayHigh_Shift,
++    // Local change (pgr4 project, 21/11/2026): two bits, at the game's fog ending
++    // (Modification::pixel.fog_form): 0 the game's result, 1 the same computed again by the fog's
++    // own code (a check: the image must not change), 2 the volumetric fog (later).
++    kSysFlag_FogMode_Shift,
++    kSysFlag_FogModeHigh_Shift,
  
      kSysFlag_Count,
  
-@@ -260,8 +304,25 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -260,8 +321,25 @@ class DxbcShaderTranslator : public ShaderTranslator {
      kSysFlag_ROVDepthWrite = 1u << kSysFlag_ROVDepthWrite_Shift,
      kSysFlag_ROVStencilTest = 1u << kSysFlag_ROVStencilTest_Shift,
      kSysFlag_ROVDepthStencilEarlyWrite = 1u << kSysFlag_ROVDepthStencilEarlyWrite_Shift,
@@ -823,7 +840,31 @@ index 3b0fd61..2d65580 100644
  
    // IF SYSTEM CONSTANTS ARE CHANGED OR ADDED, THE FOLLOWING MUST BE UPDATED:
    // - SystemConstants::Index enum.
-@@ -659,6 +720,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -388,6 +466,14 @@ class DxbcShaderTranslator : public ShaderTranslator {
+     // The constant blend factor for the respective modes.
+     float edram_blend_constant[4];
+ 
++    // Local change (pgr4 project, 21/11/2026): the volumetric fog laid by each shader at the game's
++    // fog ending (kSysFlag_FogMode 2; pgr4-native volumetrics.cpp fills it, also read by its HLSL
++    // replacements): [0] the volume's range (m), ln 2 / its slices' growth, its columns (x, y);
++    // [1] near x far, far - near, near (the view depth from SV_Position.z), the first slice's edge
++    // (m); [2] the fog's color in the volume's units (c10.rgb x c12.y), 1 / c12.y; [3] the game's
++    // fog color c10.rgb, 1 when the volume is made this frame (else the game's fog is kept).
++    float fog_shader[16];
++
+    private:
+     friend class DxbcShaderTranslator;
+ 
+@@ -440,6 +526,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
+ 
+       kEdramBlendConstant,
+ 
++      kFogShader,  // local change (pgr4 project)
++
+       kCount,
+     };
+     static_assert(uint32_t(Index::kCount) <= 64,
+@@ -659,6 +747,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
      return is_vertex_shader() ? modification.vertex.interpolator_mask
                                : modification.pixel.interpolator_mask;
    }
@@ -843,7 +884,7 @@ index 3b0fd61..2d65580 100644
  
    // Whether to use switch-case rather than if (pc >= label) for control flow.
    bool UseSwitchForControlFlow() const;
-@@ -761,6 +835,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -761,6 +862,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
    void StartPixelShader_LoadROVParameters();
    void StartPixelShader();
  
@@ -857,7 +898,7 @@ index 3b0fd61..2d65580 100644
    void CompleteVertexOrDomainShader();
    // For RTV, adds the sample to coverage_temp.coverage_temp_component if it
    // passes alpha to mask (or, if initialize == true (for the first sample
-@@ -779,10 +860,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -779,10 +887,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
    // alpha can be exponent-biased.
    void CompletePixelShader_AlphaToMask();
    void CompletePixelShader_WriteToRTVs();
@@ -873,7 +914,32 @@ index 3b0fd61..2d65580 100644
    void CompleteShaderCode();
  
    // Writes the original instruction disassembly in the output DXBC if enabled,
-@@ -992,6 +1078,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -797,6 +910,24 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // be done when the operand is not needed anymore.
+   dxbc::Src LoadOperand(const InstructionOperand& operand, uint32_t needed_components,
+                         bool& temp_pushed_out);
++  // Local change (pgr4 project, 21/11/2026): the game's fog ending (Modification::pixel.fog_form).
++  void ProcessFogEnding(const ParsedAluInstruction& instr);
++  // Its volumetric fog (kSysFlag_FogMode 2): system_temp_result_'s xyz from the operands.
++  // channels: the colour channel (0 red, 1 green, 2 blue) of each of the mad's components, as a
++  // swizzle (its fog operand's component there: the game's fog colour c10 or its premultiplied copy
++  // keeps red, green and blue in x, y and z).
++  void EmitVolumetricFog(uint32_t form, const dxbc::Src operands[3], uint32_t used,
++                         uint32_t channels);
++  // Local change (pgr4 project, 21/11/2026): the colour channel (0 red, 1 green, 2 blue, -1 none)
++  // each temp register component holds, followed through the ALU instructions before the fog
++  // ending (UpdateFogChannels): from the fog colour constants c10 (the scene's) and c32 (the
++  // flags'), by their letters, and through the temps that carry them; any other write forgets it.
++  // The fog ending's F operand then gives each written component's channel (ProcessFogEnding):
++  // checked on the 2451 dumped endings against the oC0 component each reaches, 2429 the same, the
++  // 8 others one component sent grey to red, green and blue (the game's own c10.x there).
++  void UpdateFogChannels(const ParsedAluInstruction& instr);
++  int8_t fog_channel_[64][4];
++
+   // Writes the specified source (src must be usable as a vector `mov` source,
+   // including to x#) to an instruction storage target.
+   // can_store_memexport_address is for safety, to allow only proper MADs with a
+@@ -992,6 +1123,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
    uint32_t cbuffer_index_bool_loop_constants_;
    uint32_t cbuffer_index_fetch_constants_;
    uint32_t cbuffer_index_descriptor_indices_;
@@ -886,7 +952,7 @@ index 3b0fd61..2d65580 100644
    struct SystemConstantRdef {
      const char* name;
 diff --git a/include/rex/graphics/pipeline/shader/translator.h b/include/rex/graphics/pipeline/shader/translator.h
-index 340ced5..67c82cb 100644
+index 340ced5..1522ccc 100644
 --- a/include/rex/graphics/pipeline/shader/translator.h
 +++ b/include/rex/graphics/pipeline/shader/translator.h
 @@ -82,6 +82,11 @@ class ShaderTranslator {
@@ -901,6 +967,17 @@ index 340ced5..67c82cb 100644
    // Pre-process a control-flow instruction before anything else.
    virtual void PreProcessControlFlowInstructions(
        std::vector<ucode::ControlFlowInstruction> /*instrs*/) {}
+@@ -131,6 +136,10 @@ class ShaderTranslator {
+   virtual void ProcessAluInstruction(const ParsedAluInstruction& /*instr*/,
+                                      uint8_t /*memexport_eM_potentially_written_before*/) {}
+ 
++  // Local change (pgr4 project, 21/11/2026): the ALU instruction being processed, its number in
++  // the ucode (the disassembly's /* N */), for Modification::pixel.fog_address.
++  uint32_t current_alu_address_ = 0;
++
+  private:
+   void TranslateControlFlowInstruction(const ucode::ControlFlowInstruction& cf);
+   void TranslateExecInstructions(const ParsedExecInstruction& instr);
 diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
 index d26cd4f..fbcc95b 100644
 --- a/include/rex/graphics/pipeline/texture/cache.h
@@ -5407,7 +5484,7 @@ index 8f2fcb0..fe1303e 100644
          }
          return 0;
 diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
-index 2c31a0e..464f88d 100644
+index 2c31a0e..27e0a66 100644
 --- a/src/graphics/pipeline/shader/dxbc_translator.cpp
 +++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
 @@ -123,6 +123,9 @@ void DxbcShaderTranslator::Reset() {
@@ -5420,8 +5497,12 @@ index 2c31a0e..464f88d 100644
  
    system_constants_used_ = 0;
  
-@@ -772,8 +775,11 @@ void DxbcShaderTranslator::StartPixelShader() {
+@@ -770,10 +773,15 @@ void DxbcShaderTranslator::StartPixelShader() {
+ }
+ 
  void DxbcShaderTranslator::StartTranslation() {
++  // Local change (pgr4 project): the fog channels' tracking, none known (UpdateFogChannels).
++  std::memset(fog_channel_, -1, sizeof(fog_channel_));
    // Set up the input and output registers.
    Modification shader_modification = GetDxbcShaderModification();
 -  uint32_t interpolator_register_mask = GetModificationInterpolatorMask();
@@ -5434,7 +5515,7 @@ index 2c31a0e..464f88d 100644
    if (is_vertex_shader()) {
      uint32_t out_reg_index = 0;
      // Interpolators.
-@@ -903,6 +909,10 @@ void DxbcShaderTranslator::StartTranslation() {
+@@ -903,6 +911,10 @@ void DxbcShaderTranslator::StartTranslation() {
      return;
    }
  
@@ -5445,7 +5526,7 @@ index 2c31a0e..464f88d 100644
    // Start the main loop (for jumping to labels by setting pc and continuing).
    a_.OpLoop();
    // Switch and the first label (pc == 0).
-@@ -914,8 +924,23 @@ void DxbcShaderTranslator::StartTranslation() {
+@@ -914,8 +926,23 @@ void DxbcShaderTranslator::StartTranslation() {
    }
  }
  
@@ -5471,7 +5552,7 @@ index 2c31a0e..464f88d 100644
    dxbc::Dest temp_x_dest(dxbc::Dest::R(temp, 0b0001));
    dxbc::Src temp_x_src(dxbc::Src::R(temp, dxbc::Src::kXXXX));
  
-@@ -925,25 +950,85 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
+@@ -925,25 +952,85 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
    // into W. Using div rather than relaxed-precision rcp for safety.
    a_.OpAnd(temp_x_dest, flags_src, dxbc::Src::LU(kSysFlag_WNotReciprocal));
    a_.OpIf(false, temp_x_src);
@@ -5564,7 +5645,7 @@ index 2c31a0e..464f88d 100644
  
    Modification shader_modification = GetDxbcShaderModification();
    uint32_t clip_distance_next_component = 0;
-@@ -964,19 +1049,11 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
+@@ -964,19 +1051,11 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
      ++ucp_clip_cull_distance_next_component_ref;
    }
  
@@ -5589,7 +5670,7 @@ index 2c31a0e..464f88d 100644
  
    // Kill the primitive if needed - check if the shader wants to kill (bits
    // 0:30 of the vertex kill register are not zero - using `and`, not abs or
-@@ -1023,19 +1100,7 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
+@@ -1023,19 +1102,7 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
  
  void DxbcShaderTranslator::CompleteShaderCode() {
    if (!is_depth_only_pixel_shader_) {
@@ -5610,7 +5691,7 @@ index 2c31a0e..464f88d 100644
  
      // Release the following system temporary values so epilogue can reuse them:
      // - system_temp_result_.
-@@ -1061,6 +1126,9 @@ void DxbcShaderTranslator::CompleteShaderCode() {
+@@ -1061,6 +1128,9 @@ void DxbcShaderTranslator::CompleteShaderCode() {
  
    // Write stage-specific epilogue.
    if (is_vertex_shader()) {
@@ -5620,7 +5701,7 @@ index 2c31a0e..464f88d 100644
      CompleteVertexOrDomainShader();
    } else if (is_pixel_shader()) {
      CompletePixelShader();
-@@ -1331,8 +1399,10 @@ dxbc::Src DxbcShaderTranslator::LoadOperand(const InstructionOperand& operand,
+@@ -1331,8 +1401,10 @@ dxbc::Src DxbcShaderTranslator::LoadOperand(const InstructionOperand& operand,
        }
      } break;
      case InstructionStorageSource::kConstantFloat: {
@@ -5633,7 +5714,7 @@ index 2c31a0e..464f88d 100644
        }
        const Shader::ConstantRegisterMap& constant_register_map =
            current_shader().constant_register_map();
-@@ -1347,8 +1417,10 @@ dxbc::Src DxbcShaderTranslator::LoadOperand(const InstructionOperand& operand,
+@@ -1347,8 +1419,10 @@ dxbc::Src DxbcShaderTranslator::LoadOperand(const InstructionOperand& operand,
        } else {
          assert_true(constant_register_map.float_dynamic_addressing);
        }
@@ -5646,7 +5727,7 @@ index 2c31a0e..464f88d 100644
      } break;
      default:
        assert_unhandled_case(operand.storage_source);
-@@ -1376,6 +1448,12 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result, const dx
+@@ -1376,6 +1450,12 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result, const dx
      return;
    }
  
@@ -5659,7 +5740,24 @@ index 2c31a0e..464f88d 100644
    // Get the destination address and type.
    dxbc::Dest dest(dxbc::Dest::Null());
    bool is_clamped = result.is_clamped;
-@@ -2081,6 +2159,14 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+@@ -1982,7 +2062,16 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
+     {"xe_edram_rt_blend_factors_ops", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
+ 
+     {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
++
++    // Local change (pgr4 project, 21/11/2026): SystemConstants::fog_shader (Index::kFogShader).
++    {"xe_fog_shader", ShaderRdefTypeIndex::kFloat4Array4, sizeof(float) * 16},
+ };
++// Local change (pgr4 project): every system constant must have its entry above (a missing one is
++// zero, its name null: WriteResourceDefinition then crashes).
++static_assert(offsetof(DxbcShaderTranslator::SystemConstants, fog_shader) +
++                      sizeof(DxbcShaderTranslator::SystemConstants::fog_shader) ==
++                  sizeof(DxbcShaderTranslator::SystemConstants),
++              "fog_shader must stay the last system constant");
+ 
+ void DxbcShaderTranslator::WriteResourceDefinition() {
+   // Because of shader_object_.resize(), pointers can't be kept persistently
+@@ -2081,6 +2170,14 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
    if (cbuffer_index_descriptor_indices_ != kBindingIndexUnallocated) {
      name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_descriptor_indices");
    }
@@ -5674,7 +5772,7 @@ index 2c31a0e..464f88d 100644
  
    // System constants.
    uint32_t constant_position_dwords_system = uint32_t(shader_object_.size());
-@@ -2192,6 +2278,39 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+@@ -2192,6 +2289,39 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
      constant_descriptor_indices.start_sampler = UINT32_MAX;
    }
  
@@ -5714,7 +5812,7 @@ index 2c31a0e..464f88d 100644
    // ***************************************************************************
    // Constant buffers
    // ***************************************************************************
-@@ -2218,6 +2337,14 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+@@ -2218,6 +2348,14 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
    if (cbuffer_index_descriptor_indices_ != kBindingIndexUnallocated) {
      name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_descriptor_indices_cbuffer");
    }
@@ -5729,7 +5827,7 @@ index 2c31a0e..464f88d 100644
  
    // All the constant buffers, sorted by their binding index.
    uint32_t cbuffers_position_dwords = uint32_t(shader_object_.size());
-@@ -2263,6 +2390,18 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+@@ -2263,6 +2401,18 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
              (constant_position_dwords_descriptor_indices - blob_position_dwords) * sizeof(uint32_t);
          cbuffer.size_vector_aligned_bytes =
              sizeof(uint32_t) * rex::align(GetBindlessResourceCount(), uint32_t(4));
@@ -5748,7 +5846,7 @@ index 2c31a0e..464f88d 100644
        } else {
          assert_unhandled_case(i);
        }
-@@ -2479,6 +2618,12 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
+@@ -2479,6 +2629,12 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
        } else if (i == cbuffer_index_descriptor_indices_) {
          cbuffer.name_ptr = cbuffer_name_ptr_descriptor_indices;
          cbuffer.bind_point = uint32_t(CbufferRegister::kDescriptorIndices);
@@ -5761,7 +5859,7 @@ index 2c31a0e..464f88d 100644
        } else {
          assert_unhandled_case(i);
        }
-@@ -2579,7 +2724,7 @@ void DxbcShaderTranslator::WriteInputSignature() {
+@@ -2579,7 +2735,7 @@ void DxbcShaderTranslator::WriteInputSignature() {
      // Intepolators (TEXCOORD#).
      size_t interpolator_position = shader_object_.size();
      uint32_t interpolator_mask = GetModificationInterpolatorMask();
@@ -5770,7 +5868,7 @@ index 2c31a0e..464f88d 100644
      shader_object_.resize(shader_object_.size() + interpolator_count * kParameterDwords);
      parameter_count += interpolator_count;
      {
-@@ -2598,6 +2743,18 @@ void DxbcShaderTranslator::WriteInputSignature() {
+@@ -2598,6 +2754,18 @@ void DxbcShaderTranslator::WriteInputSignature() {
          interpolator.always_reads_mask = interpolator_index < register_count() ? 0b1111 : 0b0000;
          ++used_interpolator_index;
        }
@@ -5789,7 +5887,7 @@ index 2c31a0e..464f88d 100644
      }
  
      // Point coordinates for PsParamGen (XESPRITETEXCOORD).
-@@ -2825,7 +2982,7 @@ void DxbcShaderTranslator::WriteOutputSignature() {
+@@ -2825,7 +2993,7 @@ void DxbcShaderTranslator::WriteOutputSignature() {
    if (is_vertex_shader()) {
      // Intepolators (TEXCOORD#).
      size_t interpolator_position = shader_object_.size();
@@ -5798,7 +5896,7 @@ index 2c31a0e..464f88d 100644
      shader_object_.resize(shader_object_.size() + interpolator_count * kParameterDwords);
      parameter_count += interpolator_count;
      {
-@@ -2969,8 +3126,11 @@ void DxbcShaderTranslator::WriteOutputSignature() {
+@@ -2969,8 +3137,11 @@ void DxbcShaderTranslator::WriteOutputSignature() {
  
        // Color render targets (SV_Target#).
        size_t target_position = SIZE_MAX;
@@ -5812,7 +5910,7 @@ index 2c31a0e..464f88d 100644
          target_position = shader_object_.size();
          shader_object_.resize(shader_object_.size() +
                                color_targets_written_count * kParameterDwords);
-@@ -2988,6 +3148,20 @@ void DxbcShaderTranslator::WriteOutputSignature() {
+@@ -2988,6 +3159,20 @@ void DxbcShaderTranslator::WriteOutputSignature() {
            target.register_index = i;
            target.mask = 0b1111;
          }
@@ -5833,7 +5931,7 @@ index 2c31a0e..464f88d 100644
        }
  
        // Coverage output for alpha to mask (SV_Coverage).
-@@ -3133,6 +3307,17 @@ void DxbcShaderTranslator::WriteShaderCode() {
+@@ -3133,6 +3318,17 @@ void DxbcShaderTranslator::WriteShaderCode() {
                                  ? dxbc::ConstantBufferAccessPattern::kDynamicIndexed
                                  : dxbc::ConstantBufferAccessPattern::kImmediateIndexed);
    }
@@ -5851,7 +5949,7 @@ index 2c31a0e..464f88d 100644
    if (cbuffer_index_system_constants_ != kBindingIndexUnallocated) {
      ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_system_constants_,
                                            uint32_t(CbufferRegister::kSystemConstants),
-@@ -3145,6 +3330,12 @@ void DxbcShaderTranslator::WriteShaderCode() {
+@@ -3145,6 +3341,12 @@ void DxbcShaderTranslator::WriteShaderCode() {
                                            uint32_t(CbufferRegister::kFetchConstants)),
                              48);
    }
@@ -5864,7 +5962,7 @@ index 2c31a0e..464f88d 100644
    if (cbuffer_index_descriptor_indices_ != kBindingIndexUnallocated) {
      assert_not_zero(GetBindlessResourceCount());
      ao_.OpDclConstantBuffer(dxbc::Src::CB(dxbc::Src::Dcl, cbuffer_index_descriptor_indices_,
-@@ -3272,7 +3463,7 @@ void DxbcShaderTranslator::WriteShaderCode() {
+@@ -3272,7 +3474,7 @@ void DxbcShaderTranslator::WriteShaderCode() {
        }
      }
      // Interpolator output.
@@ -5873,7 +5971,7 @@ index 2c31a0e..464f88d 100644
      for (uint32_t i = 0; i < interpolator_count; ++i) {
        ao_.OpDclOutput(dxbc::Dest::O(out_reg_vs_interpolators_ + i));
      }
-@@ -3323,6 +3514,14 @@ void DxbcShaderTranslator::WriteShaderCode() {
+@@ -3323,6 +3525,14 @@ void DxbcShaderTranslator::WriteShaderCode() {
            dxbc::Dest::V1D(interpolator_register_index));
        ++interpolator_register_index;
      }
@@ -5888,7 +5986,7 @@ index 2c31a0e..464f88d 100644
      if (in_reg_ps_point_coordinates_ != UINT32_MAX) {
        // Point coordinates input.
        ao_.OpDclInputPS(dxbc::InterpolationMode::kLinear,
-@@ -3371,6 +3570,12 @@ void DxbcShaderTranslator::WriteShaderCode() {
+@@ -3371,6 +3581,12 @@ void DxbcShaderTranslator::WriteShaderCode() {
            ao_.OpDclOutput(dxbc::Dest::O(i));
          }
        }
@@ -5901,6 +5999,361 @@ index 2c31a0e..464f88d 100644
        // Coverage output for alpha to mask.
        if ((color_targets_written & 0b1) && !global_flag_force_early_depth_stencil) {
          ao_.OpDclOutput(dxbc::Dest::OMask());
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_alu.cpp b/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
+index 66834e5..5f04d83 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
+@@ -13,7 +13,9 @@
+ #include <cmath>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>  // local change: the development log's gate (pgr4_native_capture_dir)
+ #include <rex/graphics/pipeline/shader/dxbc_translator.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ 
+ namespace rex::graphics {
+@@ -928,6 +930,321 @@ void DxbcShaderTranslator::ProcessScalarAluOperation(
+   PopSystemTemp(operand_temps);
+ }
+ 
++// Local change (pgr4 project, 21/11/2026, the volumetric fog laid by each shader as the game lays
++// its own): at the game's fog ending (mad D, B, T, F: D = B x T + F, B = surface - F, T the
++// transmittance from exp), system_temp_result_ computed again as kSysFlag_FogMode says:
++//   1 the game's mad again, the same operations as ProcessVectorAluOperation's (mul, its
++//     "0 x anything = +0" rule, add): a check that the right instruction and operands are taken,
++//     the image unchanged.
++void DxbcShaderTranslator::ProcessFogEnding(const ParsedAluInstruction& instr) {
++  const uint32_t used = instr.vector_and_constant_result.GetUsedResultComponents();
++  uint32_t mode = PushSystemTemp();
++  a_.OpUBFE(dxbc::Dest::R(mode, 0b0001), dxbc::Src::LU(2), dxbc::Src::LU(kSysFlag_FogMode_Shift),
++            LoadFlagsSystemConstant());
++  // Modes 1 and 2: the game's mad again (mode 2 then replaces its xyz with the volumetric fog).
++  a_.OpIGE(dxbc::Dest::R(mode, 0b0010), dxbc::Src::R(mode, dxbc::Src::kXXXX), dxbc::Src::LU(1));
++  a_.OpIf(true, dxbc::Src::R(mode, dxbc::Src::kYYYY));
++  {
++    dxbc::Src operands[3]{dxbc::Src::LF(0.0f), dxbc::Src::LF(0.0f), dxbc::Src::LF(0.0f)};
++    uint32_t operand_temps = 0;
++    for (uint32_t i = 0; i < 3; ++i) {
++      bool pushed = false;
++      operands[i] = LoadOperand(instr.vector_operands[i],
++                                ucode::GetAluVectorOpNeededSourceComponents(
++                                    AluVectorOpcode::kMad, i + 1, used),
++                                pushed);
++      operand_temps += uint32_t(pushed);
++    }
++    const dxbc::Dest dest(dxbc::Dest::R(system_temp_result_, used));
++    a_.OpMul(dest, operands[0], operands[1]);
++    const uint32_t different =
++        used & ~instr.vector_operands[0].GetIdenticalComponents(instr.vector_operands[1]);
++    if (different) {
++      uint32_t is_zero = PushSystemTemp();
++      a_.OpMin(dxbc::Dest::R(is_zero, different), operands[0].Abs(), operands[1].Abs());
++      a_.OpEq(dxbc::Dest::R(is_zero, different), dxbc::Src::R(is_zero), dxbc::Src::LF(0.0f));
++      a_.OpMovC(dxbc::Dest::R(system_temp_result_, different), dxbc::Src::R(is_zero),
++                dxbc::Src::LF(0.0f), dxbc::Src::R(system_temp_result_));
++      PopSystemTemp();
++    }
++    a_.OpAdd(dest, dxbc::Src::R(system_temp_result_), operands[2]);
++    // Mode 2: the volumetric fog, the volume made this frame (fog_shader[3].w).
++    a_.OpIEq(dxbc::Dest::R(mode, 0b0100), dxbc::Src::R(mode, dxbc::Src::kXXXX), dxbc::Src::LU(2));
++    a_.OpIf(true, dxbc::Src::R(mode, dxbc::Src::kZZZZ));
++    {
++      const dxbc::Src ok = LoadSystemConstant(SystemConstants::Index::kFogShader,
++                                              offsetof(SystemConstants, fog_shader) + 3 * 16,
++                                              dxbc::Src::kWWWW);
++      a_.OpLT(dxbc::Dest::R(mode, 0b1000), dxbc::Src::LF(0.5f), ok);
++      a_.OpIf(true, dxbc::Src::R(mode, dxbc::Src::kWWWW));
++      // Each component's colour channel (21/11/2026, Tazz: the trees tinted yellow-green:
++      // 0113819702EACBA3's `mad r7.xy_w, r2.xyzz, r7.xxxx, r1.xyzz` then `max oC0, r7.xywz`, blue
++      // in w; and 44 with F's colour a component on, `r2._yzw = c10.xxyz`): F's there, c10 or c32
++      // by its letter, a temp by the channel its component holds (UpdateFogChannels), else the
++      // component's own position.
++      const InstructionOperand& f_op = instr.vector_operands[2];
++      uint32_t channels = 0;
++      for (uint32_t i = 0; i < 4; ++i) {
++        const SwizzleSource c = f_op.GetComponent(i);
++        int channel = -1;
++        if (c <= SwizzleSource::kW &&
++            f_op.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
++          if (f_op.storage_source == InstructionStorageSource::kConstantFloat &&
++              (f_op.storage_index == 10 || f_op.storage_index == 32) && uint32_t(c) <= 2)
++            channel = int(c);
++          else if (f_op.storage_source == InstructionStorageSource::kRegister &&
++                   f_op.storage_index < 64)
++            channel = fog_channel_[f_op.storage_index][uint32_t(c)];
++        }
++        if (channel < 0 || channel > 2) channel = int(std::min(i, 2u));
++        channels |= uint32_t(channel) << (i * 2);
++      }
++      // Development: each translation's channels, against the offline table (work's
++      // fog_channels_expected.tsv: the same rule on the dumped shaders). Local change
++      // (22/11/2026): only with a capture folder, as pgr4-native's development probes (draw.cpp,
++      // pgr4_native_capture_dir; read once, set by the toml before any translation): in a release
++      // it was most of run.log (1229 of 1699 lines in a few seconds of menus).
++      static const bool kFogChannelsLog =
++          !rex::cvar::GetFlagByName("pgr4_native_capture_dir").empty();
++      if (kFogChannelsLog)
++        REXGPU_INFO("PGR4 fog ending channels: {:016X} at {} mask {:X} channels {}{}{}{}",
++                    current_shader().ucode_data_hash(), current_alu_address_, used, channels & 3,
++                    (channels >> 2) & 3, (channels >> 4) & 3, (channels >> 6) & 3);
++      EmitVolumetricFog(GetDxbcShaderModification().pixel.fog_form, operands, used, channels);
++      a_.OpEndIf();
++    }
++    a_.OpEndIf();
++    PopSystemTemp(operand_temps);
++  }
++  a_.OpEndIf();
++  PopSystemTemp();  // mode
++}
++
++// Local change (pgr4 project, 21/11/2026): the volumetric fog laid at the game's fog ending, as the
++// volumetric pass laid it on the finished image (pgr4-native volumetrics.cpp kApplyHlsl, FROXEL),
++// but with the pixel's own depth and the shader's own surface and transmittance:
++//   tg = the game's transmittance (the mad's T), z = the pixel's view depth (SV_Position.z),
++//   (L, Tv) = the volume at (the pixel, min(z, range)), trilinear (columns of 16 x 16 pixels, the
++//   slices' edges kVolumeNear e^(growth j), edge j at slice j - 1, before the first edge from the
++//   eye's (0, 1)); beyond the range the volume's ours / the game's at the range (kFogRange, its
++//   column) kept: Tv = it x tg, L += fog x (Tv at the range - Tv);
++//   ratio = min(Tv / tg, 1 + 2 tg), To = tg x ratio, L x (1 - To) / (1 - Tv) where To < Tv;
++//   L in the shader's units (/ c12.y, which it multiplies by after), times F / c10 (the game's own
++//   change of its fog's color: the transparents' premultiplied alpha).
++//   form 1 (normal, D = (C - F) T + F): D = C To + L F / c10, C = B + F;
++//   form 2 (shadow, D = B T + 1): D = B To + F;
++//   form 3 (the fog's light, D = (1 - T) F): D = L F / c10.
++void DxbcShaderTranslator::EmitVolumetricFog(uint32_t form, const dxbc::Src operands[3],
++                                             uint32_t used, uint32_t channels) {
++  // The components written with the volumetric fog: every one the mad writes (its colour, whatever
++  // components hold it: xy_w, x_zw, _yzw, ___w as well as xyz_), but not a fourth (alpha).
++  const uint32_t rgb = used == 0b1111 ? 0b0111u : used;
++  if (!rgb || !bindless_resources_used_) return;
++  const size_t base = offsetof(SystemConstants, fog_shader);
++  auto fc = [&](uint32_t row, uint32_t swizzle) {
++    return LoadSystemConstant(SystemConstants::Index::kFogShader, base + row * 16, swizzle);
++  };
++  in_position_used_ |= 0b0111;
++  const dxbc::Src pos = dxbc::Src::V1D(in_reg_ps_position_);
++  if (srv_index_bindless_textures_3d_ == kBindingIndexUnallocated) {
++    srv_index_bindless_textures_3d_ = srv_count_++;
++  }
++  if (srv_index_bindless_textures_2d_ == kBindingIndexUnallocated) {
++    srv_index_bindless_textures_2d_ = srv_count_++;
++  }
++  const dxbc::Src volume =
++      dxbc::Src::T(srv_index_bindless_textures_3d_, dxbc::Index(kFogVolumeDescriptor));
++  const dxbc::Src range_tex =
++      dxbc::Src::T(srv_index_bindless_textures_2d_, dxbc::Index(kFogRangeDescriptor));
++  // tg (x), z (y), z at most the range (z), the near edge's weight (w).
++  const uint32_t g = PushSystemTemp();
++  // The trilinear weights and places: x, y the columns' fractions, z the slice's; w scratch.
++  const uint32_t f = PushSystemTemp();
++  // Integer places: columns x0, x1 (x, y), rows y0, y1 (z, w).
++  const uint32_t ci = PushSystemTemp();
++  // Slices k0, k1 (x, y); the nearest column (z, w).
++  const uint32_t ki = PushSystemTemp();
++  const uint32_t v = PushSystemTemp(0b1111);  // the volume: L (rgb), Tv (a)
++  const uint32_t q = PushSystemTemp();        // a texel; scratch
++  const uint32_t a = PushSystemTemp();        // the address of a load
++  // tg: the game's transmittance, the mad's T (operand 1; operand 0 for the fog's light).
++  const dxbc::Src t_operand = form == 3 ? operands[0] : operands[1];
++  a_.OpMov(dxbc::Dest::R(g, 0b0001), t_operand.Select(0), true);
++  // z = near far / ((far - near) d + near).
++  a_.OpMAd(dxbc::Dest::R(g, 0b0010), pos.Select(2), fc(1, dxbc::Src::kYYYY), fc(1, dxbc::Src::kZZZZ));
++  a_.OpDiv(dxbc::Dest::R(g, 0b0010), fc(1, dxbc::Src::kXXXX), dxbc::Src::R(g, dxbc::Src::kYYYY));
++  a_.OpMin(dxbc::Dest::R(g, 0b0100), dxbc::Src::R(g, dxbc::Src::kYYYY), fc(0, dxbc::Src::kXXXX));
++  // Before the first edge: the eye's (0, 1) to slice 0 by z / e1.
++  a_.OpDiv(dxbc::Dest::R(g, 0b1000), dxbc::Src::R(g, dxbc::Src::kZZZZ), fc(1, dxbc::Src::kWWWW), true);
++  // The slice: log2(2 z) ln 2 / growth - 1 (edge j at slice j - 1), in [0, 63]; 0 before e1.
++  a_.OpMul(dxbc::Dest::R(f, 0b0100), dxbc::Src::R(g, dxbc::Src::kZZZZ), dxbc::Src::LF(2.0f));
++  a_.OpLog(dxbc::Dest::R(f, 0b0100), dxbc::Src::R(f, dxbc::Src::kZZZZ));
++  a_.OpMAd(dxbc::Dest::R(f, 0b0100), dxbc::Src::R(f, dxbc::Src::kZZZZ), fc(0, dxbc::Src::kYYYY),
++           dxbc::Src::LF(-1.0f));
++  a_.OpMax(dxbc::Dest::R(f, 0b0100), dxbc::Src::R(f, dxbc::Src::kZZZZ), dxbc::Src::LF(0.0f));
++  a_.OpMin(dxbc::Dest::R(f, 0b0100), dxbc::Src::R(f, dxbc::Src::kZZZZ), dxbc::Src::LF(63.0f));
++  a_.OpGE(dxbc::Dest::R(q, 0b0001), dxbc::Src::R(g, dxbc::Src::kZZZZ), fc(1, dxbc::Src::kWWWW));
++  a_.OpMovC(dxbc::Dest::R(f, 0b0100), dxbc::Src::R(q, dxbc::Src::kXXXX),
++            dxbc::Src::R(f, dxbc::Src::kZZZZ), dxbc::Src::LF(0.0f));
++  // Columns: centres at 16 c + 8: c = pos / 16 - 0.5.
++  a_.OpMAd(dxbc::Dest::R(f, 0b0011), pos, dxbc::Src::LF(1.0f / 16.0f), dxbc::Src::LF(-0.5f));
++  a_.OpRoundNI(dxbc::Dest::R(q, 0b0011), dxbc::Src::R(f));
++  a_.OpAdd(dxbc::Dest::R(f, 0b0011), dxbc::Src::R(f), -dxbc::Src::R(q));  // fractions
++  a_.OpFToI(dxbc::Dest::R(ci, 0b0101), dxbc::Src::R(q, 0b00010000));      // x0 (x), y0 (z)
++  a_.OpIAdd(dxbc::Dest::R(ci, 0b1010), dxbc::Src::R(ci, 0b10000000), dxbc::Src::LI(1));  // x1 (y), y1 (w)
++  // Clamped to the columns: [0, columns - 1].
++  a_.OpFToI(dxbc::Dest::R(q, 0b0011), fc(0, 0b1110));  // columns x (x), y (y)
++  a_.OpIAdd(dxbc::Dest::R(q, 0b0011), dxbc::Src::R(q), dxbc::Src::LI(-1));
++  a_.OpIMax(dxbc::Dest::R(ci, 0b1111), dxbc::Src::R(ci), dxbc::Src::LI(0));
++  a_.OpIMin(dxbc::Dest::R(ci, 0b0011), dxbc::Src::R(ci), dxbc::Src::R(q, dxbc::Src::kXXXX));
++  a_.OpIMin(dxbc::Dest::R(ci, 0b1100), dxbc::Src::R(ci), dxbc::Src::R(q, dxbc::Src::kYYYY));
++  // Slices k0, k1 = min(k0 + 1, 63), the fraction.
++  a_.OpRoundNI(dxbc::Dest::R(q, 0b0100), dxbc::Src::R(f, dxbc::Src::kZZZZ));
++  a_.OpAdd(dxbc::Dest::R(f, 0b0100), dxbc::Src::R(f, dxbc::Src::kZZZZ), -dxbc::Src::R(q, dxbc::Src::kZZZZ));
++  a_.OpFToI(dxbc::Dest::R(ki, 0b0001), dxbc::Src::R(q, dxbc::Src::kZZZZ));
++  a_.OpIAdd(dxbc::Dest::R(ki, 0b0010), dxbc::Src::R(ki, dxbc::Src::kXXXX), dxbc::Src::LI(1));
++  a_.OpIMin(dxbc::Dest::R(ki, 0b0010), dxbc::Src::R(ki, dxbc::Src::kYYYY), dxbc::Src::LI(63));
++  // The eight texels, weighed.
++  a_.OpMov(dxbc::Dest::R(a, 0b1000), dxbc::Src::LI(0));  // mip 0
++  for (uint32_t n = 0; n < 8; ++n) {
++    const uint32_t ox = n & 1, oy = (n >> 1) & 1, oz = n >> 2;
++    a_.OpMov(dxbc::Dest::R(a, 0b0001), dxbc::Src::R(ci, ox ? dxbc::Src::kYYYY : dxbc::Src::kXXXX));
++    a_.OpMov(dxbc::Dest::R(a, 0b0010), dxbc::Src::R(ci, oy ? dxbc::Src::kWWWW : dxbc::Src::kZZZZ));
++    a_.OpMov(dxbc::Dest::R(a, 0b0100), dxbc::Src::R(ki, oz ? dxbc::Src::kYYYY : dxbc::Src::kXXXX));
++    a_.OpLd(dxbc::Dest::R(q), dxbc::Src::R(a), 0b1111, volume);
++    // Weight: (ox ? fx : 1 - fx) (oy ? fy : 1 - fy) (oz ? fz : 1 - fz), in f.w.
++    if (ox) {
++      a_.OpMov(dxbc::Dest::R(f, 0b1000), dxbc::Src::R(f, dxbc::Src::kXXXX));
++    } else {
++      a_.OpAdd(dxbc::Dest::R(f, 0b1000), dxbc::Src::LF(1.0f), -dxbc::Src::R(f, dxbc::Src::kXXXX));
++    }
++    if (oy) {
++      a_.OpMul(dxbc::Dest::R(f, 0b1000), dxbc::Src::R(f, dxbc::Src::kWWWW),
++               dxbc::Src::R(f, dxbc::Src::kYYYY));
++    } else {
++      a_.OpMAd(dxbc::Dest::R(f, 0b1000), -dxbc::Src::R(f, dxbc::Src::kWWWW),
++               dxbc::Src::R(f, dxbc::Src::kYYYY), dxbc::Src::R(f, dxbc::Src::kWWWW));
++    }
++    if (oz) {
++      a_.OpMul(dxbc::Dest::R(f, 0b1000), dxbc::Src::R(f, dxbc::Src::kWWWW),
++               dxbc::Src::R(f, dxbc::Src::kZZZZ));
++    } else {
++      a_.OpMAd(dxbc::Dest::R(f, 0b1000), -dxbc::Src::R(f, dxbc::Src::kWWWW),
++               dxbc::Src::R(f, dxbc::Src::kZZZZ), dxbc::Src::R(f, dxbc::Src::kWWWW));
++    }
++    a_.OpMAd(dxbc::Dest::R(v), dxbc::Src::R(q), dxbc::Src::R(f, dxbc::Src::kWWWW), dxbc::Src::R(v));
++  }
++  // Before the first edge: L x w, Tv = 1 + (Tv - 1) w.
++  a_.OpMul(dxbc::Dest::R(v, 0b0111), dxbc::Src::R(v), dxbc::Src::R(g, dxbc::Src::kWWWW));
++  a_.OpAdd(dxbc::Dest::R(v, 0b1000), dxbc::Src::R(v, dxbc::Src::kWWWW), dxbc::Src::LF(-1.0f));
++  a_.OpMAd(dxbc::Dest::R(v, 0b1000), dxbc::Src::R(v, dxbc::Src::kWWWW),
++           dxbc::Src::R(g, dxbc::Src::kWWWW), dxbc::Src::LF(1.0f));
++  // Beyond the range: A = ours / the game's at the range (its column, the nearest).
++  a_.OpLT(dxbc::Dest::R(q, 0b0001), fc(0, dxbc::Src::kXXXX), dxbc::Src::R(g, dxbc::Src::kYYYY));
++  a_.OpIf(true, dxbc::Src::R(q, dxbc::Src::kXXXX));
++  {
++    a_.OpMul(dxbc::Dest::R(q, 0b0011), pos, dxbc::Src::LF(1.0f / 16.0f));
++    a_.OpFToI(dxbc::Dest::R(a, 0b0011), dxbc::Src::R(q));
++    a_.OpIMax(dxbc::Dest::R(a, 0b0011), dxbc::Src::R(a), dxbc::Src::LI(0));
++    a_.OpFToI(dxbc::Dest::R(q, 0b0011), fc(0, 0b1110));
++    a_.OpIAdd(dxbc::Dest::R(q, 0b0011), dxbc::Src::R(q), dxbc::Src::LI(-1));
++    a_.OpIMin(dxbc::Dest::R(a, 0b0011), dxbc::Src::R(a), dxbc::Src::R(q));
++    a_.OpMov(dxbc::Dest::R(a, 0b1100), dxbc::Src::LI(0));  // array slice 0, mip 0
++    a_.OpLd(dxbc::Dest::R(q, 0b0001), dxbc::Src::R(a), 0b1111, range_tex.Select(0));
++    // Tv' = A tg; L += fog (Tv - Tv'); Tv = Tv'.
++    a_.OpMul(dxbc::Dest::R(q, 0b0010), dxbc::Src::R(q, dxbc::Src::kXXXX),
++             dxbc::Src::R(g, dxbc::Src::kXXXX));
++    a_.OpAdd(dxbc::Dest::R(q, 0b0100), dxbc::Src::R(v, dxbc::Src::kWWWW),
++             -dxbc::Src::R(q, dxbc::Src::kYYYY));
++    a_.OpMAd(dxbc::Dest::R(v, 0b0111), fc(2, dxbc::Src::kXYZW), dxbc::Src::R(q, dxbc::Src::kZZZZ),
++             dxbc::Src::R(v));
++    a_.OpMov(dxbc::Dest::R(v, 0b1000), dxbc::Src::R(q, dxbc::Src::kYYYY));
++  }
++  a_.OpEndIf();
++  // ratio = min(Tv / max(tg, 1e-6), 1 + 2 tg) (q.x), To = tg ratio (q.y).
++  a_.OpMax(dxbc::Dest::R(q, 0b0001), dxbc::Src::R(g, dxbc::Src::kXXXX), dxbc::Src::LF(1e-6f));
++  a_.OpDiv(dxbc::Dest::R(q, 0b0001), dxbc::Src::R(v, dxbc::Src::kWWWW), dxbc::Src::R(q, dxbc::Src::kXXXX));
++  a_.OpMAd(dxbc::Dest::R(q, 0b0010), dxbc::Src::R(g, dxbc::Src::kXXXX), dxbc::Src::LF(2.0f),
++           dxbc::Src::LF(1.0f));
++  a_.OpMin(dxbc::Dest::R(q, 0b0001), dxbc::Src::R(q, dxbc::Src::kXXXX), dxbc::Src::R(q, dxbc::Src::kYYYY));
++  a_.OpMul(dxbc::Dest::R(q, 0b0010), dxbc::Src::R(g, dxbc::Src::kXXXX), dxbc::Src::R(q, dxbc::Src::kXXXX));
++  // L x (1 - To) / max(1 - Tv, 1e-4) where To < Tv (q.z the factor).
++  a_.OpAdd(dxbc::Dest::R(q, 0b0100), dxbc::Src::LF(1.0f), -dxbc::Src::R(v, dxbc::Src::kWWWW));
++  a_.OpMax(dxbc::Dest::R(q, 0b0100), dxbc::Src::R(q, dxbc::Src::kZZZZ), dxbc::Src::LF(1e-4f));
++  a_.OpAdd(dxbc::Dest::R(q, 0b1000), dxbc::Src::LF(1.0f), -dxbc::Src::R(q, dxbc::Src::kYYYY));
++  a_.OpDiv(dxbc::Dest::R(q, 0b0100), dxbc::Src::R(q, dxbc::Src::kWWWW), dxbc::Src::R(q, dxbc::Src::kZZZZ));
++  a_.OpLT(dxbc::Dest::R(q, 0b1000), dxbc::Src::R(q, dxbc::Src::kYYYY), dxbc::Src::R(v, dxbc::Src::kWWWW));
++  a_.OpMovC(dxbc::Dest::R(q, 0b0100), dxbc::Src::R(q, dxbc::Src::kWWWW), dxbc::Src::R(q, dxbc::Src::kZZZZ),
++            dxbc::Src::LF(1.0f));
++  // ... and / c12.y: L' = L x that (v.rgb).
++  a_.OpMul(dxbc::Dest::R(q, 0b0100), dxbc::Src::R(q, dxbc::Src::kZZZZ), fc(2, dxbc::Src::kWWWW));
++  a_.OpMul(dxbc::Dest::R(v, 0b0111), dxbc::Src::R(v), dxbc::Src::R(q, dxbc::Src::kZZZZ));
++  // From here in the mad's components (rgb): the volume's light (v.xyz, red green blue) and the
++  // fog colours (c10) taken at each component's channel (channels), the operands as they are.
++  // F / c10 (1 where c10 is 0): in a; L' x F / c10 in g (tg, z and the edge's weight are done with).
++  const dxbc::Src f_operand = operands[2];
++  const dxbc::Src light = dxbc::Src::R(v, channels);
++  if (form != 2) {
++    a_.OpDiv(dxbc::Dest::R(a, rgb), f_operand, fc(3, channels));
++    a_.OpLT(dxbc::Dest::R(ci, rgb), dxbc::Src::LF(1e-5f), fc(3, channels));
++    a_.OpMovC(dxbc::Dest::R(a, rgb), dxbc::Src::R(ci), dxbc::Src::R(a), dxbc::Src::LF(1.0f));
++    a_.OpMul(dxbc::Dest::R(g, rgb), light, dxbc::Src::R(a));
++  }
++  const dxbc::Dest out(dxbc::Dest::R(system_temp_result_, rgb));
++  if (form == 1) {
++    // C To + L': C = B + F.
++    a_.OpAdd(dxbc::Dest::R(a, rgb), operands[0], f_operand);
++    a_.OpMAd(out, dxbc::Src::R(a), dxbc::Src::R(q, dxbc::Src::kYYYY), dxbc::Src::R(g));
++  } else if (form == 2) {
++    a_.OpMAd(out, operands[0], dxbc::Src::R(q, dxbc::Src::kYYYY), f_operand);
++  } else {
++    a_.OpMov(out, dxbc::Src::R(g));
++  }
++  PopSystemTemp(7);
++}
++
++// Local change (pgr4 project, 21/11/2026): the colour channels the temps hold after this
++// instruction (fog_channel_): each lane's from its first operand that is c10 or c32 (its letter
++// there, x y z), else from its first temp operand whose component there holds one; the vector
++// result's written components take their lane's, the scalar result's are forgotten.
++void DxbcShaderTranslator::UpdateFogChannels(const ParsedAluInstruction& instr) {
++  int lane[4] = {-1, -1, -1, -1};
++  for (uint32_t j = 0; j < 4; ++j) {
++    for (uint32_t pass = 0; pass < 2 && lane[j] < 0; ++pass) {
++      for (uint32_t k = 0; k < instr.vector_operand_count && lane[j] < 0; ++k) {
++        const InstructionOperand& o = instr.vector_operands[k];
++        if (o.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute) continue;
++        const SwizzleSource c = o.GetComponent(j);
++        if (c > SwizzleSource::kW) continue;
++        if (pass == 0) {
++          if (o.storage_source == InstructionStorageSource::kConstantFloat &&
++              (o.storage_index == 10 || o.storage_index == 32) && uint32_t(c) <= 2)
++            lane[j] = int(c);
++        } else if (o.storage_source == InstructionStorageSource::kRegister &&
++                   o.storage_index < 64) {
++          lane[j] = fog_channel_[o.storage_index][uint32_t(c)];
++        }
++      }
++    }
++  }
++  const InstructionResult& v = instr.vector_and_constant_result;
++  if (v.storage_target == InstructionStorageTarget::kRegister &&
++      v.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute && v.storage_index < 64) {
++    const uint32_t mask = v.GetUsedWriteMask();
++    for (uint32_t i = 0; i < 4; ++i) {
++      if (!(mask & (1u << i))) continue;
++      const SwizzleSource rc = v.components[i];
++      fog_channel_[v.storage_index][i] = int8_t(rc <= SwizzleSource::kW ? lane[uint32_t(rc)] : -1);
++    }
++  }
++  const InstructionResult& sr = instr.scalar_result;
++  if (sr.storage_target == InstructionStorageTarget::kRegister && sr.storage_index < 64) {
++    const uint32_t mask = sr.GetUsedWriteMask();
++    for (uint32_t i = 0; i < 4; ++i)
++      if (mask & (1u << i)) fog_channel_[sr.storage_index][i] = -1;
++  }
++}
++
+ void DxbcShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& instr,
+                                                  uint8_t memexport_eM_potentially_written_before) {
+   if (instr.IsNop()) {
+@@ -947,6 +1264,18 @@ void DxbcShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& ins
+   uint32_t vector_result_swizzle = dxbc::Src::kXYZW;
+   ProcessVectorAluOperation(instr, memexport_eM_potentially_written_before, vector_result_swizzle,
+                             predicate_written_vector);
++  // Local change (pgr4 project, 21/11/2026): the game's fog ending (Modification::pixel.fog_form,
++  // fog_address), its result computed again from its operands as kSysFlag_FogMode says, before
++  // it is stored (its sources still hold their values then).
++  if (is_pixel_shader()) {
++    const Modification fog_mod = GetDxbcShaderModification();
++    if (fog_mod.pixel.fog_form && current_alu_address_ == fog_mod.pixel.fog_address &&
++        instr.vector_opcode == AluVectorOpcode::kMad &&
++        instr.vector_and_constant_result.GetUsedResultComponents()) {
++      ProcessFogEnding(instr);
++    }
++    if (fog_mod.pixel.fog_form) UpdateFogChannels(instr);
++  }
+   bool predicate_written_scalar = false;
+   ProcessScalarAluOperation(instr, memexport_eM_potentially_written_before,
+                             predicate_written_scalar);
 diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
 index 31de175..1f732ec 100644
 --- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
@@ -6248,7 +6701,7 @@ index a7d508a..d89e955 100644
    }
  }
 diff --git a/src/graphics/pipeline/shader/translator.cpp b/src/graphics/pipeline/shader/translator.cpp
-index e472251..a4a52e0 100644
+index e472251..c750ca5 100644
 --- a/src/graphics/pipeline/shader/translator.cpp
 +++ b/src/graphics/pipeline/shader/translator.cpp
 @@ -635,22 +635,7 @@ bool ShaderTranslator::TranslateAnalyzedShader(Shader::Translation& translation)
@@ -6303,6 +6756,14 @@ index e472251..a4a52e0 100644
  void ShaderTranslator::EmitTranslationError(const char* message, bool is_fatal) {
    Shader::Error error;
    error.is_fatal = is_fatal;
+@@ -905,6 +911,7 @@ void ShaderTranslator::TranslateExecInstructions(const ParsedExecInstruction& in
+       auto& op = *reinterpret_cast<const AluInstruction*>(op_ptr);
+       ParsedAluInstruction alu_instr;
+       ParseAluInstruction(op, current_shader().type(), alu_instr);
++      current_alu_address_ = instr_offset;  // local change (pgr4 project)
+       ProcessAluInstruction(alu_instr, eM_potentially_written_before);
+       if (alu_instr.vector_and_constant_result.storage_target ==
+               InstructionStorageTarget::kExportData &&
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
 index 76f5600..788c617 100644
 --- a/src/graphics/pipeline/texture/cache.cpp

@@ -77,6 +77,8 @@ REXCVAR_DECLARE(bool, pgr4_native_texture_hd);  // pgr4-native textures.cpp
 using pgr4::native::FLAGS_pgr4_native_texture_hd_storage_;
 REXCVAR_DECLARE(bool, pgr4_native_enhanced_reflections);  // pgr4-native shader_replace.cpp
 REXCVAR_DECLARE(int32_t, pgr4_native_details);  // pgr4-native tunables.cpp
+REXCVAR_DECLARE(bool, pgr4_native_volumetric);  // pgr4-native volumetrics.cpp (off by default)
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_effects);  // volumetrics.cpp: the launcher's choice
 REXCVAR_DECLARE(double, pgr4_native_sharpen_dlss);  // pgr4-native upscaler.cpp
 REXCVAR_DECLARE(double, pgr4_native_sharpen_fsr);
 
@@ -220,6 +222,7 @@ enum Text : uint32_t {
   kAspect1610,
   kAspect219,
   kAspect329,
+  kVolumetricRow,  // GRAPHICS's volumetric effects (pgr4_native_volumetric), off / on
   kTextCount
 };
 // IDS_OVER_A_SYSTEM_LINK_HELP (PGR4UIStrings.loc), the Multiplayer menu's system link line:
@@ -241,7 +244,7 @@ const char16_t* const kTexts[kTextCount] = {
     nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr, nullptr,
     nullptr,  u"X2",    u"X3",    u"X4",    u"X5",    u"X6",    u"MSAA",
     u"DLSS FRAME GENERATION", u"FSR FRAME GENERATION", nullptr, u"60%", u"70%", u"80%", u"90%",
-    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.4 (TAZZ)",
+    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.5 (TAZZ)",
 };
 
 // The others, in each of the game's languages (the loc folders' order), every glyph one the game's
@@ -259,7 +262,7 @@ constexpr Text kLocalized[] = {kTitle,     kUpscaler,     kUpscalerOff, kQuality
                                kLocalXenonHelpPs, kSharpRow, kShotHint,
                                kHdRow, kReflectRow, kDetailsRow, kAoRow, kImageRow, kImageOpen,
                                kRestartTitle, kRestartMessage, kWelcomeTitle, kWelcomeText,
-                               kAspectRow};
+                               kAspectRow, kVolumetricRow};
 constexpr size_t kLocalizedCount = std::size(kLocalized);
 const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
     {  // cz
@@ -315,6 +318,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"VÍTEJTE",
         u"Project Gotham Racing 4 edice 2026 je vylepšená verze hry s novými vizuálními efekty a novými grafickými možnostmi. Tato verze by nevznikla bez práce těchto autorů: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Velké díky jim oběma.",
         u"POMĚR STRAN",
+        u"OBJEMOVÉ EFEKTY",
     },
     {  // de
         u"GRAFIK",
@@ -369,6 +373,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"WILLKOMMEN",
         u"Project Gotham Racing 4 Edition 2026 ist eine verbesserte Version des Spiels mit neuen visuellen Effekten und neuen Grafikoptionen. Diese Version gäbe es nicht ohne die Arbeit von: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Vielen Dank an die beiden.",
         u"BILDFORMAT",
+        u"VOLUMETRISCHE EFFEKTE",
     },
     {  // en
         u"GRAPHICS",
@@ -423,6 +428,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"WELCOME",
         u"Project Gotham Racing 4 Edition 2026 is an enhanced version of the game with new visual effects and new graphics options. This version would not exist without the work of: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Many thanks to them.",
         u"ASPECT RATIO",
+        u"VOLUMETRIC EFFECTS",
     },
     {  // es
         u"GRÁFICOS",
@@ -477,6 +483,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"BIENVENIDO",
         u"Project Gotham Racing 4 Edición 2026 es una versión mejorada del juego con nuevos efectos visuales y nuevas opciones gráficas. Esta versión no existiría sin el trabajo de: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Muchas gracias a ambos.",
         u"FORMATO DE IMAGEN",
+        u"EFECTOS VOLUMÉTRICOS",
     },
     {  // fr
         u"GRAPHISMES",
@@ -531,6 +538,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"BIENVENUE",
         u"Project Gotham Racing 4 édition 2026 est une version améliorée du jeu proposant de nouveaux effets visuels et de nouvelles options graphiques. Cette version n'existerait pas sans le travail effectué par : ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Un grand merci à eux.",
         u"FORMAT D'IMAGE",
+        u"EFFETS VOLUMÉTRIQUES",
     },
     {  // hu
         u"GRAFIKA",
@@ -585,6 +593,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ÜDVÖZÖLJÜK",
         u"A Project Gotham Racing 4 2026-os kiadása a játék továbbfejlesztett változata új vizuális effektekkel és új grafikai beállításokkal. Ez a változat nem jöhetett volna létre a következők munkája nélkül: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Köszönjük nekik.",
         u"KÉPARÁNY",
+        u"VOLUMETRIKUS EFFEKTEK",
     },
     {  // it
         u"GRAFICA",
@@ -639,6 +648,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"BENVENUTO",
         u"Project Gotham Racing 4 Edizione 2026 è una versione migliorata del gioco con nuovi effetti visivi e nuove opzioni grafiche. Questa versione non esisterebbe senza il lavoro di: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Un grande grazie a loro.",
         u"FORMATO IMMAGINE",
+        u"EFFETTI VOLUMETRICI",
     },
     {  // ja
         u"グラフィック",
@@ -693,6 +703,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ようこそ",
         u"Project Gotham Racing 4 エディション 2026 は、新しい視覚効果とグラフィック設定を加えた強化バージョンです。このバージョンは次の方々の作業なしには存在しませんでした。 ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~ありがとうございます。",
         u"画面比率",
+        u"ボリューメトリックエフェクト",
     },
     {  // ko
         u"그래픽",
@@ -747,6 +758,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"환영합니다",
         u"Project Gotham Racing 4 에디션 2026은 새로운 시각 효과와 그래픽 옵션을 더한 향상된 버전입니다. 이 버전은 다음 분들의 작업이 없었다면 존재하지 않았을 것입니다. ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~두 분께 감사드립니다.",
         u"화면비",
+        u"볼류메트릭 효과",
     },
     {  // pl
         u"GRAFIKA",
@@ -801,6 +813,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"WITAJ",
         u"Project Gotham Racing 4 Edycja 2026 to ulepszona wersja gry z nowymi efektami wizualnymi i nowymi opcjami graficznymi. Ta wersja nie powstałaby bez pracy: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Wielkie dzięki dla nich.",
         u"PROPORCJE OBRAZU",
+        u"EFEKTY WOLUMETRYCZNE",
     },
     {  // ru
         u"ГРАФИКА",
@@ -855,6 +868,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ДОБРО ПОЖАЛОВАТЬ",
         u"Project Gotham Racing 4 Издание 2026 — это улучшенная версия игры с новыми визуальными эффектами и новыми настройками графики. Эта версия не появилась бы без работы: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Большое им спасибо.",
         u"ФОРМАТ ЭКРАНА",
+        u"ОБЪЕМНЫЕ ЭФФЕКТЫ",
     },
     {  // sc
         u"图形",
@@ -909,6 +923,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"欢迎",
         u"Project Gotham Racing 4 2026 版是游戏的增强版本,加入了新的视觉效果和新的图形选项。没有以下人员的工作,就没有这个版本: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~非常感谢他们。",
         u"屏幕比例",
+        u"体积效果",
     },
     {  // tc
         u"視訊",
@@ -963,6 +978,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"歡迎",
         u"Project Gotham Racing 4 2026 版是遊戲的增強版本,加入了新的視覺效果和新的圖形選項。沒有以下人員的工作,就沒有這個版本: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~非常感謝他們。",
         u"畫面比例",
+        u"體積效果",
     },
 };
 
@@ -1205,6 +1221,7 @@ struct Values {
   int hd = 1;      // HD textures off / on (pgr4_native_texture_hd)
   int reflect = 0;  // enhanced effects off / on (pgr4_native_enhanced_reflections)
   int details = 0;  // enhanced details: original, high, ultra (pgr4_native_details)
+  int volumetric = 0;  // volumetric effects off / on (pgr4_native_volumetric)
   int aspect = 0;  // index in kAspects (pgr4_render_height): auto, 16:9, 16:10, 21:9, 32:9
 };
 
@@ -1249,6 +1266,7 @@ Values CurrentValues() {
   v.hd = REXCVAR_GET(pgr4_native_texture_hd) ? 1 : 0;
   v.reflect = REXCVAR_GET(pgr4_native_enhanced_reflections) ? 1 : 0;
   v.details = std::clamp(REXCVAR_GET(pgr4_native_details), 0, 2);
+  v.volumetric = REXCVAR_GET(pgr4_native_volumetric) ? 1 : 0;
   v.sharp[1] = std::clamp(int(std::lround(REXCVAR_GET(pgr4_native_sharpen_dlss) * 20)), 0, 20);
   v.sharp[2] = std::clamp(int(std::lround(REXCVAR_GET(pgr4_native_sharpen_fsr) * 20)), 0, 20);
   const std::vector<ScreenMode> modes = ScreenModes();
@@ -1321,6 +1339,11 @@ std::vector<Row> RowsFor(Page page, const Values& v) {
     rows.push_back({"hd", kHdRow, {kOff, kOn}, v.hd});
     rows.push_back({"reflect", kReflectRow, {kOff, kOn}, v.reflect});
     rows.push_back({"details", kDetailsRow, {kDetailOriginal, kDetailHigh, kDetailUltra}, v.details});
+    // Local change (21/11/2026, Tazz): the volumetric fog and lights, the overlay's checkbox
+    // (pgr4_native_volumetric, read at each frame), off by default.
+    // Local change (22/11/2026): only with the launcher's VOLUMETRIC EFFECTS on.
+    if (REXCVAR_GET(pgr4_native_volumetric_effects))
+      rows.push_back({"volumetric", kVolumetricRow, {kOff, kOn}, v.volumetric});
     // GTAO (in races, the garage, replays and the photo mode): hidden on 03/11/2026 (1.3 ms a frame at
     // scale 3 for little to see), back on 14/11/2026 at Tazz's request; off by default (pgr4_native_gtao).
     // One choice for both of the renderer's occlusions (16/11/2026): ours with MSAA, Intel's
@@ -1404,6 +1427,7 @@ Values DecodePage(const std::string& digits) {
     else if (name == "hd") v.hd = d;
     else if (name == "reflect") v.reflect = d;
     else if (name == "details") v.details = d;
+    else if (name == "volumetric") v.volumetric = d;
     else if (name == "sharp") v.sharp[ShownKind(v)] = d;
     else if (name == "blur") v.blur = d;
     else if (name == "fps") v.fps = d;
@@ -1766,6 +1790,7 @@ std::string PageChanges(const Values& opened, const Values& want) {
   note("hd", opened.hd, want.hd);
   note("reflections", opened.reflect, want.reflect);
   note("details", opened.details, want.details);
+  note("volumetric", opened.volumetric, want.volumetric);
   note("blur", opened.blur, want.blur);
   return out;
 }
@@ -1825,6 +1850,8 @@ void ApplyPage(const Values& want, const Values& opened, bool restart = false) {
     REXCVAR_SET(pgr4_native_enhanced_reflections, want.reflect != 0);
   if (want.details != opened.details)
     REXCVAR_SET(pgr4_native_details, std::clamp(want.details, 0, 2));
+  if (want.volumetric != opened.volumetric)
+    REXCVAR_SET(pgr4_native_volumetric, want.volumetric != 0);
   // Read where the game's motion blur is set up (src/pgr4_hooks.cpp).
   if (want.blur != opened.blur) REXCVAR_SET(pgr4_disable_motion_blur, want.blur == 0);
   // Read at each upscale: each upscaler's own sharpening.
@@ -2320,6 +2347,11 @@ void Pgr4BringWindowToFront() {
   SetActiveWindow(hwnd);
 }
 
+REXCVAR_DEFINE_BOOL(pgr4_menu_pages_keep_screen, true, "PGR4",
+                    "Our options pages' screens (Intro\\P?_) leave the race screen as it was (off: "
+                    "classed as menu screens, the race's effects off after a setting changed from "
+                    "the pause)");
+
 // sub_82883CC0(ui, name): finds the UIScript file `name` (its index at ui+27540).
 REX_HOOK_RAW(sub_82883CC0) {
   const std::string name(reinterpret_cast<const char*>(base + ctx.r4.u32));
@@ -2337,10 +2369,21 @@ REX_HOOK_RAW(sub_82883CC0) {
     std::filesystem::remove(std::filesystem::path(dir) / file, ec);  // read again from the start
   }
   const std::string previous = std::exchange(g_last_screen, name);
+  // Our options pages' own screens (Intro\PG_, PA_, PK_, PR_, PX_, PN_, PD_: the values carried in
+  // the name, below) show over the screen that opened them, the pause menu or the main menu: they
+  // leave the race screen as it was (pgr4_menu_pages_keep_screen; 21/11/2026, a setting changed
+  // from the pause classed the race as left, GTAO and the volumetric fog off until the next pause).
+  const bool our_page = [&] {
+    for (const char* p : {"Intro\\PG_", "Intro\\PA_", "Intro\\PK_", "Intro\\PR_", "Intro\\PX_",
+                          "Intro\\PN_", "Intro\\PD_"})
+      if (name.find(p) != std::string::npos && EndsWith(name, ".lua")) return true;
+    return false;
+  }();
+  const bool race_before = g_gtao_screen;
   // A race's screens are Screens\Ingame\... (3-2-1-Go, HUD, pause and its pages). Only screens
   // in a folder of Screens\ count: helpers (Screens\GUIBank.lua), popups and shared pieces show
   // over either.
-  {
+  if (!(our_page && REXCVAR_GET(pgr4_menu_pages_keep_screen))) {
     std::string lower(name);
     for (char& c : lower) c = char(std::tolower(static_cast<unsigned char>(c)));
     constexpr std::string_view kScreens = "screens\\";
@@ -2359,6 +2402,14 @@ REX_HOOK_RAW(sub_82883CC0) {
       }
     }
   }
+  // Every change of the race screen logged (the script names above stop after 40), and our pages
+  // seen keeping it.
+  if (race_before != g_gtao_screen || our_page)
+    REXLOG_INFO("PGR4 menu: race screen {} -> {} at {}{}", race_before ? "on" : "off",
+                g_gtao_screen ? "on" : "off", name,
+                our_page ? (REXCVAR_GET(pgr4_menu_pages_keep_screen) ? " (our options page: kept)"
+                                                                     : " (our options page: classed, switch off)")
+                         : "");
   g_pause_sizing = EndsWith(name, "Ingame\\PauseMenu.lua");
   if (EndsWith(name, "Ingame\\IngameOptions.lua") && g_pause_target != kPauseNone) {
     const Page page = g_pause_target == kPauseDisplay ? kDisplayPage : kGraphicsPage;

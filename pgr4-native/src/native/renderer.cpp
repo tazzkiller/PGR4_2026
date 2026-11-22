@@ -1,5 +1,6 @@
 // pgr4-native PGR4 native renderer: NativeRenderer host.
 #include "renderer.h"
+#include "hang_probe.h"  // local change: the freeze probe
 
 #include "async_file.h"
 #include "clock.h"
@@ -20,6 +21,7 @@
 #include "render_targets.h"
 #include "resolve.h"
 #include "scene_effects.h"
+#include "volumetrics.h"
 #include "textures.h"
 #include "upscaler.h"
 #include "streamline.h"
@@ -80,6 +82,16 @@ REXCVAR_DEFINE_BOOL(pgr4_native_resolve_readback, true, "PGR4 native",
                     "Write k_5_6_5 / k_6_5_5 resolves back into guest memory (the GPU waited "
                     "for at the resolve): the team logo on the suit and the liveries, which the "
                     "game composes on the GPU and compresses on the CPU");
+// Local change (pgr4 project, 20/11/2026, issue #21: a custom paint's flag and number corrupted
+// after 3 or 4 races, the AI cars' too). WantsReadBack wrote back the first two resolves into an
+// address for the whole game: a livery the game composes again at the same address for a later
+// race was no longer written back, and the CPU compressed what was left in guest memory.
+// pgr4_native_resolve_readback_each_time counts the two per composition: an address not resolved
+// for a second (a load in between) starts over. Resolves repeated at every frame (reflections)
+// still stop after their second. Read at each resolve.
+REXCVAR_DEFINE_BOOL(pgr4_native_resolve_readback_each_time, true, "PGR4 native",
+                    "Write back the first two resolves of each composition (an address not "
+                    "resolved for 1 s starts over), not only the first two of the game");
 REXCVAR_DEFINE_INT32(pgr4_render_height, 0, "PGR4",
                      "The render height the patch gives every hooked 720 (720 disables it, 0: from the "
                      "screen's shape, 21:9 about 540)")
@@ -166,6 +178,17 @@ REXCVAR_DEFINE_INT32(
     "registers against the game thread's, and the shared memory each draw reads "
     "against guest memory as it was when the draw was queued (0: off)");
 REXCVAR_DECLARE(std::string, pgr4_native_capture_dir);
+// Local change (22/11/2026): DLSS and FSR kept once made (the upscaler's recreate).
+REXCVAR_DEFINE_BOOL(pgr4_native_upscaler_keep_other, true, "PGR4 native",
+                    "DLSS and FSR kept once made: a switch between them takes the other back, no "
+                    "wait for the GPU nor a new context (off: made again at each switch)");
+REXCVAR_DECLARE(std::string, pgr4_native_dlss_mode);
+REXCVAR_DECLARE(std::string, pgr4_native_fsr_mode);
+REXCVAR_DECLARE(int32_t, pgr4_native_upscaler_width);
+REXCVAR_DECLARE(int32_t, pgr4_native_upscaler_height);
+REXCVAR_DECLARE(int32_t, pgr4_native_upscaler_target_fps);
+REXCVAR_DECLARE(int32_t, pgr4_native_upscaler_min_height);
+REXCVAR_DECLARE(bool, pgr4_native_volumetric_effects);  // volumetrics.cpp (local change, 22/11/2026)
 // The last screen the game loaded was a race's (games/pgr4/src/pgr4_menu.cpp).
 bool Pgr4InGameScreen();
 // The photo mode's camera ran in the last frames (src/pgr4_hooks.cpp).
@@ -356,7 +379,7 @@ struct NativeRenderer::Queue {
   // hand-over can wake the render thread (a syscall), so batches are large.
   static constexpr size_t kBatchCommands = 256;
 
-  enum Kind : uint8_t { kDraw, kClear, kResolve, kSwap, kQuery };
+  enum Kind : uint8_t { kDraw, kClear, kResolve, kSwap, kQuery, kWorldMarker };
   struct Cmd {
     Kind kind;
     uint32_t index;    // into the batch's vector of that kind
@@ -456,6 +479,7 @@ struct NativeRenderer::Queue {
     std::unique_lock<std::mutex> lock(mutex);
     if (frames_done >= frames) return 0;
     const uint64_t t0 = NowNs();
+    HangMark hang_mark(HangWhat::kGuestWaitFrames, frames);  // local change: the freeze probe
     done_cv.wait(lock, [&] { return frames_done >= frames; });
     return NowNs() - t0;
   }
@@ -578,6 +602,15 @@ bool NativeRenderer::Initialize() {
     if (rex::cvar::GetFlagByName("bind_overlay").empty() &&
         rex::cvar::GetFlagByName("bind_original_look").empty())
       rex::cvar::SetFlagByName("bind_original_look", "F2");
+    // Local change (22/11/2026, settings version 6, src/pgr4_profile.cpp): the keys the game kept.
+    REXLOG_INFO("PGR4 native: keys: bind_overlay '{}', bind_original_look '{}', bind_screenshot '{}', "
+                "bind_settings '{}', bind_debug_overlay '{}', bind_achievements '{}', "
+                "pgr4_free_camera {}",
+                rex::cvar::GetFlagByName("bind_overlay"), rex::cvar::GetFlagByName("bind_original_look"),
+                rex::cvar::GetFlagByName("bind_screenshot"), rex::cvar::GetFlagByName("bind_settings"),
+                rex::cvar::GetFlagByName("bind_debug_overlay"),
+                rex::cvar::GetFlagByName("bind_achievements"),
+                rex::cvar::GetFlagByName("pgr4_free_camera"));
     overlay_bound_ = true;
   }
   paced_ = paced;
@@ -701,6 +734,18 @@ bool NativeRenderer::CreatePipeline() {
     REXLOG_ERROR("PGR4 native: scene effects (GTAO) unavailable");
     scene_effects_.reset();
   }
+  // Local change (20/11/2026): the volumetric light (volumetrics.h). Local change (22/11/2026):
+  // only with the launcher's VOLUMETRIC EFFECTS on (pgr4_native_volumetric_effects); off, none made.
+  if (REXCVAR_GET(pgr4_native_volumetric_effects)) volumetrics_ = std::make_unique<Volumetrics>();
+  if (!volumetrics_) {
+    REXLOG_INFO("PGR4 native: volumetric effects off (the launcher's choice)");
+  } else if (volumetrics_->Initialize(device_->device())) {
+    volumetrics_->set_camera(&camera_, camera_clip_);
+    resolver_->set_volumetrics(volumetrics_.get());
+  } else {
+    REXLOG_ERROR("PGR4 native: volumetric light unavailable");
+    volumetrics_.reset();
+  }
   if (FrameGeneration::Requested() && !paced_)
     REXLOG_ERROR("PGR4 native: frame generation needs the frame pacer (--pgr4_native_primary)");
   ApplyFsrFrameGeneration();
@@ -738,6 +783,7 @@ bool NativeRenderer::RebuildPipeline() {
   device_->WaitIdle();
   const bool on = upscaler_on_;
   upscaler_.reset();
+  parked_upscaler_.reset();  // local change: the one kept goes too (another scale)
   upscaler_on_ = false;
   hudless_capture_.reset();
   frame_generation_.reset();
@@ -773,6 +819,7 @@ void NativeRenderer::ApplyFsrFrameGeneration() {
     frame_generation_.reset();
   }
   if (upscaler_) upscaler_->set_frame_generation(frame_generation_.get());
+  if (parked_upscaler_) parked_upscaler_->set_frame_generation(frame_generation_.get());
 }
 
 // Local change (pgr4 project): --pgr4_native_msaa changed (overlay.h): the scene's sample count
@@ -833,10 +880,30 @@ ID3D12GraphicsCommandList* NativeRenderer::recording_list() const {
 }
 uint64_t NativeRenderer::frame_fence() const { return device_->frame_fence(); }
 
+// Local change (22/11/2026): the settings an upscaler is made with (Upscaler::Initialize): its own
+// quality mode, the render size settings, the output's size; a kept one is taken back only with
+// the same.
+std::string UpscalerSettingsKey(bool dlss) {
+  return fmt::format("{}|{}|{}x{}|{}|{}|{}x{}", dlss ? 1 : 0,
+                     dlss ? REXCVAR_GET(pgr4_native_dlss_mode) : REXCVAR_GET(pgr4_native_fsr_mode),
+                     REXCVAR_GET(pgr4_native_upscaler_width), REXCVAR_GET(pgr4_native_upscaler_height),
+                     REXCVAR_GET(pgr4_native_upscaler_target_fps),
+                     REXCVAR_GET(pgr4_native_upscaler_min_height), Upscaler::OutputWidth(),
+                     Upscaler::OutputHeight());
+}
+
 void NativeRenderer::SwitchUpscaler(bool on) {
   if (on && !upscaler_) {
+    const uint64_t video_before = textures_ ? textures_->video_usage_now() : 0;
     upscaler_ = std::make_unique<Upscaler>();
-    if (!upscaler_->Initialize(device_->device())) {
+    const bool made = upscaler_->Initialize(device_->device());
+    // Local change (22/11/2026): its video memory, the adapter's use before and after (approximate).
+    if (const uint64_t video_after = textures_ ? textures_->video_usage_now() : 0;
+        made && video_before && video_after)
+      REXLOG_INFO("PGR4 native upscaler: {} made, video memory {:+.0f} MB",
+                  upscaler_->dlss() ? "DLSS" : "FSR",
+                  (double(video_after) - double(video_before)) / (1024.0 * 1024.0));
+    if (!made) {
       REXLOG_ERROR("PGR4 native: upscaler unavailable; the scene keeps its MSAA");
       upscaler_.reset();
       return;
@@ -917,11 +984,37 @@ void NativeRenderer::BeginFrameModules() {
   if (fsr_fg_requested_.exchange(false, std::memory_order_relaxed)) ApplyFsrFrameGeneration();
   if (upscaler_recreate_requested_.exchange(false, std::memory_order_relaxed) && upscaler_) {
     const bool on = upscaler_on_;
-    device_->WaitIdle();
-    if (on) SwitchUpscaler(false);
-    resolver_->set_upscaler(nullptr);
-    upscaler_.reset();
-    if (on) SwitchUpscaler(true);
+    // Local change (22/11/2026, pgr4_native_upscaler_keep_other): the upscaler wanted (DLSS when
+    // asked and Streamline is up, as Upscaler::Initialize), the one kept taken back when it is that
+    // one with the same settings: no wait, nothing made; the one left kept in turn.
+    const bool keep = REXCVAR_GET(pgr4_native_upscaler_keep_other);
+    const bool want_dlss = streamline::DlssRequested() && streamline::Active();
+    const std::string current_key = UpscalerSettingsKey(upscaler_->dlss());
+    if (keep && upscaler_->dlss() != want_dlss && parked_upscaler_ &&
+        parked_upscaler_->dlss() == want_dlss && parked_key_ == UpscalerSettingsKey(want_dlss)) {
+      if (on) SwitchUpscaler(false);
+      resolver_->set_upscaler(nullptr);
+      std::swap(upscaler_, parked_upscaler_);
+      parked_key_ = current_key;
+      upscaler_->set_frame_generation(frame_generation_.get());
+      upscaler_->set_camera(&camera_);
+      REXLOG_INFO("PGR4 native upscaler: {} taken back (kept since its last use), {} kept",
+                  want_dlss ? "DLSS" : "FSR", want_dlss ? "FSR" : "DLSS");
+      if (on) SwitchUpscaler(true);
+    } else {
+      device_->WaitIdle();
+      if (on) SwitchUpscaler(false);
+      resolver_->set_upscaler(nullptr);
+      // The one kept, if it is the one now wanted but made with other settings: made again.
+      if (parked_upscaler_ && parked_upscaler_->dlss() == want_dlss) parked_upscaler_.reset();
+      if (keep && upscaler_->dlss() != want_dlss) {
+        parked_upscaler_ = std::move(upscaler_);
+        parked_key_ = current_key;
+      } else {
+        upscaler_.reset();
+      }
+      if (on) SwitchUpscaler(true);
+    }
   }
   if (upscaler_debug_requested_.exchange(false, std::memory_order_relaxed) && upscaler()) {
     // The context made again: its old resources may be in the lists still running.
@@ -948,6 +1041,7 @@ void NativeRenderer::RenderThreadMain() {
     std::unique_ptr<Queue::Batch> b;
     {
       std::unique_lock<std::mutex> lock(q.mutex);
+      HangMark hang_mark(HangWhat::kRenderWaitWork);  // local change: the freeze probe
       q.work_cv.wait(lock, [&] { return !q.pending.empty(); });
       b = std::move(q.pending.front());
       q.pending.pop_front();
@@ -1000,6 +1094,9 @@ void NativeRenderer::RenderThreadMain() {
           break;
         case Queue::kQuery:
           ExecuteQuery(b->queries[c.index]);
+          break;
+        case Queue::kWorldMarker:
+          WorldMarker(c.index);
           break;
         case Queue::kSwap: {
           const Queue::SwapCmd& s = b->swaps[c.index];
@@ -1103,6 +1200,7 @@ void NativeRenderer::QueueResolve(const uint8_t* base, const HookArgs& args) {
       const uint64_t ticket = ++q.readbacks_queued;
       q.Publish();
       std::unique_lock<std::mutex> lock(q.mutex);
+      HangMark hang_mark(HangWhat::kGuestReadback, ticket);  // local change: the freeze probe
       q.done_cv.wait(lock, [&] { return q.readbacks_done >= ticket; });
     }
   } else {
@@ -1112,8 +1210,9 @@ void NativeRenderer::QueueResolve(const uint8_t* base, const HookArgs& args) {
 }
 
 // Small color resolves into k_5_6_5, k_6_5_5 or k_8_8_8_8 (the team logo, liveries), the first
-// two times into each address: those the game composes once and then reads on the CPU. Resolves
-// it repeats every frame (reflections) stop being read back after their second.
+// two times into each address (each composition, pgr4_native_resolve_readback_each_time): those
+// the game composes and then reads on the CPU. Resolves it repeats every frame (reflections) stop
+// being read back after their second.
 bool NativeRenderer::WantsReadBack(const ResolveParams& p) {
   using rex::graphics::xenos::TextureFormat;
   if (!REXCVAR_GET(pgr4_native_resolve_readback) || p.source == 4 || p.dest_width > 512 ||
@@ -1123,8 +1222,23 @@ bool NativeRenderer::WantsReadBack(const ResolveParams& p) {
       p.dest_format != uint32_t(TextureFormat::k_6_5_5) &&
       p.dest_format != uint32_t(TextureFormat::k_8_8_8_8))
     return false;
-  static std::unordered_map<uint32_t, uint32_t> counts;  // guest thread
-  return ++counts[p.dest_base] <= 2;
+  struct Seen {
+    uint32_t count = 0;
+    uint64_t last_ns = 0;
+  };
+  static std::unordered_map<uint32_t, Seen> seen;  // guest thread
+  Seen& s = seen[p.dest_base];
+  const uint64_t now = NowNs();
+  if (REXCVAR_GET(pgr4_native_resolve_readback_each_time) && s.count &&
+      now - s.last_ns > 1'000'000'000ull)
+    s.count = 0;  // a new composition into this address
+  s.last_ns = now;
+  const bool wanted = ++s.count <= 2;
+  // Each one waits for the GPU at the resolve: logged, to see when they happen (loads, not races).
+  if (wanted)
+    REXLOG_INFO("PGR4 native readback: {:08X} {}x{} format {}, time {} in this composition",
+                p.dest_base, p.dest_width, p.dest_height, p.dest_format, s.count);
+  return wanted;
 }
 
 void NativeRenderer::ReadBackResolve(const ResolveParams& p) {
@@ -1285,6 +1399,14 @@ void NativeRenderer::OnSwap(uint8_t* base, const HookArgs& args) {
   if (swap.hand_over || g_failed) HandOver(base, args.device);
 }
 
+// The game's transparent world starts (1) or ends (2): the marker in the draws' order (draw.cpp,
+// WorldMarker), queued as they are.
+void NativeRenderer::OnWorldMarker(uint32_t id) {
+  if (g_failed) return;
+  if (!queue_) return WorldMarker(id);
+  queue_->Push(Queue::kWorldMarker, id);
+}
+
 void NativeRenderer::OnQueryIssue(const uint8_t* base, const HookArgs& args) {
   // D3DQUERYTYPE_OCCLUSION at query+4, and D3DISSUE_END / D3DISSUE_BEGIN; QueryIssue takes BEGIN
   // when both are set.
@@ -1360,7 +1482,8 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
     }
     gpu_timer_->Pass(device_->recording_list(), key);
   }
-  if (camera_scan_ && (upscaler_ || frame_generation_ || SceneEffects::Enabled()))
+  if (camera_scan_ &&
+      (upscaler_ || frame_generation_ || SceneEffects::Enabled() || Volumetrics::Enabled()))
     FindCamera(state);
   if (REXCVAR_GET(pgr4_native_camera_diag)) DiagCamera(state);
   if (frame_generation_ &&
@@ -1479,6 +1602,7 @@ void NativeRenderer::FindCamera(const DrawState& state) {
     for (uint32_t i = 0; i < 16; ++i) m[i] = std::bit_cast<float>(c[4 * v + i]);
     if (!CameraFromClipRows(m, camera_)) continue;
     camera_scan_ = 0;
+    std::memcpy(camera_clip_, m, sizeof(camera_clip_));  // local change: the volumetric light's
     // Local change: the whole transform for DLSS's camera matrices (upscaler.h).
     if (Upscaler* u = upscaler()) u->SetViewProjection(m, frame_index_);
     if (!camera_logged_) {
@@ -1748,7 +1872,7 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   FrameGeneration* const fg = frame_generation_.get();
   const bool generate = shown && fg && fg->prepared(frame_index_);
   // FindCamera's budget in the next frame's draws (also for the scene's effects: local change).
-  camera_scan_ = (upscaler_ || fg || SceneEffects::Enabled()) ? 8 : 0;
+  camera_scan_ = (upscaler_ || fg || SceneEffects::Enabled() || Volumetrics::Enabled()) ? 8 : 0;
   SwapCopy hudless;
   if (generate) {
     d.SetFrameImage(fg->image(), fg->image_rtv());
@@ -1938,6 +2062,20 @@ void NativeRenderer::AppendCsvColumns(const FrameStats& s, uint64_t frame_ns, bo
       Uint("hash_copies", ds.hash_copies),
       Uint("pso_pending", ds.pso_pending),
       Uint("pso_wait_us", ds.pso_wait_us),
+      Uint("pso_live_compiled", ds.pso_live_compiled),
+      Uint("pso_live_fog", ds.pso_live_fog),
+      Uint("pso_live_loaded", ds.pso_live_loaded),
+      Uint("pso_compile_max_us", ds.pso_compile_max_us),
+      Uint("lib_save_us", ds.lib_save_us),
+      Uint("lib_saving", ds.lib_saving),
+      Uint("vol_read_us", ds.vol_us[0]),
+      Uint("vol_early_us", ds.vol_us[1]),
+      Uint("vol_resolve_us", ds.vol_us[2]),
+      Uint("vol_camera_us", ds.vol_us[3]),
+      Uint("vol_probe_us", ds.vol_us[4]),
+      Uint("vol_consts_us", ds.vol_us[5]),
+      Uint("vol_flares_us", ds.vol_us[6]),
+      Uint("vol_endings_us", ds.vol_us[7]),
       Uint("held", s.frames_held),
       Uint("tex_stale", ds.textures_stale),
       Uint("coh_stale", ds.stale_pages),

@@ -1,6 +1,7 @@
 // pgr4-native PGR4 native renderer: D3D12 device, frame command lists, swapchain and the debug
 // window.
 #include "d3d12_device.h"
+#include "hang_probe.h"  // local change: the freeze probe
 
 #include "clock.h"
 #include "gpu_timer.h"
@@ -32,7 +33,9 @@ REXCVAR_DEFINE_BOOL(pgr4_native_dred, false, "PGR4 native",
 // more than first measured (06/11/2026, x3 DLAA: 80 frames a second fell to about 60).
 // On by default (Tazz, 07/11/2026): off, it was worse on a friend's PC. Without it the wrong sky can come back
 // while the GPU is saturated.
-REXCVAR_DEFINE_BOOL(pgr4_native_gpu_serialize_fg, true, "PGR4 native",
+// Local change (22/11/2026, Tazz: "normalement ça doit être false maintenant par défaut"): off by
+// default, as decided on 16/11 (branch perf-cpu, never carried over); settings version 7.
+REXCVAR_DEFINE_BOOL(pgr4_native_gpu_serialize_fg, false, "PGR4 native",
                     "Wait for the GPU at the end of every frame while DLSS frame generation is on "
                     "(against a wrong sky on the cars' reflections when the GPU is saturated)");
 // Local addition (18/11/2026, Tazz): the draws' D3D12 calls replayed on a thread of their own
@@ -575,6 +578,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::back_buffer_rtv() const {
 void D3D12Device::WaitFence(uint64_t value) {
   if (fence_->GetCompletedValue() >= value) return;
   fence_->SetEventOnCompletion(value, fence_event_.get());
+  HangMark hang_mark(HangWhat::kGpuFence, value);  // local change: the freeze probe
   WaitForSingleObject(fence_event_.get(), INFINITE);
 }
 
@@ -588,6 +592,7 @@ void D3D12Device::WaitIdle() {
   const uint64_t v = ++idle_fence_value_;
   if (FAILED(queue_->Signal(idle_fence_.Get(), v)) || idle_fence_->GetCompletedValue() >= v) return;
   idle_fence_->SetEventOnCompletion(v, idle_event_.get());
+  HangMark hang_mark(HangWhat::kGpuIdle, v);  // local change: the freeze probe
   WaitForSingleObject(idle_event_.get(), INFINITE);
 }
 

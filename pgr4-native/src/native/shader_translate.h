@@ -63,7 +63,16 @@ struct SystemConstantsWithSun {
   // Local change (18/11/2026): the water's draws only (zero otherwise), with pgr4_native_water_live: the
   // race's weather's water tuning and the waves' clock (water_hooks.hlsli pgr4_water, draw.cpp).
   float water[24];
+  // Local change (21/11/2026): the volumetric fog's volume for the replacement shaders of the
+  // transparent draws after it (UsesFogVolume), zero for the others and while it is not made:
+  // Volumetrics::Share::values (fog_volume_hooks.hlsli's pgr4_fog_volume), its view at bindless
+  // index 8 (draw.cpp kFogVolume).
+  float fog_volume[16];
 };
+// Local change (21/11/2026): which pixel shaders' replacements read pgr4_fog_volume (their prelude
+// declares it, after pgr4_water): those whose file includes fog_volume_hooks.hlsli
+// (ShaderReplacer::UsesFogVolume), the spectators' flags drawn after the fog with a fog of their
+// own, made by work/make_fog_volume_shaders.py; a new one is taken with the files' hot reload.
 static_assert(sizeof(rex::graphics::DxbcShaderTranslator::SystemConstants) % 16 == 0);
 
 using rex::graphics::DxbcShader;

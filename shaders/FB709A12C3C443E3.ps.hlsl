@@ -393,7 +393,7 @@ float4 Shade(XeInput i) {
   { float4 t164 = (XeMul((-r2.zzzz), c11.yyyy) + r2.xxxx); r0.x = t164.x; }
   { float t165 = XeMul1(c255.y, r0.x); r0.x = t165; ps = t165; }
   { float4 t166 = (r1.xxyz + (-c10.xxyz)); float t167 = exp2(r0.x); r0.y = t166.y; r0.z = t166.z; r0.w = t166.w; r0.x = t167; ps = t167; }
-  { float4 t168 = (XeMul(r0.yzww, r0.xxxx) + c10.xyzz); r0.x = t168.x; r0.y = t168.y; r0.z = t168.z; }
+  { float4 t168 = XeFog(r0.yzww, r0.xxxx, c10.xyzz, 1); r0.x = t168.x; r0.y = t168.y; r0.z = t168.z; }
   { float4 t169 = XeMul(r0.xyzz, c12.yyyy); r3.x = t169.x; r3.y = t169.y; r3.z = t169.z; }
   { float4 t170 = max(r3.xyzw, r3.xyzw); xe_out.x = t170.x; xe_out.y = t170.y; xe_out.z = t170.z; xe_out.w = t170.w; }
   return XeFinish(xe_out);

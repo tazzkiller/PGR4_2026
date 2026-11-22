@@ -17,6 +17,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <cwctype>
@@ -49,12 +50,25 @@ REXCVAR_DECLARE(std::string, pgr4_native_dlss_mode);  // pgr4-native upscaler.cp
 REXCVAR_DECLARE(std::string, pgr4_native_fsr_mode);
 REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_mvec_x);  // pgr4-native upscaler.cpp
 REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_mvec_y);
+REXCVAR_DECLARE(double, pgr4_native_tune_flare);       // pgr4-native shader_replace.cpp
+REXCVAR_DECLARE(double, pgr4_native_tune_flare_halo);
+REXCVAR_DECLARE(std::string, pgr4_native_tune_water_light_rain);
+REXCVAR_DECLARE(std::string, pgr4_native_xegtao_fog);   // pgr4-native scene_effects.cpp
+REXCVAR_DECLARE(double, pgr4_native_xegtao_intensity);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_strength);  // pgr4-native volumetrics.cpp
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_cone);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_light_cone_around);
 // Local change (16/11/2026): the version of the settings in pgr4.toml, for Pgr4MigrateSettings.
 // A change of default reaches a pgr4.toml an earlier version wrote once, then the version is
 // raised: a value the player sets afterwards, the old default included, stays.
 REXCVAR_DEFINE_INT32(pgr4_settings_version, 0, "PGR4",
                      "The version of the settings in pgr4.toml (0: written before V1.4); the game "
                      "brings an older one up to date once");
+// Local change (22/11/2026, Tazz: a friend's very old pgr4.toml kept the settings overlay on F2 and no
+// free camera on F5): settings version 6, the release's keys a pgr4.toml lacks added to it.
+REXCVAR_DEFINE_BOOL(pgr4_migrate_release_keys, true, "PGR4",
+                    "Settings version 6: a release's pgr4.toml without its keys lines (the free "
+                    "camera, the development keys left empty) gets them (off: nothing added)");
 REXCVAR_DEFINE_STRING(pgr4_profile2_name, "", "PGR4",
                       "The second player's gamertag (split screen); empty: player 1's with \" 2\" "
                       "(made at the first launch)");
@@ -373,11 +387,74 @@ static void MigrateToVersion1() {
   }
 }
 
+// Version 6: the release's keys lines a pgr4.toml lacks, added to it and applied now (also to the
+// keys registered later, the renderer's: the SDK keeps a config value for a key not yet registered
+// and gives it at its registration).
+static void MigrateToVersion6() {
+  wchar_t exe[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  const std::filesystem::path dir = std::filesystem::path(exe).parent_path();
+#ifdef PGR4_BUILD_DIR
+  if (std::error_code ec; std::filesystem::equivalent(dir, PGR4_BUILD_DIR, ec)) {
+    REXLOG_INFO("PGR4 settings: version 6 (the release's keys) skipped (the development build)");
+    return;
+  }
+#endif
+  if (!REXCVAR_GET(pgr4_migrate_release_keys)) {
+    REXLOG_INFO("PGR4 settings: version 6 (the release's keys) off (pgr4_migrate_release_keys)");
+    return;
+  }
+  static const std::pair<const char*, const char*> kKeys[] = {
+      {"pgr4_free_camera", "true"},     {"bind_screenshot", "\"\""},
+      {"bind_overlay", "\"\""},         {"bind_renderer_switch", "\"\""},
+      {"bind_achievements", "\"\""},    {"bind_upscaler", "\"\""},
+      {"bind_upscaler_debug", "\"\""},  {"bind_debug_overlay", "\"\""},
+      {"bind_settings", "\"\""}};
+  std::vector<std::string> added;
+  for (const auto& [key, value] : kKeys)
+    if (!HasSetting(key)) added.push_back(std::string(key) + " = " + value);
+  if (added.empty()) {
+    REXLOG_INFO("PGR4 settings: version 6, the release's keys already in pgr4.toml");
+    return;
+  }
+  // Into pgr4.toml beside the executable, under one comment (SaveSetting writes its comment for
+  // each new key).
+  const std::filesystem::path toml = dir / "pgr4.toml";
+  std::vector<std::string> file;
+  {
+    std::ifstream in(toml);
+    for (std::string line; std::getline(in, line);) file.push_back(line);
+  }
+  file.push_back("# The release's keys (src/pgr4_profile.cpp, settings version 6): F2 switches between "
+                 "the game as it was");
+  file.push_back("# and the enhanced version, F5 the free camera; no development key.");
+  for (const std::string& line : added) file.push_back(line);
+  {
+    std::ofstream out(toml, std::ios::trunc);
+    for (const std::string& line : file) out << line << '\n';
+  }
+  // Applied now, as the config file's values: those registered already set, the others kept by the
+  // SDK for their registration. A file of these lines only (the rest of pgr4.toml not read again).
+  std::string text;
+  for (const std::string& line : added) text += line + "\n";
+  const std::filesystem::path temp = std::filesystem::temp_directory_path() / "pgr4_release_keys.toml";
+  {
+    std::ofstream out(temp, std::ios::trunc);
+    out << text;
+  }
+  rex::cvar::LoadConfig(temp);
+  std::error_code ec;
+  std::filesystem::remove(temp, ec);
+  std::string list;
+  for (const std::string& line : added) list += (list.empty() ? "" : ", ") + line;
+  REXLOG_INFO("PGR4 settings: the release's keys added to pgr4.toml (version 6): {}", list);
+}
+
 void Pgr4MigrateSettings() {
   // Local change (16/11/2026): each step once, for a pgr4.toml older than it (pgr4_settings_version;
   // pgr4.default.toml has the current one). Before, the steps ran at every start: a player who
   // chose the GTAO's old values again had them replaced at the next.
-  constexpr int32_t kSettingsVersion = 3;
+  constexpr int32_t kSettingsVersion = 7;
   const int32_t from = REXCVAR_GET(pgr4_settings_version);
   if (from >= kSettingsVersion) return;
   if (from < 1) MigrateToVersion1();
@@ -402,6 +479,84 @@ void Pgr4MigrateSettings() {
     SaveSetting("pgr4_native_dlss_fg_mvec_y", "1", comment);
     REXLOG_INFO("PGR4 settings: DLSS-G's motion vectors in pgr4.toml from V1.3's -1 to 1");
   }
+  // Version 4 (21/11/2026, Tazz's tunings as the new defaults): a value exactly the old default
+  // (the game's Graphics page saves every renderer setting, so most pgr4.toml files hold them)
+  // gets the new one; another value the player chose stays.
+  if (from < 4) {
+    const char* comment = "# Tazz's tunings as the new defaults (src/pgr4_profile.cpp).";
+    const auto number = [comment](const char* key, double now, double old_default,
+                                  double new_default, auto set) {
+      if (now != old_default) return;
+      set(new_default);
+      char text[32];
+      std::snprintf(text, sizeof(text), "%.6f", new_default);
+      SaveSetting(key, text, comment);
+      REXLOG_INFO("PGR4 settings: {} in pgr4.toml from {} to {}", key, old_default, new_default);
+    };
+    const auto text = [comment](const char* key, const std::string& now, const char* old_default,
+                                const char* new_default, auto set) {
+      if (now != old_default) return;
+      set(std::string(new_default));
+      SaveSetting(key, std::string("\"") + new_default + "\"", comment);
+      REXLOG_INFO("PGR4 settings: {} in pgr4.toml from \"{}\" to \"{}\"", key, old_default,
+                  new_default);
+    };
+    // The light flares with the volumetric fog's lamps (shader_replace.cpp).
+    number("pgr4_native_tune_flare", REXCVAR_GET(pgr4_native_tune_flare), 0.75, 1.0,
+           [](double v) { REXCVAR_SET(pgr4_native_tune_flare, v); });
+    number("pgr4_native_tune_flare_halo", REXCVAR_GET(pgr4_native_tune_flare_halo), 0.0, 0.02,
+           [](double v) { REXCVAR_SET(pgr4_native_tune_flare_halo, v); });
+    // The water in light rain (empty: the rain's until now).
+    text("pgr4_native_tune_water_light_rain", REXCVAR_GET(pgr4_native_tune_water_light_rain), "",
+         "wave_strength=1 wave_steepness=0.08 wave_noise=0.3 wave_size=1 wave_speed=0 "
+         "wind_angle=0.01 sun_waves=0",
+         [](const std::string& v) { REXCVAR_SET(pgr4_native_tune_water_light_rain, v); });
+    // XeGTAO: 0.1 in fog, 0.2 in every other weather.
+    text("pgr4_native_xegtao_fog", REXCVAR_GET(pgr4_native_xegtao_fog), "intensity=0.2 falloff=1",
+         "intensity=0.1 falloff=1",
+         [](const std::string& v) { REXCVAR_SET(pgr4_native_xegtao_fog, v); });
+    number("pgr4_native_xegtao_intensity", REXCVAR_GET(pgr4_native_xegtao_intensity), 0.3, 0.2,
+           [](double v) { REXCVAR_SET(pgr4_native_xegtao_intensity, v); });
+  }
+  // Version 5 (21/11/2026, Tazz's volumetric lamps saved at 20 h 57 as the new defaults): the same
+  // rule, a value exactly the old default.
+  if (from < 5) {
+    const char* comment = "# Tazz's volumetric lamps as the new defaults (src/pgr4_profile.cpp).";
+    const auto number = [comment](const char* key, double now, double old_default,
+                                  double new_default, auto set) {
+      if (now != old_default) return;
+      set(new_default);
+      char text[32];
+      std::snprintf(text, sizeof(text), "%.6f", new_default);
+      SaveSetting(key, text, comment);
+      REXLOG_INFO("PGR4 settings: {} in pgr4.toml from {} to {}", key, old_default, new_default);
+    };
+    number("pgr4_native_volumetric_light_strength", REXCVAR_GET(pgr4_native_volumetric_light_strength),
+           15.0, 10.0, [](double v) { REXCVAR_SET(pgr4_native_volumetric_light_strength, v); });
+    number("pgr4_native_volumetric_light_cone", REXCVAR_GET(pgr4_native_volumetric_light_cone), 50.0,
+           65.0, [](double v) { REXCVAR_SET(pgr4_native_volumetric_light_cone, v); });
+    number("pgr4_native_volumetric_light_cone_around",
+           REXCVAR_GET(pgr4_native_volumetric_light_cone_around), 0.15, 0.1,
+           [](double v) { REXCVAR_SET(pgr4_native_volumetric_light_cone_around, v); });
+  }
+  // Version 6 (22/11/2026): the release's keys (pgr4.default.toml, its lines since V1.1): the free
+  // camera on, the development keys empty. The game's code has them on F2 (the settings overlay),
+  // F3, F4, F7 and the free camera off; only these lines change that, and the launcher writes
+  // pgr4.default.toml only when there is no pgr4.toml, so an older one kept the development keys.
+  // A line already there stays (the player's choice). Not in the development build's folder (its
+  // pgr4.toml has none of these lines on purpose).
+  if (from < 6) MigrateToVersion6();
+  // Version 7 (22/11/2026, Tazz: "normalement ça doit être false maintenant par défaut"): the wait
+  // for the GPU at each frame with DLSS Frame Generation off by default, as decided on 16/11 (branch
+  // perf-cpu, never carried over); the same rule as versions 4 and 5: the old default (true, which
+  // version 1 wrote into the pgr4.toml files without the line) gets the new one.
+  if (from < 7 && REXCVAR_GET(pgr4_native_gpu_serialize_fg)) {
+    REXCVAR_SET(pgr4_native_gpu_serialize_fg, false);
+    SaveSetting("pgr4_native_gpu_serialize_fg", "false",
+                "# With DLSS Frame Generation, wait for the GPU at the end of every frame: off "
+                "(src/pgr4_profile.cpp).");
+    REXLOG_INFO("PGR4 settings: pgr4_native_gpu_serialize_fg in pgr4.toml from true to false");
+  }
   REXCVAR_SET(pgr4_settings_version, kSettingsVersion);
   SaveSetting("pgr4_settings_version", std::to_string(kSettingsVersion),
               "# The version of these settings (src/pgr4_profile.cpp: brought up to date once).");
@@ -420,6 +575,28 @@ REXCVAR_DECLARE(bool, pgr4_native_precompile);  // pgr4-native draw.cpp
 
 // The launcher's precompile step (pgr4_app.h): the window hidden, no profile asked.
 bool Pgr4Precompiling() { return REXCVAR_GET(pgr4_native_precompile); }
+
+// Local change (22/11/2026, Tazz): a fresh log file at each start. The SDK's file sink appends
+// (spdlog's basic_file_sink, truncate off): the development build's run.log had grown to 1.2 GB,
+// every start since 16/11 after the others. The launcher's precompile writes its own beside it
+// (run_precompile.log), else the game's start, which follows it, would remove its lines. Before the
+// SDK opens the file (Pgr4App::OnConfigureLogging); the log_file setting as pgr4.toml or the command
+// line gives it.
+REXCVAR_DEFINE_BOOL(pgr4_log_fresh, true, "PGR4",
+                    "The log file started afresh at each start, the launcher's precompile in its own "
+                    "(<name>_precompile) (off: appended to, one file)");
+void Pgr4FreshLog(rex::LogConfig& config) {
+  const std::string file = REXCVAR_GET(log_file);
+  if (file.empty() || !REXCVAR_GET(pgr4_log_fresh)) return;
+  std::filesystem::path path(file);
+  if (Pgr4Precompiling()) {
+    path = path.parent_path() / (path.stem().string() + "_precompile" + path.extension().string());
+    REXCVAR_SET(log_file, path.string());
+  }
+  config.log_file = path;
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}
 void Pgr4HideWindow(void* hwnd) { ShowWindow(static_cast<HWND>(hwnd), SW_HIDE); }
 
 // Local change (15/11/2026, Tazz): the game starts only from PGR4Launcher, which passes

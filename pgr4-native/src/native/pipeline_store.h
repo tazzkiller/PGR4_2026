@@ -77,6 +77,13 @@ class PipelineStore {
   void TouchRecord(uint64_t vs_hash, uint64_t vs_mod, uint64_t ps_hash, uint64_t ps_mod,
                    const void* key);
   void TouchEntry(uint32_t index);
+  // Development (22/11/2026, the race probe in draw.cpp): whether this record was loaded at the
+  // start (the base list, the other scales' and this scale's store), so the launcher's
+  // precompile had it.
+  bool HasLoadedRecord(uint64_t vs_hash, uint64_t vs_mod, uint64_t ps_hash, uint64_t ps_mod,
+                       const void* key) const {
+    return entry_by_hash_.count(RecordHash(vs_hash, vs_mod, ps_hash, ps_mod, key, key_size_)) != 0;
+  }
   // Once per frame: makes the records appended since the last call durable.
   void Flush();
 
@@ -120,13 +127,34 @@ class PipelineLibrary {
   // root_signature_hash: CreateBindlessRootSignature's blob_hash. A pipeline stored with another
   // root signature does not load with this one, so it is part of every name.
   void Open(ID3D12Device* device, const std::filesystem::path& path, uint64_t root_signature_hash);
-  // Loads the pipeline from the library, or creates it and stores it there. *loaded: whether
-  // it came from the library.
+  // Local change (22/11/2026): the small library beside it (pipelines.delta.d3d12lib) for the
+  // pipelines compiled while playing, the only one saved then (delta), and the precompile's fold
+  // (fold): those found in the small one stored in the big one, the small one removed at its save.
+  // Set before Open.
+  void SetDelta(bool delta, bool fold) {
+    delta_on_ = delta;
+    fold_ = fold;
+  }
+  // Loads the pipeline from the library (local change: else from the small one), or creates it and
+  // stores it there (the small one while playing). *loaded: whether it came from a library.
   HRESULT Create(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineState** out,
                  bool* loaded);
-  bool dirty() const { return dirty_.load(std::memory_order_relaxed); }
-  // Writes the library if a pipeline was stored since the last save.
+  bool dirty() const {
+    return dirty_.load(std::memory_order_relaxed) || delta_dirty_.load(std::memory_order_relaxed);
+  }
+  // Writes the library if a pipeline was stored since the last save (local change: the small one
+  // alone while playing; with the fold, the big one, then the small one removed).
   void Save();
+  // Development (22/11/2026, the race probe in draw.cpp): the saves done, their whole time
+  // (serialize and write), and whether one is running now.
+  uint32_t saves() const { return saves_.load(std::memory_order_relaxed); }
+  uint64_t save_us() const { return save_us_.load(std::memory_order_relaxed); }
+  bool saving() const { return saving_.load(std::memory_order_relaxed); }
+  // Local change (22/11/2026, the precompile's new pipelines only): whether the library was read
+  // from its file (else new, or the file not usable), and the pipelines compiled and stored in it
+  // by this process.
+  bool from_file() const { return !blob_.empty(); }
+  uint32_t stored() const { return stored_.load(std::memory_order_relaxed); }
 
  private:
   ID3D12Device* device_ = nullptr;
@@ -136,6 +164,19 @@ class PipelineLibrary {
   uint64_t root_signature_hash_ = 0;
   std::atomic<bool> dirty_{false};
   std::atomic<uint32_t> loaded_{0}, stored_{0};
+  std::atomic<uint32_t> saves_{0};
+  std::atomic<uint64_t> save_us_{0};
+  std::atomic<bool> saving_{false};
+  // Local change (22/11/2026): the small library (SetDelta).
+  bool delta_on_ = false, fold_ = false;
+  std::vector<uint8_t> delta_blob_;  // must outlive delta_
+  Microsoft::WRL::ComPtr<ID3D12PipelineLibrary> delta_;
+  std::filesystem::path delta_path_;
+  std::atomic<bool> delta_dirty_{false};
+  bool delta_removed_ = false;  // the precompile removed its file (Save)
+  std::atomic<uint32_t> delta_loaded_{0}, folded_{0};
+  // Writes one library (serialized whole) to its file through a .tmp; false if it failed.
+  bool Write(ID3D12PipelineLibrary* lib, const std::filesystem::path& path, const char* what);
   // Names being loaded or stored: the library does not synchronize two loads of one pipeline.
   std::mutex busy_mutex_;
   std::unordered_set<uint64_t> busy_;

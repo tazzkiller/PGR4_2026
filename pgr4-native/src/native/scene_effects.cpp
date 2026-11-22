@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cassert>
 #include <cctype>
 #include <cmath>
@@ -50,6 +51,9 @@ REXCVAR_DEFINE_BOOL(pgr4_native_gtao_debug, false, "PGR4 native",
 // upscaler, steadier than ours there (Tazz in DLSS Quality); with MSAA, nothing accumulates a
 // changing noise, ours. Its own radius, strength and tuning; the distance and the game's fog
 // shared.
+// Local change (22/11/2026, Tazz: "c'est bon le MSAA avec le XeGTAO, on va mettre toujours celui-là").
+REXCVAR_DEFINE_BOOL(pgr4_native_ao_auto_xegtao, true, "PGR4 native",
+                    "The automatic ambient occlusion: XeGTAO with MSAA too (off: our GTAO with MSAA)");
 REXCVAR_DEFINE_INT32(pgr4_native_ao_method, 0, "PGR4 native",
                      "The ambient occlusion's method (with --pgr4_native_gtao): 0 automatic (our "
                      "GTAO with MSAA, Intel's XeGTAO under an upscaler), 1 always our GTAO, 2 "
@@ -114,22 +118,42 @@ REXCVAR_DEFINE_STRING(pgr4_native_xegtao_clear, "", "PGR4 native",
                       "thin_compensation, final_power, mip_offset); empty: the general ones");
 REXCVAR_DEFINE_STRING(pgr4_native_xegtao_overcast, "", "PGR4 native",
                       "XeGTAO when overcast (as --pgr4_native_xegtao_clear)");
-REXCVAR_DEFINE_STRING(pgr4_native_xegtao_fog, "intensity=0.2 falloff=1", "PGR4 native",
+// Tazz's tuning (21/11/2026: intensity 0.2 -> 0.15, his pgr4.toml since V1.45; then 0.1, 22 h 13).
+REXCVAR_DEFINE_STRING(pgr4_native_xegtao_fog, "intensity=0.1 falloff=1", "PGR4 native",
                       "XeGTAO in fog (as --pgr4_native_xegtao_clear; Tazz's tuning by default)");
 REXCVAR_DEFINE_STRING(pgr4_native_xegtao_rain, "", "PGR4 native",
                       "XeGTAO in rain (as --pgr4_native_xegtao_clear)");
+// Local change (22/11/2026, Tazz: "le GTAO en MSAA est super aliasé, particulièrement avec le
+// brouillard"): in MSAA (the deferred occlusion) one value per sample, not per pixel (sample 0's),
+// each sample multiplied by its own before the resolve averages them. Read at each frame.
+REXCVAR_DEFINE_BOOL(pgr4_native_gtao_ms_per_sample, true, "PGR4 native",
+                    "GTAO in MSAA: the occlusion per sample at the edges, each sample darkened by its "
+                    "own (off: sample 0's for the whole pixel)");
+// Local change (21/11/2026, Tazz: GTAO and XeGTAO with the volumetric fog laid by the shaders):
+// the surface's part of each pixel (SurfaceShare) from our fog when the shaders laid it (mode 2):
+// the volume's transmittance there and its fog colour; off: the game's distance fog, as before.
+// Off by default (21/11/2026, 22 h): on, XeGTAO's occlusion was hidden everywhere, even in clear
+// daylight (its debug view 252 against 243.6 off, A/B/A on one photo mode frame), cause not found
+// yet; off is V1.4's way (exp(-distance x c10.w), c10.rgb), which works with the volumetric fog.
+REXCVAR_DEFINE_BOOL(pgr4_native_gtao_fog_volume, false, "PGR4 native",
+                    "GTAO and XeGTAO: the surface's part from the volumetric fog the shaders laid "
+                    "(off: from the game's fog)");
 REXCVAR_DEFINE_STRING(pgr4_native_xegtao_snow, "", "PGR4 native",
                       "XeGTAO in snow (as --pgr4_native_xegtao_clear)");
 REXCVAR_DEFINE_STRING(pgr4_native_xegtao_icy, "", "PGR4 native",
                       "XeGTAO on ice (as --pgr4_native_xegtao_clear)");
 REXCVAR_DEFINE_STRING(pgr4_native_xegtao_heavy_snow, "", "PGR4 native",
                       "XeGTAO in heavy snow (as --pgr4_native_xegtao_clear)");
-REXCVAR_DEFINE_DOUBLE(pgr4_native_xegtao_intensity, 0.3, "PGR4 native",
+// Tazz (21/11/2026): 0.2 in every weather but fog (pgr4_native_xegtao_fog, 0.15); 0.3 before.
+REXCVAR_DEFINE_DOUBLE(pgr4_native_xegtao_intensity, 0.2, "PGR4 native",
                       "XeGTAO: a power on its occlusion (1: as XeGTAO makes it; less, lighter)")
     .range(0.0, 4.0);
 bool Pgr4GtaoScreen();  // src/pgr4_menu.cpp: a race's, the garage's, a replay's or photo screen
+extern bool g_pgr4_dev;  // draw.cpp: development (the capture dir set), never in the release
 extern std::atomic<float> g_pgr4_fog_density;  // draw.cpp: the scene's fog, per metre
 extern std::atomic<float> g_pgr4_fog_color[3];  // draw.cpp: its color (the shaders' c10.rgb)
+std::string Pgr4TakeGtaoFogProbe();  // draw.cpp: development, the draws' fog densities (2 s)
+REXCVAR_DECLARE(bool, pgr4_native_gtao_fog_from_code);  // draw.cpp
 extern int g_pgr4_weather_kind;    // draw.cpp: the race's weather, -1 unknown, 0 clear .. 6
 extern bool g_pgr4_race_screen;    // draw.cpp: a race's, the garage's, a replay's or photo screen
 
@@ -147,7 +171,9 @@ namespace {
 // u0-u4), the prefilter, the main pass, up to three denoise passes and the finish.
 constexpr uint32_t kXeFirstView = 20;
 constexpr uint32_t kXeViews = 8;
-constexpr uint32_t kViewsPerSlot = kXeFirstView + 6 * kXeViews;
+// ... then the fog volume's view (the occlusion's t3: the second table, kFogVolumeView).
+constexpr uint32_t kFogVolumeView = kXeFirstView + 6 * kXeViews;
+constexpr uint32_t kViewsPerSlot = kFogVolumeView + 1;
 
 struct AoConstants {
   uint32_t size[2];  // the scene's host size
@@ -163,7 +189,15 @@ struct AoConstants {
   uint32_t pad;
   float fog_color[3];     // the fog's color, the rest of the pixel (local change, 16/11/2026)
   float pad2;
+  // Local change (21/11/2026): the fog volume (SceneEffects::FogVolume), on when the shaders laid it.
+  uint32_t fog_volume_on;
+  float vol_range, vol_ln2_growth, vol_first_edge;
+  float vol_fog[3];
+  float vol_columns_x;
+  float vol_columns_y;
+  float pad3[3];
 };
+static_assert(sizeof(AoConstants) == 32 * 4, "AoConstants: 8 registers, as kAoHlsl's cbuffer");
 
 constexpr char kAoHlsl[] = R"(
 cbuffer C : register(b0) {
@@ -172,6 +206,9 @@ cbuffer C : register(b0) {
   float max_distance; uint frame; uint2 half_size;
   uint ratio; float fog_density; uint axis; uint pad;
   float3 fog_color; float pad2;
+  uint fog_volume_on; float vol_range; float vol_ln2_growth; float vol_first_edge;
+  float3 vol_fog; float vol_columns_x;
+  float vol_columns_y; float3 pad3;
 };
 static const float kPi = 3.14159265;
 // Local change (16/11/2026): the multiplier of a pixel's color `color` that darkens by `v` only
@@ -209,10 +246,11 @@ float RawDepth(int2 p) { return depth_tex.Load(p, 0); }
 Texture2D<float> depth_tex : register(t2);
 float RawDepth(int2 p) { return depth_tex.Load(int3(p, 0)); }
 #endif
-RWTexture2D<unorm float> full : register(u0);
-[numthreads(8, 8, 1)]
-void main(uint2 p : SV_DispatchThreadID) {
-  if (any(p >= size)) return;
+// Local change (22/11/2026, pgr4_native_gtao_ms_per_sample: pad 1): a slice per sample. The
+// pixel's value (below, sample 0's) to every sample of its depth; the others the occlusion of the
+// texels around weighted by how close their depth is to the sample's.
+RWTexture2DArray<unorm float> full : register(u0);
+float PixelValue(uint2 p) {
   float r = float(ratio);
   float2 t = (float2(p) + 0.5 - 0.5 * r) / r;
   int2 q0 = int2(floor(t));
@@ -225,14 +263,12 @@ void main(uint2 p : SV_DispatchThreadID) {
     o4[k] = ao_tex.Load(int3(q[k], 0));
     least = min(least, o4[k]);
   }
-  if (least >= 0.998) { full[p] = 1.0; return; }
+  if (least >= 0.998) return 1.0;
   // Where the four texels nearly agree (no edge between near and far through them), their
   // bilinear mix: the multisampled depth (64 bytes a pixel at 8x) is read only at the edges.
   float most = max(max(o4[0], o4[1]), max(o4[2], o4[3]));
-  if (most - least < 0.03) {
-    full[p] = lerp(lerp(o4[0], o4[1], f.x), lerp(o4[2], o4[3], f.x), f.y);
-    return;
-  }
+  if (most - least < 0.03)
+    return lerp(lerp(o4[0], o4[1], f.x), lerp(o4[2], o4[3], f.x), f.y);
   float zp = ViewZ(RawDepth(int2(p)));
   float sum = 0.0, weight = 0.0;
   [unroll] for (int k = 0; k < 4; ++k) {
@@ -243,7 +279,44 @@ void main(uint2 p : SV_DispatchThreadID) {
     sum += o4[k] * z;
     weight += z;
   }
-  full[p] = sum / weight;
+  return sum / weight;
+}
+[numthreads(8, 8, 1)]
+void main(uint2 p : SV_DispatchThreadID) {
+  if (any(p >= size)) return;
+  float v = PixelValue(p);
+  uint slices = 1u;
+#ifdef MS
+  if (pad != 0u) {
+    uint dw, dh, ds;
+    depth_tex.GetDimensions(dw, dh, ds);
+    slices = ds;
+  }
+#endif
+  full[uint3(p, 0)] = v;
+#ifdef MS
+  if (slices > 1u) {
+    float z0 = ViewZ(depth_tex.Load(int2(p), 0));
+    float r = float(ratio);
+    int2 qc = int2(floor((float2(p) + 0.5) / r));
+    for (uint s = 1u; s < slices; ++s) {
+      float zs = ViewZ(depth_tex.Load(int2(p), s));
+      if (abs(zs - z0) <= 0.01 * max(z0, 1e-3)) {
+        full[uint3(p, s)] = v;
+        continue;
+      }
+      float sum = 0.0, weight = 0.0;
+      [unroll] for (int k = 0; k < 9; ++k) {
+        int2 q = clamp(qc + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(half_size) - 1);
+        float zq = half_z.Load(int3(q, 0));
+        float w = exp(-abs(zq - zs) / (0.03 * max(zs, 1e-3))) * (k == 4 ? 1.0 : 0.5) + 1e-6;
+        sum += ao_tex.Load(int3(q, 0)) * w;
+        weight += w;
+      }
+      full[uint3(p, s)] = sum / weight;
+    }
+  }
+#endif
 }
 #elif defined(DOWN)
 // The depth at half size, read once (the scene's depth is multisampled and four times larger):
@@ -299,6 +372,38 @@ void main(uint2 p : SV_DispatchThreadID) {
   dst[p] = sum / max(weight, 1e-4);
 }
 #else
+// Local change (21/11/2026, the volumetric fog laid by the shaders, mode 2): the transmittance to
+// a surface through the volume (t3), as the shaders lay it (shader_replace.cpp PgrFog,
+// dxbc_translator_alu.cpp EmitVolumetricFog: the eight loads around the pixel's column and slice,
+// the near edge's weight), beyond the volume's range the game's distance fog on. p the scene's
+// pixel, z its view depth, dist its distance (metres); columns of 16 x 16 pixels.
+Texture3D<float4> fog_volume_tex : register(t3);
+float FogVolumeT(float2 p, float z, float dist, float range, float ln2g, float e1, float2 cols_f,
+                 float density) {
+  float zc = min(z, range);
+  float wn = saturate(zc / max(e1, 1e-4));
+  float s = zc >= e1 ? min(max(log2(zc * 2.0) * ln2g - 1.0, 0.0), 63.0) : 0.0;
+  float2 cc = p * (1.0 / 16.0) - 0.5;
+  float2 c0 = floor(cc);
+  float2 fr = cc - c0;
+  int2 cols = int2(cols_f) - 1;
+  int2 xs = clamp(int2(int(c0.x), int(c0.x) + 1), 0, cols.x);
+  int2 ys = clamp(int2(int(c0.y), int(c0.y) + 1), 0, cols.y);
+  float sf = floor(s);
+  float fz = s - sf;
+  int k0 = int(sf), k1 = min(k0 + 1, 63);
+  float a = 0.0;
+  [unroll] for (int n = 0; n < 8; ++n) {
+    int ox = n & 1, oy = (n >> 1) & 1, oz = n >> 2;
+    float w = (ox ? fr.x : 1.0 - fr.x);
+    w = oy ? w * fr.y : w - w * fr.y;
+    w = oz ? w * fz : w - w * fz;
+    a += fog_volume_tex.Load(int4(ox ? xs.y : xs.x, oy ? ys.y : ys.x, oz ? k1 : k0, 0)).a * w;
+  }
+  a = (a - 1.0) * wn + 1.0;
+  if (z > range) a *= exp(-dist * (1.0 - range / z) * density);
+  return saturate(a);
+}
 // GTAO (Jimenez et al., "Practical Real-Time Strategies for Accurate Indirect Occlusion", 2016,
 // laid out as XeGTAO does): per slice (a screen direction), the highest horizon on each side
 // within the radius, and the visibility between them over the normal projected into the slice.
@@ -319,8 +424,15 @@ void main(uint2 p : SV_DispatchThreadID) {
   float fade = saturate((max_distance - c.z) / (0.2 * max_distance));
   // The game's fog is already in the scene's color: the occlusion only darkens the part of the
   // surface the fog leaves, exp(-distance x density) (the shaders' c10.w), never the fog itself
-  // (SurfaceShare, at the end).
-  const float fog_f = exp(-length(c) * fog_density);
+  // (SurfaceShare, at the end). With the fog laid by the shaders (mode 2): ours, the volume's
+  // transmittance there and its colour.
+  float fog_f = exp(-length(c) * fog_density);
+  float3 fog_c = fog_color;
+  if (fog_volume_on != 0u) {
+    fog_f = FogVolumeT((float2(ip) + 0.5) * float(ratio), c.z, length(c), vol_range, vol_ln2_growth,
+                       vol_first_edge, float2(vol_columns_x, vol_columns_y), fog_density);
+    fog_c = vol_fog;
+  }
   if (fade <= 0.001 || fog_f <= 0.001 || intensity <= 0.0) { dst[p] = 1.0; return; }
   // The surface's normal from the nearer neighbour on each axis (no bleeding across edges).
   float3 l = PosAt(ip - int2(1, 0)), r = PosAt(ip + int2(1, 0));
@@ -382,7 +494,7 @@ void main(uint2 p : SV_DispatchThreadID) {
   float kc = 2.7552 * albedo + 0.6903;
   visibility = max(visibility, ((visibility * ka + kb) * visibility + kc) * visibility);
   visibility = max(pow(saturate(visibility), intensity), 0.5);
-  dst[p] = SurfaceShare(SceneColorAt(int2(p) * int(ratio)), fog_color, fog_f,
+  dst[p] = SurfaceShare(SceneColorAt(int2(p) * int(ratio)), fog_c, fog_f,
                         lerp(1.0, visibility, fade));
 }
 #endif
@@ -455,7 +567,15 @@ struct XeConstants {
   float near_start;    // the near fade (local change, 17/11/2026), 0 and 0 for none
   float fog_color[3];  // the fog's color (AoConstants')
   float near_end;
+  // Local change (21/11/2026): the fog volume (AoConstants').
+  uint32_t fog_volume_on;
+  float vol_range, vol_ln2_growth, vol_first_edge;
+  float vol_fog[3];
+  float vol_columns_x;
+  float vol_columns_y;
+  float pad3[3];
 };
+static_assert(sizeof(XeConstants) == 44 * 4, "XeConstants: 11 registers, as kXeHlsl's cbuffer");
 static_assert(sizeof(XeGTAO::GTAOConstants) == 24 * 4, "XeGTAO's constants: 6 registers");
 
 // Our entry points around XeGTAO's (as its sample's vaGTAO.hlsl wires them), one per pass macro.
@@ -474,6 +594,9 @@ cbuffer C : register(b0) {
   GTAOConstants g_GTAOConsts;
   float pgr4_fog_density; float pgr4_max_distance; float pgr4_intensity; float pgr4_near_start;
   float3 pgr4_fog_color; float pgr4_near_end;
+  uint pgr4_fog_volume_on; float pgr4_vol_range; float pgr4_vol_ln2_growth; float pgr4_vol_first_edge;
+  float3 pgr4_vol_fog; float pgr4_vol_columns_x;
+  float pgr4_vol_columns_y; float3 pgr4_pad3;
 };
 #include "XeGTAO.hlsli"
 SamplerState g_samplerPointClamp : register(s0);
@@ -579,6 +702,38 @@ Texture2D<float4> g_sceneColor : register(t2);
 float3 SceneColorAt(int2 p) { return g_sceneColor.Load(int3(p, 0)).rgb; }
 #endif
 RWTexture2D<unorm float> g_out : register(u0);
+// Local change (21/11/2026, the volumetric fog laid by the shaders, mode 2): the transmittance to
+// a surface through the volume (t3), as the shaders lay it (shader_replace.cpp PgrFog,
+// dxbc_translator_alu.cpp EmitVolumetricFog: the eight loads around the pixel's column and slice,
+// the near edge's weight), beyond the volume's range the game's distance fog on. p the scene's
+// pixel, z its view depth, dist its distance (metres); columns of 16 x 16 pixels.
+Texture3D<float4> fog_volume_tex : register(t3);
+float FogVolumeT(float2 p, float z, float dist, float range, float ln2g, float e1, float2 cols_f,
+                 float density) {
+  float zc = min(z, range);
+  float wn = saturate(zc / max(e1, 1e-4));
+  float s = zc >= e1 ? min(max(log2(zc * 2.0) * ln2g - 1.0, 0.0), 63.0) : 0.0;
+  float2 cc = p * (1.0 / 16.0) - 0.5;
+  float2 c0 = floor(cc);
+  float2 fr = cc - c0;
+  int2 cols = int2(cols_f) - 1;
+  int2 xs = clamp(int2(int(c0.x), int(c0.x) + 1), 0, cols.x);
+  int2 ys = clamp(int2(int(c0.y), int(c0.y) + 1), 0, cols.y);
+  float sf = floor(s);
+  float fz = s - sf;
+  int k0 = int(sf), k1 = min(k0 + 1, 63);
+  float a = 0.0;
+  [unroll] for (int n = 0; n < 8; ++n) {
+    int ox = n & 1, oy = (n >> 1) & 1, oz = n >> 2;
+    float w = (ox ? fr.x : 1.0 - fr.x);
+    w = oy ? w * fr.y : w - w * fr.y;
+    w = oz ? w * fz : w - w * fz;
+    a += fog_volume_tex.Load(int4(ox ? xs.y : xs.x, oy ? ys.y : ys.x, oz ? k1 : k0, 0)).a * w;
+  }
+  a = (a - 1.0) * wn + 1.0;
+  if (z > range) a *= exp(-dist * (1.0 - range / z) * density);
+  return saturate(a);
+}
 // As our GTAO's (kAoHlsl's SurfaceShare): the occlusion on the surface's part of the color only.
 float SurfaceShare(float3 color, float3 fog, float f, float v) {
   const float3 kLuma = float3(0.2126, 0.7152, 0.0722);
@@ -599,9 +754,16 @@ void main(uint2 p : SV_DispatchThreadID) {
   if (pgr4_near_end > 0.0)
     fade *= saturate((length(pos) - pgr4_near_start) / (pgr4_near_end - pgr4_near_start));
   float fog_f = exp(-length(pos) * pgr4_fog_density);
+  float3 fog_c = pgr4_fog_color;
+  if (pgr4_fog_volume_on != 0u) {
+    fog_f = FogVolumeT(float2(p) + 0.5, z, length(pos), pgr4_vol_range, pgr4_vol_ln2_growth,
+                       pgr4_vol_first_edge, float2(pgr4_vol_columns_x, pgr4_vol_columns_y),
+                       pgr4_fog_density);
+    fog_c = pgr4_vol_fog;
+  }
   float v = float(g_finalAOTerm.Load(int3(p, 0))) / 255.0;
   v = max(pow(saturate(v), pgr4_intensity), 0.5);
-  g_out[p] = SurfaceShare(SceneColorAt(int2(p)), pgr4_fog_color, fog_f, lerp(1.0, v, fade));
+  g_out[p] = SurfaceShare(SceneColorAt(int2(p)), fog_c, fog_f, lerp(1.0, v, fade));
 }
 #endif
 )";
@@ -810,12 +972,16 @@ bool SceneEffects::Initialize(ID3D12Device* device) {
       {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0},
       {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 3},
   };
-  D3D12_ROOT_PARAMETER params[2] = {};
+  // ... and (local change, 21/11/2026) a second table, t3 the fog volume (kFogVolumeView).
+  const D3D12_DESCRIPTOR_RANGE fog_range = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3, 0, 0};
+  D3D12_ROOT_PARAMETER params[3] = {};
   params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   params[0].DescriptorTable = {2, ranges};
   params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   params[1].Constants = {0, 0, sizeof(AoConstants) / 4};
-  const D3D12_ROOT_SIGNATURE_DESC cs = {2, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[2].DescriptorTable = {1, &fog_range};
+  const D3D12_ROOT_SIGNATURE_DESC cs = {3, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
   ComPtr<ID3DBlob> blob, error;
   if (Failed(D3D12SerializeRootSignature(&cs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error),
              "scene effects root signature serialize") ||
@@ -895,17 +1061,19 @@ bool SceneEffects::Initialize(ID3D12Device* device) {
         {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0},
         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 5, 0, 0, 3},
     };
-    D3D12_ROOT_PARAMETER xe_params[2] = {};
+    D3D12_ROOT_PARAMETER xe_params[3] = {};
     xe_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     xe_params[0].DescriptorTable = {2, xe_ranges};
     xe_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     xe_params[1].Constants = {0, 0, sizeof(XeConstants) / 4};
+    xe_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    xe_params[2].DescriptorTable = {1, &fog_range};
     D3D12_STATIC_SAMPLER_DESC point = {};
     point.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
     point.AddressU = point.AddressV = point.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     point.MaxLOD = D3D12_FLOAT32_MAX;
     point.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    const D3D12_ROOT_SIGNATURE_DESC xs = {2, xe_params, 1, &point, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    const D3D12_ROOT_SIGNATURE_DESC xs = {3, xe_params, 1, &point, D3D12_ROOT_SIGNATURE_FLAG_NONE};
     blob.Reset();
     error.Reset();
     XeGtaoInclude include;
@@ -996,8 +1164,8 @@ bool SceneEffects::EnsureTargets(uint32_t width, uint32_t height) {
   return true;
 }
 
-bool SceneEffects::EnsureFull(uint32_t width, uint32_t height) {
-  if (full_ && full_width_ == width && full_height_ == height) return true;
+bool SceneEffects::EnsureFull(uint32_t width, uint32_t height, uint32_t slices) {
+  if (full_ && full_width_ == width && full_height_ == height && full_slices_ == slices) return true;
   full_.Reset();
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1005,7 +1173,7 @@ bool SceneEffects::EnsureFull(uint32_t width, uint32_t height) {
   d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   d.Width = width;
   d.Height = height;
-  d.DepthOrArraySize = 1;
+  d.DepthOrArraySize = uint16_t(slices);
   d.MipLevels = 1;
   d.Format = DXGI_FORMAT_R8_UNORM;
   d.SampleDesc.Count = 1;
@@ -1018,6 +1186,7 @@ bool SceneEffects::EnsureFull(uint32_t width, uint32_t height) {
   full_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   full_width_ = width;
   full_height_ = height;
+  full_slices_ = slices;
   return true;
 }
 
@@ -1125,7 +1294,10 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   // Local addition (16/11/2026): XeGTAO (the menu's third choice), at the scene's full size.
   // XeGTAO under an upscaler (defer: none), or as --pgr4_native_ao_method forces.
   const int32_t method = REXCVAR_GET(pgr4_native_ao_method);
-  const bool xe = xe_ready_ && (method == 2 || (method == 0 && !defer));
+  // Local change (22/11/2026, pgr4_native_ao_auto_xegtao): automatic, XeGTAO with MSAA too (ours
+  // shimmered in the distance without an upscaler to smooth it; XeGTAO's spatial denoiser holds).
+  const bool xe = xe_ready_ && (method == 2 || (method == 0 && (!defer ||
+                                                                REXCVAR_GET(pgr4_native_ao_auto_xegtao))));
   const uint32_t ratio = xe || REXCVAR_GET(pgr4_native_gtao_full) ? 1 : 2;
   const uint32_t hw = (w + ratio - 1) / ratio, hh = (h + ratio - 1) / ratio;
   if (!w || !h || !EnsureTargets(hw, hh) || (xe && !EnsureXeTargets(w, h))) return;
@@ -1169,8 +1341,9 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   z_uav.Format = DXGI_FORMAT_R32_FLOAT;
   // The deferred path: a multisampled scene the resolver's copies alone read (no upscaler), not
   // the debug view (which shows the occlusion in place of the color).
+  const uint32_t full_slices = REXCVAR_GET(pgr4_native_gtao_ms_per_sample) ? color->samples : 1;
   const bool deferred = defer && color->samples > 1 && !REXCVAR_GET(pgr4_native_gtao_debug) &&
-                        upsample_ms_pso_ && EnsureFull(w, h);
+                        upsample_ms_pso_ && EnsureFull(w, h, full_slices);
   // Pass g's views at 4g: t0, t1, t2, u0 (kViewsPerSlot).
   const auto views = [&](uint32_t g, ID3D12Resource* t0, const D3D12_SHADER_RESOURCE_VIEW_DESC& d0,
                          ID3D12Resource* t1, const D3D12_SHADER_RESOURCE_VIEW_DESC& d1,
@@ -1197,8 +1370,12 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
         r8_uav);
   views(2, half_depth_.Get(), z_srv, raw_.Get(), r8_srv, nullptr, r8_srv, ao_.Get(), r8_uav);
   views(3, half_depth_.Get(), z_srv, ao_.Get(), r8_srv, nullptr, r8_srv, raw_.Get(), r8_uav);
+  // Local change (22/11/2026): full_ a slice per sample (pgr4_native_gtao_ms_per_sample).
+  D3D12_UNORDERED_ACCESS_VIEW_DESC full_uav = r8_uav;
+  full_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+  full_uav.Texture2DArray.ArraySize = deferred ? full_slices_ : 1;
   views(4, raw_.Get(), r8_srv, half_depth_.Get(), z_srv, depth->resource.Get(), depth_srv,
-        deferred ? full_.Get() : nullptr, r8_uav);
+        deferred ? full_.Get() : nullptr, full_uav);
 
   const FfxCamera cam = camera_ ? *camera_ : FfxCamera{};
   AoConstants c = {};
@@ -1216,9 +1393,73 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   c.half_size[0] = hw;
   c.half_size[1] = hh;
   c.ratio = ratio;
+  c.pad = REXCVAR_GET(pgr4_native_gtao_ms_per_sample) ? 1u : 0u;  // local change: the upsample's
   c.fog_density = std::max(0.0f, g_pgr4_fog_density.load(std::memory_order_relaxed));
+  // Development (22/11/2026): the density the GTAO takes, frame to frame (a flicker of its distant
+  // occlusion when it changes), with the draws' densities (draw.cpp), every 2 s.
+  if (g_pgr4_dev) {
+    static float prev = -1.0f;
+    static uint64_t frames = 0, changes = 0;
+    static std::string seen;
+    static auto last = std::chrono::steady_clock::now();
+    ++frames;
+    if (prev >= 0.0f && c.fog_density != prev) {
+      ++changes;
+      if (seen.size() < 300) seen += fmt::format(" {:.5f}->{:.5f}", prev, c.fog_density);
+    }
+    prev = c.fog_density;
+    if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(2)) {
+      last = now;
+      REXLOG_INFO("PGR4 GTAO fog density probe ({}): {} frames, the density taken {:.5f}, changed "
+                  "in {} frames{}{}",
+                  REXCVAR_GET(pgr4_native_gtao_fog_from_code) ? "from the fog's code" : "any draw",
+                  frames, c.fog_density, changes, seen, Pgr4TakeGtaoFogProbe());
+      frames = changes = 0;
+      seen.clear();
+    }
+  }
   for (int i = 0; i < 3; ++i)
     c.fog_color[i] = std::max(0.0f, g_pgr4_fog_color[i].load(std::memory_order_relaxed));
+  // The fog volume the shaders laid this frame (mode 2), its view at kFogVolumeView (a null one
+  // otherwise, never read: fog_volume_on 0).
+  const FogVolume& fv = fog_volume_;
+  const bool fog_volume = REXCVAR_GET(pgr4_native_gtao_fog_volume) && fv.on && fv.volume &&
+                          fv.range > 0.0f && fv.ln2_growth > 0.0f && fv.first_edge > 0.0f &&
+                          fv.columns[0] >= 1.0f && fv.columns[1] >= 1.0f;
+  {
+    D3D12_SHADER_RESOURCE_VIEW_DESC vs = {};
+    vs.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    vs.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    vs.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    vs.Texture3D.MipLevels = 1;
+    device_->CreateShaderResourceView(fog_volume ? fv.volume : nullptr, &vs, cpu(kFogVolumeView));
+  }
+  c.fog_volume_on = fog_volume ? 1u : 0u;
+  c.vol_range = fv.range;
+  c.vol_ln2_growth = fv.ln2_growth;
+  c.vol_first_edge = fv.first_edge;
+  for (int i = 0; i < 3; ++i) c.vol_fog[i] = fv.fog[i];
+  c.vol_columns_x = fv.columns[0];
+  c.vol_columns_y = fv.columns[1];
+  // Its probe: every 2 s, on or why not, and the values given.
+  {
+    static auto fv_last = std::chrono::steady_clock::now();
+    static uint64_t with = 0, without = 0;
+    ++(fog_volume ? with : without);
+    if (const auto now = std::chrono::steady_clock::now();
+        g_pgr4_dev && now - fv_last >= std::chrono::seconds(2)) {  // never in the release (22/11/2026)
+      fv_last = now;
+      REXLOG_INFO("PGR4 GTAO fog volume ({}): {} frames with the volume's fog, {} with the game's; "
+                  "laid by the shaders {}, volume {}, range {:.0f} m, ln2/growth {:.3f}, first edge "
+                  "{:.3f} m, columns {:.0f}x{:.0f}, fog {:.3f} {:.3f} {:.3f} (the game's c10 {:.3f} "
+                  "{:.3f} {:.3f}, distance {:.5f} per m)",
+                  REXCVAR_GET(pgr4_native_gtao_fog_volume) ? "on" : "off", with, without, fv.on,
+                  fv.volume != nullptr, fv.range, fv.ln2_growth, fv.first_edge, fv.columns[0],
+                  fv.columns[1], fv.fog[0], fv.fog[1], fv.fog[2], c.fog_color[0], c.fog_color[1],
+                  c.fog_color[2], c.fog_density);
+      with = without = 0;
+    }
+  }
 
   Transition(list, depth->resource.Get(), depth->state,
              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -1232,6 +1473,7 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   list->SetDescriptorHeaps(1, heaps);
   list->SetComputeRootSignature(compute_signature_.Get());
   list->SetComputeRoot32BitConstants(1, sizeof(c) / 4, &c, 0);
+  list->SetComputeRootDescriptorTable(2, gpu(kFogVolumeView));
   const UINT gx = (hw + 7) / 8, gy = (hh + 7) / 8;
   step(1);
   list->SetPipelineState(ms ? down_ms_pso_.Get() : down_pso_.Get());
@@ -1298,6 +1540,13 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
     g.DepthMIPSamplingOffset = tune.mip_offset;
     g.NoiseIndex = temporal ? int32_t(frame % 64) : 0;
     xc.fog_density = c.fog_density;
+    xc.fog_volume_on = c.fog_volume_on;
+    xc.vol_range = c.vol_range;
+    xc.vol_ln2_growth = c.vol_ln2_growth;
+    xc.vol_first_edge = c.vol_first_edge;
+    std::memcpy(xc.vol_fog, c.vol_fog, sizeof(xc.vol_fog));
+    xc.vol_columns_x = c.vol_columns_x;
+    xc.vol_columns_y = c.vol_columns_y;
     xc.max_distance = c.max_distance;
     xc.intensity = tune.intensity;
     std::memcpy(xc.fog_color, c.fog_color, sizeof(xc.fog_color));
@@ -1362,6 +1611,7 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
     // The upsample (deferred path) uses the effects' own signature and constants again.
     list->SetComputeRootSignature(compute_signature_.Get());
     list->SetComputeRoot32BitConstants(1, sizeof(c) / 4, &c, 0);
+    list->SetComputeRootDescriptorTable(2, gpu(kFogVolumeView));
   } else {
     step(2);
     list->SetPipelineState(ms ? ao_ms_pso_.Get() : ao_pso_.Get());

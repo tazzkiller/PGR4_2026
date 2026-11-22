@@ -159,6 +159,8 @@ class Resolver {
   // Local change (pgr4 project): the effects over the scene, before its first resolve of a frame
   // (scene_effects.h).
   void set_scene_effects(SceneEffects* effects) { effects_ = effects; }
+  // Local change (20/11/2026): the volumetric light, after the scene's end (volumetrics.h).
+  void set_volumetrics(class Volumetrics* volumetrics) { volumetrics_ = volumetrics; }
   // Local change (pgr4 project): called there too, after the effects (the wet roads' copy of the
   // scene, DrawRenderer::OnSceneEnd); returns whether it recorded work of its own state.
   using SceneEnd = std::function<bool(ID3D12GraphicsCommandList*, RenderTargets&, const SurfaceRegs&)>;
@@ -266,6 +268,7 @@ class Resolver {
   GpuTimer* timer_ = nullptr;
   Upscaler* upscaler_ = nullptr;
   SceneEffects* effects_ = nullptr;
+  class Volumetrics* volumetrics_ = nullptr;
   SceneEnd scene_end_;
 };
 
