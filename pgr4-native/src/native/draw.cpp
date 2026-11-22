@@ -36,6 +36,7 @@
 
 #include <map>
 #include <set>
+#include <tuple>  // local change: the view probe's keys
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
@@ -213,6 +214,168 @@ bool g_pgr4_vol_timing = false;
 // Development (22/11/2026): the capture dir set (pgr4_native_capture_dir: the development build's
 // toml only), so the probes run in development and never in the release (Initialize).
 bool g_pgr4_dev = false;
+// Development (22/11/2026, Tazz: the volumetric fog gone in the bumper and cockpit views at night):
+// the fog's probe by the game's view mode (ViewProbe below), with the capture dir only.
+REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_view_probe, true, "PGR4 native",
+                    "Development: the volumetric fog by the game's view mode, every 2 s (the "
+                    "capture dir set only)");
+// Development (22/11/2026): the game's view mode (its view camera's +496: 256 to 259 in a race),
+// set by pgr4_hooks.cpp at each update of that camera (NoteCameraCut).
+std::atomic<uint32_t> g_pgr4_view_mode{0};
+// Development (22/11/2026, Tazz: the volumetric fog gone from the scenery in the bumper and cockpit
+// views, night cities): by view mode, every 2 s (ViewProbeLog). The renderer's thread.
+struct ViewProbe {
+  uint64_t draws = 0, not_made = 0, own_known = 0, own_unknown = 0, lost = 0, eye_off = 0;
+  uint64_t full = 0, taken = 0;  // the draws that may give the volume its camera, those that did
+  uint64_t taken_small = 0;      // of those taken, a viewport under 400 half-width (not the main view)
+  uint64_t left_small = 0;       // left out for that (pgr4_native_volumetric_camera_main_view)
+  uint64_t turned = 0;           // cameras taken over 10 deg from the frame's volume
+  float turned_max = 0.0f;
+  uint64_t direction_off = 0, volume_frames = 0;  // fog draws facing over 10 deg from the volume
+  float direction_max = 0.0f;                     // the largest angle (deg)
+  float volume_forward[3] = {}, own_forward[3] = {};  // at that angle
+  // The fog's colour (22/11/2026): the copies of the game's fog by (c12.y, a viewport under 400
+  // half-width, shader); the main view's c12.y seen; the volumes made at the frame's first fog draw,
+  // the c12.y they took, by (that draw's shader, its viewport, its own c12.y or -1 unread) and by
+  // the copy they took it from (the last before them: shader, viewport, c12.y).
+  std::map<std::tuple<float, bool, uint64_t>, uint64_t> stores;
+  float main_c12_lo = INFINITY, main_c12_hi = -INFINITY;
+  uint64_t first_volumes = 0, c12_stale = 0;
+  float first_c12_lo = INFINITY, first_c12_hi = -INFINITY;
+  std::map<std::tuple<uint64_t, bool, float>, uint64_t> first_draws, first_from;
+  float near_lo = INFINITY, near_hi = -INFINITY, far_lo = INFINITY, far_hi = -INFINITY;
+  float fov_lo = INFINITY, fov_hi = -INFINITY, eye_gap = 0.0f;
+  float dec_lo[3] = {INFINITY, INFINITY, INFINITY}, dec_hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+  float used[3] = {};               // the decode's near x far, far - near, near (the last draw)
+  float own_eye[3] = {}, vol_eye[3] = {};
+  std::map<std::pair<float, float>, uint64_t> depth_range;  // the viewport's z_min, z_max
+  std::map<uint64_t, uint64_t> shaders, lost_shaders, full_shaders;
+};
+static std::map<uint32_t, ViewProbe> g_view_probe;
+// The clip transform the early volume was made with, and its frame (copied as it is made).
+static float g_view_volume_rows[16] = {};
+// The last copy of the game's fog (draw.cpp's store): its shader, a viewport under 400 half-width,
+// its c12.y (-1: not read).
+static uint64_t g_view_store_ps = 0;
+static bool g_view_store_small = false;
+static float g_view_store_c12 = -1.0f;
+static uint64_t g_view_volume_frame = UINT64_MAX;
+// A clip transform's forward: its w row's direction.
+static bool ClipForward(const float* m, float out[3]) {
+  const float n = std::sqrt(m[12] * m[12] + m[13] * m[13] + m[14] * m[14]);
+  if (!(n > 1e-6f)) return false;
+  for (int k = 0; k < 3; ++k) out[k] = m[12 + k] / n;
+  return true;
+}
+static bool ViewProbeOn() { return g_pgr4_dev && REXCVAR_GET(pgr4_native_volumetric_view_probe); }
+// A clip transform's centre: the point whose clip x, y and w are 0 (rows 0, 1, 3).
+static bool ClipCentre(const float* m, float out[3]) {
+  double a[3][3], b[3];
+  const float* rows[3] = {m, m + 4, m + 12};
+  for (int i = 0; i < 3; ++i) {
+    for (int k = 0; k < 3; ++k) a[i][k] = rows[i][k];
+    b[i] = -double(rows[i][3]);
+  }
+  const auto det3 = [](const double x[3][3]) {
+    return x[0][0] * (x[1][1] * x[2][2] - x[1][2] * x[2][1]) -
+           x[0][1] * (x[1][0] * x[2][2] - x[1][2] * x[2][0]) +
+           x[0][2] * (x[1][0] * x[2][1] - x[1][1] * x[2][0]);
+  };
+  const double d = det3(a);
+  if (std::abs(d) <= 1e-12) return false;
+  for (int k = 0; k < 3; ++k) {
+    double t[3][3];
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j) t[i][j] = j == k ? b[i] : a[i][j];
+    out[k] = float(det3(t) / d);
+  }
+  return true;
+}
+// z_ndc = a + b / depth (CameraFromClipRows's form: the z row a times the w row, plus b).
+static bool ClipZ(const float* m, float& a, float& b) {
+  const float *z = m + 8, *w = m + 12;
+  const float wn2 = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
+  if (wn2 < 1e-8f) return false;
+  a = (z[0] * w[0] + z[1] * w[1] + z[2] * w[2]) / wn2;
+  b = z[3] - a * w[3];
+  return b != 0.0f;
+}
+static void ViewProbeLog() {
+  static auto last = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(2)) return;
+  last = now;
+  const auto top = [](const std::map<uint64_t, uint64_t>& m) {
+    std::vector<std::pair<uint64_t, uint64_t>> v(m.begin(), m.end());
+    std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+    std::string s;
+    for (size_t i = 0; i < v.size() && i < 6; ++i) s += fmt::format(" {:016X} ({})", v[i].first, v[i].second);
+    return s.empty() ? std::string(" none") : s;
+  };
+  for (auto& [mode, p] : g_view_probe) {
+    std::string ranges;
+    for (const auto& [zr, n] : p.depth_range)
+      if (ranges.size() < 200) ranges += fmt::format(" {:.4f}..{:.4f} ({})", zr.first, zr.second, n);
+    const auto range = [](float lo, float hi) {
+      return lo <= hi ? fmt::format("{:.3f}..{:.3f}", lo, hi) : std::string("none");
+    };
+    const bool lost = p.lost > 0, eye_off = p.eye_off > 0, no_camera = p.taken == 0;
+    {
+      std::string stores, firsts, froms;
+      std::vector<std::pair<uint64_t, std::string>> sv;
+      for (const auto& [k, n] : p.stores)
+        sv.emplace_back(n, fmt::format(" c12.y {:.3f} {} {:016X} ({})", std::get<0>(k),
+                                       std::get<1>(k) ? "small" : "main", std::get<2>(k), n));
+      std::sort(sv.begin(), sv.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+      for (size_t i = 0; i < sv.size() && i < 8; ++i) stores += sv[i].second;
+      for (const auto& [k, n] : p.first_draws)
+        if (firsts.size() < 400)
+          firsts += fmt::format(" {:016X} {} c12.y {:.3f} ({})", std::get<0>(k),
+                                std::get<1>(k) ? "small" : "main", std::get<2>(k), n);
+      for (const auto& [k, n] : p.first_from)
+        if (froms.size() < 400)
+          froms += fmt::format(" {:016X} {} c12.y {:.3f} ({})", std::get<0>(k),
+                               std::get<1>(k) ? "small" : "main", std::get<2>(k), n);
+      REXLOG_INFO(
+          "PGR4 view probe mode {} fog colour: volumes made at the first fog draw {}, the c12.y they "
+          "took {}..{}, the main view's copies' {}..{} ({} took another); the first fog draws (shader, "
+          "viewport, own c12.y):{}; the copies they took it from:{}; the copies of the game's fog "
+          "(c12.y, viewport, shader):{}{}",
+          mode, p.first_volumes, p.first_c12_lo <= p.first_c12_hi ? p.first_c12_lo : 0.0f,
+          p.first_c12_lo <= p.first_c12_hi ? p.first_c12_hi : 0.0f,
+          p.main_c12_lo <= p.main_c12_hi ? p.main_c12_lo : 0.0f,
+          p.main_c12_lo <= p.main_c12_hi ? p.main_c12_hi : 0.0f, p.c12_stale,
+          firsts.empty() ? std::string(" none") : firsts, froms.empty() ? std::string(" none") : froms,
+          stores.empty() ? std::string(" none") : stores, p.c12_stale ? " C12 STALE" : "");
+    }
+    REXLOG_INFO(
+        "PGR4 view probe mode {} direction: volumes made early in {} frames; fog draws facing over 10 "
+        "deg from the volume {} (at most {:.1f} deg: the volume's forward {:.3f} {:.3f} {:.3f}, the "
+        "draw's {:.3f} {:.3f} {:.3f}); the volume's camera taken from a viewport under 400 "
+        "half-width in {} of {}, left out for it {}; cameras taken over 10 deg from the frame's "
+        "volume {} (at most {:.1f} deg){}{}{}",
+        mode, p.volume_frames, p.direction_off, p.direction_max, p.volume_forward[0],
+        p.volume_forward[1], p.volume_forward[2], p.own_forward[0], p.own_forward[1],
+        p.own_forward[2], p.taken_small, p.taken, p.left_small, p.turned, p.turned_max,
+        p.direction_off ? " DIRECTION OFF" : "", p.taken_small ? " SMALL VIEWPORT" : "",
+        p.turned ? " CAMERA TURNED" : "");
+    REXLOG_INFO(
+        "PGR4 view probe mode {}: {} draws given the volume ({} not made: the game's fog); their own "
+        "camera known in {}, unknown in {} (near {}, far {}, fov {} deg); the decode's near x far "
+        "{:.3f}, far - near {:.1f}, near {:.4f}; viewport depth{}; 5 m read as {}, 50 m as {}, 200 m "
+        "as {} ({} draws off); eye apart from the volume's by up to {:.2f} m (the draws' {:.1f} {:.1f} "
+        "{:.1f}, the volume's {:.1f} {:.1f} {:.1f}); the volume's camera from {} of {} candidate "
+        "draws; shaders given the volume:{}; off:{}; candidates:{}{}{}{}",
+        mode, p.draws, p.not_made, p.own_known, p.own_unknown, range(p.near_lo, p.near_hi),
+        range(p.far_lo, p.far_hi), range(p.fov_lo, p.fov_hi), p.used[0], p.used[1], p.used[2],
+        ranges.empty() ? std::string(" none") : ranges, range(p.dec_lo[0], p.dec_hi[0]),
+        range(p.dec_lo[1], p.dec_hi[1]), range(p.dec_lo[2], p.dec_hi[2]), p.lost, p.eye_gap,
+        p.own_eye[0], p.own_eye[1], p.own_eye[2], p.vol_eye[0], p.vol_eye[1], p.vol_eye[2], p.taken,
+        p.full, top(p.shaders), top(p.lost_shaders), top(p.full_shaders), lost ? " FOG LOST" : "",
+        eye_off ? " EYE OFF" : "", no_camera ? " NO CAMERA" : "");
+  }
+  g_view_probe.clear();
+}
 // Development (22/11/2026): the GTAO's fog density probe: the densities (c10.w) the scene draws gave,
 // all of them and those laying the game's fog by its code, the shaders of the others; read and
 // emptied every 2 s by SceneEffects::Apply (scene_effects.cpp).
@@ -399,6 +562,16 @@ REXCVAR_DEFINE_BOOL(pgr4_native_fog_ending_shared, true, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_freeze_probe, true, "PGR4 native",
                     "When no frame comes for 5 s, log what each of the renderer's threads waits for "
                     "(again every 5 s while it lasts)");
+// Local change (22/11/2026, Tazz: the volumetric fog gone in the bumper view at night): the volume's
+// copy of the game's fog from the main view's draws only (its viewport over 400 half-width).
+REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_fog_main_view, true, "PGR4 native",
+                    "Volumetric fog: the game's fog (c10, c11, c12.y, its scale, the eye) copied from "
+                    "the main view's draws only (off: from any scene draw, the rear-view mirror's too)");
+// Local change (22/11/2026, Tazz: "fais le correctif dans tous les cas"): the volume's camera from
+// the main view's draws only (as its copy of the game's fog above).
+REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_camera_main_view, true, "PGR4 native",
+                    "Volumetric fog: its camera (world to clip) taken from the main view's draws only "
+                    "(off: from any fog draw, the rear-view mirror's too)");
 // Local change (22/11/2026): the GTAO's fog from the draws laying the game's fog by its code.
 REXCVAR_DEFINE_BOOL(pgr4_native_gtao_fog_from_code, true, "PGR4 native",
                     "GTAO: the scene's fog density and colour from the draws laying the game's fog "
@@ -8399,13 +8572,33 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
                         ((pmap.float_bitmap[0] >> 10) & 1);
       const float scale = full ? regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + scale_at)
                                : c(254, 1);
-      if (full || !from_code) {
+      // Local change (22/11/2026, pgr4_native_volumetric_fog_main_view): the main view's draws only
+      // (|VPORT_XSCALE| over 400, the guest's 1280 x 720, as the volume made at its first draw
+      // below): a smaller view drawn at the frame's end (F797C4DF8C6B6E5E, c12.y 1 against the main
+      // view's 6 at night: the rear-view mirror's) left its constants to the next frame's volume
+      // made at the first fog draw (the bumper view): the fog's colour six times too dark.
+      const bool main_view = !REXCVAR_GET(pgr4_native_volumetric_fog_main_view) ||
+                             std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f;
+      if ((full || !from_code) && main_view) {
         for (int k = 0; k < 4; ++k) {
           g_pgr4_fog_c10[k].store(c(10, k), std::memory_order_relaxed);
           g_pgr4_fog_c11[k].store(c(11, k), std::memory_order_relaxed);
         }
         for (int k = 0; k < 3; ++k) g_pgr4_fog_eye[k].store(c(5, k), std::memory_order_relaxed);
         g_pgr4_fog_exp2.store(from_code ? scale : c(254, 1), std::memory_order_relaxed);
+        if (ViewProbeOn()) {  // development (22/11/2026): the fog's colour by view mode
+          const bool small_vp = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) < 400.0f;
+          const float k12 = ((pmap.float_bitmap[0] >> 12) & 1) ? c(12, 1) : -1.0f;
+          ViewProbe& p = g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)];
+          ++p.stores[{k12, small_vp, ps->ucode_data_hash()}];
+          if (!small_vp && k12 >= 0.0f) {
+            p.main_c12_lo = std::min(p.main_c12_lo, k12);
+            p.main_c12_hi = std::max(p.main_c12_hi, k12);
+          }
+          g_view_store_ps = ps->ucode_data_hash();
+          g_view_store_small = small_vp;
+          g_view_store_c12 = k12;
+        }
         if ((pmap.float_bitmap[0] >> 12) & 1)
           g_pgr4_fog_c12y.store(c(12, 1), std::memory_order_relaxed);
         g_pgr4_fog_height_on.store(height, std::memory_order_relaxed);
@@ -8440,10 +8633,40 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
           }
         }
         const float scale = std::max({std::abs(eye[0]), std::abs(eye[1]), std::abs(eye[2]), 1.0f});
+        if (ViewProbeOn()) {  // development (22/11/2026): by view mode
+          ViewProbe& vp_seen = g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)];
+          ++vp_seen.full;
+          ++vp_seen.full_shaders[ps->ucode_data_hash()];
+          const bool fits = gap <= 0.05f + 1e-4f * scale && m[5] > 0.0f;
+          const bool small_vp = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) <= 400.0f;
+          const bool kept_out = small_vp && REXCVAR_GET(pgr4_native_volumetric_camera_main_view);
+          vp_seen.taken += fits && !kept_out;
+          vp_seen.taken_small += fits && !kept_out && small_vp;
+          vp_seen.left_small += fits && kept_out;
+          float fwd[3], vol_fwd[3];
+          if (fits && !kept_out && g_view_volume_frame == r.frame_index() && ClipForward(m, fwd) &&
+              ClipForward(g_view_volume_rows, vol_fwd)) {
+            const float angle = std::acos(std::clamp(fwd[0] * vol_fwd[0] + fwd[1] * vol_fwd[1] +
+                                                         fwd[2] * vol_fwd[2],
+                                                     -1.0f, 1.0f)) *
+                                57.2958f;
+            vp_seen.turned += angle > 10.0f;
+            vp_seen.turned_max = std::max(vp_seen.turned_max, angle);
+          }
+          ViewProbeLog();
+        }
+        // Local change (22/11/2026, pgr4_native_volumetric_camera_main_view): the main view's draws
+        // only (|VPORT_XSCALE| over 400, as the volume made at its first draw below and the copy of
+        // the game's fog above): the rear-view mirror's pass at the frame's end gave its camera too,
+        // which the pass at the resolve read.
+        const bool camera_view = !REXCVAR_GET(pgr4_native_volumetric_camera_main_view) ||
+                                 std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f;
         if (!(gap <= 0.05f + 1e-4f * scale)) {
           ++g_pgr4_fog_camera_stats[1];
         } else if (!(m[5] > 0.0f)) {
           ++g_pgr4_fog_camera_stats[2];  // the world's up drawn downwards: the reflection's
+        } else if (!camera_view) {
+          // another view's (a smaller viewport): not the volume's
         } else {
           std::memcpy(g_pgr4_fog_clip, m, sizeof(m));
           g_pgr4_fog_clip_frame = r.frame_index();
@@ -8457,6 +8680,13 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       if (full && g_pgr4_fog_clip_frame == r.frame_index() &&
           std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f) {
         HangStep(1000 + 9);  // local change: the freeze probe's step
+        if (ViewProbeOn() && g_view_volume_frame != r.frame_index()) {  // development: the probe
+          if (Volumetrics* pv = r.volumetrics(); pv && !pv->VolumeMade(r.frame_index())) {
+            std::memcpy(g_view_volume_rows, g_pgr4_fog_clip, sizeof(g_view_volume_rows));
+            g_view_volume_frame = r.frame_index();
+            ++g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)].volume_frames;
+          }
+        }
         if (Volumetrics* v = r.volumetrics(); v && !v->VolumeMade(r.frame_index()) &&
                                                v->Apply(list, r.render_targets(),
                                                         SurfaceRegsFromRegisters(s.regs), r.frame_index(),
@@ -8658,6 +8888,11 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
           ++fs.off_eye;
         } else if (!(w2c[5] > 0.0f)) {
           ++fs.mirrored;
+        } else if (REXCVAR_GET(pgr4_native_volumetric_camera_main_view) &&
+                   std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) <= 400.0f) {
+          // Local change (22/11/2026, pgr4_native_volumetric_camera_main_view): another view's
+          // draw (a smaller viewport): neither its camera nor the volume made now.
+          if (ViewProbeOn()) ++g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)].left_small;
         } else {
           std::memcpy(g_pgr4_fog_clip, w2c, sizeof(w2c));
           g_pgr4_fog_clip_frame = r.frame_index();
@@ -8665,6 +8900,26 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
           first_frame = r.frame_index();
           ++(from == 1 ? fs.from_c20 : from == 2 ? fs.from_object : fs.from_clip);
           HangStep(1000 + 11);  // local change: the freeze probe's step
+          if (ViewProbeOn()) {  // development (22/11/2026): the fog's colour it takes
+            ViewProbe& p = g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)];
+            std::memcpy(g_view_volume_rows, w2c, sizeof(g_view_volume_rows));
+            g_view_volume_frame = r.frame_index();
+            const float took = g_pgr4_fog_c12y.load(std::memory_order_relaxed);
+            const Shader::ConstantRegisterMap& pm = ps->constant_register_map();
+            const float own12 = !pm.float_dynamic_addressing && ((pm.float_bitmap[0] >> 12) & 1)
+                                    ? regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 12 * 4 + 1)
+                                    : -1.0f;
+            const bool small_vp = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) < 400.0f;
+            ++p.first_volumes;
+            p.first_c12_lo = std::min(p.first_c12_lo, took);
+            p.first_c12_hi = std::max(p.first_c12_hi, took);
+            ++p.first_draws[{ps->ucode_data_hash(), small_vp, own12}];
+            ++p.first_from[{g_view_store_ps, g_view_store_small, g_view_store_c12}];
+            if (p.main_c12_lo <= p.main_c12_hi &&
+                (took < p.main_c12_lo - 1e-3f || took > p.main_c12_hi + 1e-3f))
+              ++p.c12_stale;
+            ViewProbeLog();
+          }
           if (v->Apply(list, r.render_targets(), SurfaceRegsFromRegisters(s.regs), r.frame_index(),
                        r.device().gpu_timer(), true)) {
             ResetListState();
@@ -8929,6 +9184,74 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
           sys.fog_shader[11] = own_inv;
           for (int k = 0; k < 3; ++k) sys.fog_shader[12 + k] = own_c10[k];
         }
+        // Development (22/11/2026): by view mode, this draw's own camera and the distance the
+        // shader's decode (PgrFog: z = near x far / (pos.z x (far - near) + near)) gives for 5, 50
+        // and 200 m of it, pos.z through this draw's viewport (HostViewportInfo) as the rasterizer
+        // makes it.
+        if (ViewProbeOn()) {
+          ViewProbe& p = g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)];
+          ++p.draws;
+          ++p.shaders[ps->ucode_data_hash()];
+          for (int k = 0; k < 3; ++k) p.used[k] = sys.fog_shader[4 + k];
+          ++p.depth_range[{vp.z_min, vp.z_max}];
+          float m[16];
+          for (int k = 0; k < 16; ++k)
+            m[k] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * 4 + k);
+          FfxCamera own;
+          float za = 0.0f, zb = 0.0f;
+          const bool rows_read = vs && ((vs->constant_register_map().float_bitmap[0] >> 4) & 0xF) == 0xF;
+          if (rows_read && CameraFromClipRows(m, own) && ClipZ(m, za, zb)) {
+            ++p.own_known;
+            p.near_lo = std::min(p.near_lo, own.near_plane);
+            p.near_hi = std::max(p.near_hi, own.near_plane);
+            p.far_lo = std::min(p.far_lo, own.far_plane);
+            p.far_hi = std::max(p.far_hi, own.far_plane);
+            p.fov_lo = std::min(p.fov_lo, own.fov_y * 57.2958f);
+            p.fov_hi = std::max(p.fov_hi, own.fov_y * 57.2958f);
+            static constexpr float kRef[3] = {5.0f, 50.0f, 200.0f};
+            bool off = false;
+            for (int i = 0; i < 3; ++i) {
+              const float z_ndc = za + zb / kRef[i];
+              const float pos_z =
+                  vp.z_min + (vp.z_max - vp.z_min) * (z_ndc * vp.ndc_scale[2] + vp.ndc_offset[2]);
+              const float read = sys.fog_shader[4] / (pos_z * sys.fog_shader[5] + sys.fog_shader[6]);
+              p.dec_lo[i] = std::min(p.dec_lo[i], read);
+              p.dec_hi[i] = std::max(p.dec_hi[i], read);
+              if (i == 1 && !(read >= 25.0f && read <= 100.0f)) off = true;
+            }
+            if (off) {
+              ++p.lost;
+              ++p.lost_shaders[ps->ucode_data_hash()];
+            }
+            float own_eye[3], vol_eye[3];
+            if (ClipCentre(m, own_eye) && ClipCentre(g_pgr4_fog_clip, vol_eye)) {
+              float gap = 0.0f;
+              for (int k = 0; k < 3; ++k) gap = std::max(gap, std::abs(own_eye[k] - vol_eye[k]));
+              if (gap > p.eye_gap) {
+                p.eye_gap = gap;
+                std::copy(own_eye, own_eye + 3, p.own_eye);
+                std::copy(vol_eye, vol_eye + 3, p.vol_eye);
+              }
+              p.eye_off += gap > 1.0f;
+            }
+            float own_fwd[3], vol_fwd[3];
+            if (g_view_volume_frame == r.frame_index() && ClipForward(m, own_fwd) &&
+                ClipForward(g_view_volume_rows, vol_fwd)) {
+              const float dot = std::clamp(
+                  own_fwd[0] * vol_fwd[0] + own_fwd[1] * vol_fwd[1] + own_fwd[2] * vol_fwd[2], -1.0f, 1.0f);
+              const float angle = std::acos(dot) * 57.2958f;
+              p.direction_off += angle > 10.0f;
+              if (angle > p.direction_max) {
+                p.direction_max = angle;
+                std::copy(vol_fwd, vol_fwd + 3, p.volume_forward);
+                std::copy(own_fwd, own_fwd + 3, p.own_forward);
+              }
+            }
+          } else {
+            ++p.own_unknown;
+          }
+          ViewProbeLog();
+        }
         if (VolProbes()) {  // development (22/11/2026: off by default)
         struct ScaleSeen {
           uint64_t draws = 0, differ = 0, c10_differ = 0;
@@ -8986,6 +9309,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     } else {
       if (flags_volume) ++not_made;
       if (fog_in_shader) ++shader_not_made;
+      if (fog_in_shader && ViewProbeOn())  // development (22/11/2026): by view mode
+        ++g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)].not_made;
     }
     // Development (21/11/2026, Tazz, Shanghai's Heavy Fog in mode 2: whole regions less fogged on
     // some frames, safety barriers darker): the frame's order of the fog-laying draws against the

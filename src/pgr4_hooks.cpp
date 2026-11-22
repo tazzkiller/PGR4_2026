@@ -1457,6 +1457,7 @@ void Pgr4RaceWeather(const uint8_t* base);  // src/pgr4_autopilot.cpp
 bool Pgr4FreeCamBefore(uint8_t* base, uint32_t camera, uint8_t saved[8]);  // src/pgr4_freecam.cpp
 void Pgr4FreeCamAfter(uint8_t* base, uint32_t camera, const uint8_t saved[8]);
 REX_EXTERN(__imp__sub_827D4688);
+extern std::atomic<uint32_t> g_pgr4_view_mode;  // draw.cpp: development, the volumetric fog's probe
 namespace pgr4::native {
 void NoteGameCameraCut(const float eye[3], const char* why, bool again);  // pgr4-native upscaler.cpp
 }
@@ -1476,6 +1477,7 @@ void NoteCameraCut(const uint8_t* base, bool zone_before) {
   constexpr uint32_t kView = 0x82C91D00, kZoneSwitch = 0x82C922CC;
   const uint8_t* c = base + kView;
   const uint32_t mode = BeU32(c + 496), last_mode = BeU32(c + 500);
+  g_pgr4_view_mode.store(mode, std::memory_order_relaxed);  // development: the fog probe
   const uint32_t sub = BeU32(c + 516), last_sub = BeU32(c + 520);
   const bool zone = zone_before || base[kZoneSwitch] == 1;
   const char* why = nullptr;
