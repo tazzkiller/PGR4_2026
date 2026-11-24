@@ -173,9 +173,6 @@ class NativeRenderer {
     queued_settings_.push_back(std::move(fn));
   }
   bool upscaler_on() const { return upscaler_on_; }
-  // Local change (18/11/2026): DLSS (Super Resolution, and its frame generation with it) upscales
-  // the frames now (set at each Swap by the render thread; read on any thread).
-  bool dlss_running() const { return dlss_running_.load(std::memory_order_relaxed); }
   void RequestUpscaler(bool on) {
     if (on != upscaler_on_) upscaler_switch_requested_.store(true, std::memory_order_relaxed);
   }
@@ -308,9 +305,7 @@ class NativeRenderer {
   std::mutex settings_mutex_;
   std::vector<std::function<void()>> queued_settings_;  // QueueSettings
   bool upscaler_on_ = false;
-  std::atomic<bool> dlss_running_{false};  // dlss_running()
-  // The game's motion blur held off by ApplyMotionBlurRule (guest thread).
-  bool blur_held_off_ = false;
+  // The game's motion blur as the menu and the game want it (guest thread, at the Swap).
   void ApplyMotionBlurRule(uint8_t* base);
   uint32_t scene_msaa_ = 2;  // --pgr4_native_msaa, as far as the GPU has it
 

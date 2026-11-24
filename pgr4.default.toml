@@ -6,7 +6,7 @@
 # fences and interrupts; F9 switches between the two).
 # The version of these settings: an older pgr4.toml is brought up to date once at the
 # game's start (src/pgr4_profile.cpp).
-pgr4_settings_version = 7
+pgr4_settings_version = 10
 pgr4_native = true
 pgr4_native_primary = true
 # The frame rate unlocked from the console's 30 (the game's presentation interval).

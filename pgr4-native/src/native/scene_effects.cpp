@@ -118,17 +118,12 @@ REXCVAR_DEFINE_STRING(pgr4_native_xegtao_clear, "", "PGR4 native",
                       "thin_compensation, final_power, mip_offset); empty: the general ones");
 REXCVAR_DEFINE_STRING(pgr4_native_xegtao_overcast, "", "PGR4 native",
                       "XeGTAO when overcast (as --pgr4_native_xegtao_clear)");
-// Tazz's tuning (21/11/2026: intensity 0.2 -> 0.15, his pgr4.toml since V1.45; then 0.1, 22 h 13).
-REXCVAR_DEFINE_STRING(pgr4_native_xegtao_fog, "intensity=0.1 falloff=1", "PGR4 native",
+// Tazz's tuning (21/11/2026: intensity 0.2 -> 0.15, his pgr4.toml since V1.45; then 0.1, 22 h 13;
+// 24/11/2026: 0.05, « fallait aussi passer le xegtao avec le brouillard de 0.1 à 0.05 »).
+REXCVAR_DEFINE_STRING(pgr4_native_xegtao_fog, "intensity=0.05 falloff=1", "PGR4 native",
                       "XeGTAO in fog (as --pgr4_native_xegtao_clear; Tazz's tuning by default)");
 REXCVAR_DEFINE_STRING(pgr4_native_xegtao_rain, "", "PGR4 native",
                       "XeGTAO in rain (as --pgr4_native_xegtao_clear)");
-// Local change (22/11/2026, Tazz: "le GTAO en MSAA est super aliasé, particulièrement avec le
-// brouillard"): in MSAA (the deferred occlusion) one value per sample, not per pixel (sample 0's),
-// each sample multiplied by its own before the resolve averages them. Read at each frame.
-REXCVAR_DEFINE_BOOL(pgr4_native_gtao_ms_per_sample, true, "PGR4 native",
-                    "GTAO in MSAA: the occlusion per sample at the edges, each sample darkened by its "
-                    "own (off: sample 0's for the whole pixel)");
 // Local change (21/11/2026, Tazz: GTAO and XeGTAO with the volumetric fog laid by the shaders):
 // the surface's part of each pixel (SurfaceShare) from our fog when the shaders laid it (mode 2):
 // the volume's transmittance there and its fog colour; off: the game's distance fog, as before.
@@ -149,7 +144,7 @@ REXCVAR_DEFINE_DOUBLE(pgr4_native_xegtao_intensity, 0.2, "PGR4 native",
                       "XeGTAO: a power on its occlusion (1: as XeGTAO makes it; less, lighter)")
     .range(0.0, 4.0);
 bool Pgr4GtaoScreen();  // src/pgr4_menu.cpp: a race's, the garage's, a replay's or photo screen
-extern bool g_pgr4_dev;  // draw.cpp: development (the capture dir set), never in the release
+extern std::atomic<bool> g_pgr4_dev;  // draw.cpp: development (the capture dir set), never in the release
 extern std::atomic<float> g_pgr4_fog_density;  // draw.cpp: the scene's fog, per metre
 extern std::atomic<float> g_pgr4_fog_color[3];  // draw.cpp: its color (the shaders' c10.rgb)
 std::string Pgr4TakeGtaoFogProbe();  // draw.cpp: development, the draws' fog densities (2 s)
@@ -246,11 +241,10 @@ float RawDepth(int2 p) { return depth_tex.Load(p, 0); }
 Texture2D<float> depth_tex : register(t2);
 float RawDepth(int2 p) { return depth_tex.Load(int3(p, 0)); }
 #endif
-// Local change (22/11/2026, pgr4_native_gtao_ms_per_sample: pad 1): a slice per sample. The
-// pixel's value (below, sample 0's) to every sample of its depth; the others the occlusion of the
-// texels around weighted by how close their depth is to the sample's.
-RWTexture2DArray<unorm float> full : register(u0);
-float PixelValue(uint2 p) {
+RWTexture2D<unorm float> full : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint2 p : SV_DispatchThreadID) {
+  if (any(p >= size)) return;
   float r = float(ratio);
   float2 t = (float2(p) + 0.5 - 0.5 * r) / r;
   int2 q0 = int2(floor(t));
@@ -263,12 +257,14 @@ float PixelValue(uint2 p) {
     o4[k] = ao_tex.Load(int3(q[k], 0));
     least = min(least, o4[k]);
   }
-  if (least >= 0.998) return 1.0;
+  if (least >= 0.998) { full[p] = 1.0; return; }
   // Where the four texels nearly agree (no edge between near and far through them), their
   // bilinear mix: the multisampled depth (64 bytes a pixel at 8x) is read only at the edges.
   float most = max(max(o4[0], o4[1]), max(o4[2], o4[3]));
-  if (most - least < 0.03)
-    return lerp(lerp(o4[0], o4[1], f.x), lerp(o4[2], o4[3], f.x), f.y);
+  if (most - least < 0.03) {
+    full[p] = lerp(lerp(o4[0], o4[1], f.x), lerp(o4[2], o4[3], f.x), f.y);
+    return;
+  }
   float zp = ViewZ(RawDepth(int2(p)));
   float sum = 0.0, weight = 0.0;
   [unroll] for (int k = 0; k < 4; ++k) {
@@ -279,44 +275,7 @@ float PixelValue(uint2 p) {
     sum += o4[k] * z;
     weight += z;
   }
-  return sum / weight;
-}
-[numthreads(8, 8, 1)]
-void main(uint2 p : SV_DispatchThreadID) {
-  if (any(p >= size)) return;
-  float v = PixelValue(p);
-  uint slices = 1u;
-#ifdef MS
-  if (pad != 0u) {
-    uint dw, dh, ds;
-    depth_tex.GetDimensions(dw, dh, ds);
-    slices = ds;
-  }
-#endif
-  full[uint3(p, 0)] = v;
-#ifdef MS
-  if (slices > 1u) {
-    float z0 = ViewZ(depth_tex.Load(int2(p), 0));
-    float r = float(ratio);
-    int2 qc = int2(floor((float2(p) + 0.5) / r));
-    for (uint s = 1u; s < slices; ++s) {
-      float zs = ViewZ(depth_tex.Load(int2(p), s));
-      if (abs(zs - z0) <= 0.01 * max(z0, 1e-3)) {
-        full[uint3(p, s)] = v;
-        continue;
-      }
-      float sum = 0.0, weight = 0.0;
-      [unroll] for (int k = 0; k < 9; ++k) {
-        int2 q = clamp(qc + int2(k % 3 - 1, k / 3 - 1), int2(0, 0), int2(half_size) - 1);
-        float zq = half_z.Load(int3(q, 0));
-        float w = exp(-abs(zq - zs) / (0.03 * max(zs, 1e-3))) * (k == 4 ? 1.0 : 0.5) + 1e-6;
-        sum += ao_tex.Load(int3(q, 0)) * w;
-        weight += w;
-      }
-      full[uint3(p, s)] = sum / weight;
-    }
-  }
-#endif
+  full[p] = sum / weight;
 }
 #elif defined(DOWN)
 // The depth at half size, read once (the scene's depth is multisampled and four times larger):
@@ -1164,8 +1123,8 @@ bool SceneEffects::EnsureTargets(uint32_t width, uint32_t height) {
   return true;
 }
 
-bool SceneEffects::EnsureFull(uint32_t width, uint32_t height, uint32_t slices) {
-  if (full_ && full_width_ == width && full_height_ == height && full_slices_ == slices) return true;
+bool SceneEffects::EnsureFull(uint32_t width, uint32_t height) {
+  if (full_ && full_width_ == width && full_height_ == height) return true;
   full_.Reset();
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1173,7 +1132,7 @@ bool SceneEffects::EnsureFull(uint32_t width, uint32_t height, uint32_t slices) 
   d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   d.Width = width;
   d.Height = height;
-  d.DepthOrArraySize = uint16_t(slices);
+  d.DepthOrArraySize = 1;
   d.MipLevels = 1;
   d.Format = DXGI_FORMAT_R8_UNORM;
   d.SampleDesc.Count = 1;
@@ -1186,7 +1145,6 @@ bool SceneEffects::EnsureFull(uint32_t width, uint32_t height, uint32_t slices) 
   full_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   full_width_ = width;
   full_height_ = height;
-  full_slices_ = slices;
   return true;
 }
 
@@ -1341,9 +1299,8 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   z_uav.Format = DXGI_FORMAT_R32_FLOAT;
   // The deferred path: a multisampled scene the resolver's copies alone read (no upscaler), not
   // the debug view (which shows the occlusion in place of the color).
-  const uint32_t full_slices = REXCVAR_GET(pgr4_native_gtao_ms_per_sample) ? color->samples : 1;
   const bool deferred = defer && color->samples > 1 && !REXCVAR_GET(pgr4_native_gtao_debug) &&
-                        upsample_ms_pso_ && EnsureFull(w, h, full_slices);
+                        upsample_ms_pso_ && EnsureFull(w, h);
   // Pass g's views at 4g: t0, t1, t2, u0 (kViewsPerSlot).
   const auto views = [&](uint32_t g, ID3D12Resource* t0, const D3D12_SHADER_RESOURCE_VIEW_DESC& d0,
                          ID3D12Resource* t1, const D3D12_SHADER_RESOURCE_VIEW_DESC& d1,
@@ -1370,12 +1327,8 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
         r8_uav);
   views(2, half_depth_.Get(), z_srv, raw_.Get(), r8_srv, nullptr, r8_srv, ao_.Get(), r8_uav);
   views(3, half_depth_.Get(), z_srv, ao_.Get(), r8_srv, nullptr, r8_srv, raw_.Get(), r8_uav);
-  // Local change (22/11/2026): full_ a slice per sample (pgr4_native_gtao_ms_per_sample).
-  D3D12_UNORDERED_ACCESS_VIEW_DESC full_uav = r8_uav;
-  full_uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-  full_uav.Texture2DArray.ArraySize = deferred ? full_slices_ : 1;
   views(4, raw_.Get(), r8_srv, half_depth_.Get(), z_srv, depth->resource.Get(), depth_srv,
-        deferred ? full_.Get() : nullptr, full_uav);
+        deferred ? full_.Get() : nullptr, r8_uav);
 
   const FfxCamera cam = camera_ ? *camera_ : FfxCamera{};
   AoConstants c = {};
@@ -1393,7 +1346,6 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   c.half_size[0] = hw;
   c.half_size[1] = hh;
   c.ratio = ratio;
-  c.pad = REXCVAR_GET(pgr4_native_gtao_ms_per_sample) ? 1u : 0u;  // local change: the upsample's
   c.fog_density = std::max(0.0f, g_pgr4_fog_density.load(std::memory_order_relaxed));
   // Development (22/11/2026): the density the GTAO takes, frame to frame (a flicker of its distant
   // occlusion when it changes), with the draws' densities (draw.cpp), every 2 s.

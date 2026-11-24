@@ -1,3 +1,12 @@
+// The cars' shadow on the ground (psCarShadow1) in the volumetric fog: with the volume (PGR4_SHADOW_BLEND:
+// draw.cpp CarShadowFogOn sets the blend src + dst x src.a) the ground's share alone darkened, the
+// fog's light given back (car_shadow_fog_hooks.hlsli; local change, 24/11/2026, made by
+// work/make_car_shadow_fog.py). Without it: the game's computation and blend.
+// fog_volume_hooks.hlsli named here: ShaderReplacer::ClassifyFiles gives the volume only to the
+// files that name it (UsesFogVolume); included through car_shadow_fog_hooks.hlsli alone, the
+// prelude lacked pgr4_fog_volume and none compiled (24/11/2026).
+#include "fog_volume_hooks.hlsli"
+#include "car_shadow_fog_hooks.hlsli"
 // The cars' projected sun shadow on the road (local change, pgr4 project): the game's shader
 // 11E50E2DE7A16D05 (every bool variant), a 3x3 PCF over the car's shadow depth map (tf0) with
 // bilinear weights, its texel size from c161.x (512, the map's console size). The map is drawn at
@@ -166,6 +175,7 @@ float4 Shade(XeInput i) {
 #if XE_INTERPOLATORS > 8
   r8 = i.r8;
 #endif
+  float pgr_d = r2.w, pgr_h = r2.y;  /* local change: the fog distance and height, kept */
   { float t1 = XeRcp(r0.w); r4.x = t1; ps = t1; }
   { float4 t2 = XeMul(r4.xxxx, r0.xxyy); r0.y = t2.y; r0.z = t2.z; }
   { float4 t3 = max(r0.yyyy, r0.yyyy); float t4 = max(r0.z, r0.z); r5.x = t3.x; r7.y = t4; ps = t4; }
@@ -240,5 +250,8 @@ float4 Shade(XeInput i) {
   { float4 t84 = XeMul(r1.xxyz, c161.wwww); float t85 = exp2(r0.x); r0.y = t84.y; r0.z = t84.z; r0.w = t84.w; r0.x = t85; ps = t85; }
   { float4 t86 = XeFog(r0.yzww, r0.xxxx, c254.yyyy, 2); r1.x = t86.x; r1.y = t86.y; r1.z = t86.z; }
   { float4 t87 = max(r1.xyzw, r1.xyzw); xe_out.x = t87.x; xe_out.y = t87.y; xe_out.z = t87.z; xe_out.w = t87.w; }
+  // Local change (24/11/2026): with the volume (draw.cpp CarShadowFogOn, the blend src + dst x
+  // src.a), the ground's share alone darkened, the fog's light given back.
+  if (PgrShadowOurs()) return PgrShadowOut(r0.yzw, r0.x, pgr_d, pgr_h, c5.xyz, PGR4_PIXEL_POS(i));
   return XeFinish(xe_out);
 }

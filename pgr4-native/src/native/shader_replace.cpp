@@ -153,7 +153,8 @@ REXCVAR_DEFINE_BOOL(pgr4_native_tune_flare_with_volumetric, true, "PGR4 native",
 // 246A313B2DFCE07F and the headlights' 87B13831BF0A358D through sub_826CFA60, not the scenery's
 // vsSceneLightFlare 764E294E908A8A4A: draw.cpp marks them in pgr4_dirt.z) with the volumetric fog
 // on: their own tunings, 0.5 (Tazz, 21/11/2026, from a sheet of 1.0, 0.75, 0.5 and 0.35 on the same
-// photo mode frame) and the game's halo. Without the volumetric fog, V1.45's (0.75, Tazz's choice of
+// photo mode frame; 0.75 in V1.51, back to 0.5 the same day, Tazz: « remets 0.5 »; settings
+// version 9), and the game's halo. Without the volumetric fog, V1.45's (0.75, Tazz's choice of
 // 31/10/2026). pgr4_native_tune_flare_car_apart off: the scenery's tunings for them too (as before).
 REXCVAR_DEFINE_DOUBLE(pgr4_native_tune_flare_car, 0.5, "PGR4 native",
                       "The cars' flares (headlights) with the volumetric fog, 1 the game's (kFlareCar)");
@@ -904,6 +905,7 @@ void ShaderReplacer::ClassifyFiles() {
   decal_files_.clear();
   fog_volume_files_.clear();
   fog_shader_files_.clear();
+  shadow_blend_files_.clear();  // local change (24/11/2026)
   for (const auto& [hash, time] : files_) {
     if (hash == kIncludes) continue;
     char name[32];
@@ -918,6 +920,7 @@ void ShaderReplacer::ClassifyFiles() {
     if (text.find("pgr4_decal_light") != std::string::npos) decal_files_.insert(hash);
     if (text.find("fog_volume_hooks.hlsli") != std::string::npos) fog_volume_files_.insert(hash);
     if (text.find("XeFog") != std::string::npos) fog_shader_files_.insert(hash);
+    if (text.find("PGR4_SHADOW_BLEND") != std::string::npos) shadow_blend_files_.insert(hash);
   }
 }
 

@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <memory>
 #include <thread>
+#include <vector>
 
 namespace pgr4::native {
 
@@ -78,6 +79,24 @@ class CommandRecorder final : public ID3D12GraphicsCommandList {
     publish_bytes_ = publish_bytes ? publish_bytes : uint32_t(kPublishBytes);
     worker_spin_ns_.store(worker_spin_ns ? worker_spin_ns : 10000, std::memory_order_relaxed);
   }
+  // Local change (24/11/2026, branch cpu_thread: the draws on two threads, draw.cpp
+  // EncodeWorker): while a thread records "on the side", its recorded calls are appended to
+  // `bytes` in the ring's format (no kWrap) instead of the ring, for the ring's only producer to
+  // splice them in order (Splice). Its Drain first calls `flush` (the producer's packets before
+  // done, then this side's commands so far spliced by this thread), so a forwarded call or a
+  // descriptor write keeps its place.
+  struct Side {
+    std::vector<uint8_t>* bytes = nullptr;
+    void (*flush)(void* context) = nullptr;
+    void* context = nullptr;
+  };
+  // This thread's side (nullptr: the ring).
+  static void SetSide(Side* side) { t_side_ = side; }
+  static Side* side() { return t_side_; }
+  // Commands recorded on a side, into the ring, in their order (the producer's thread).
+  void Splice(const uint8_t* data, size_t bytes);
+  // What was recorded made visible to the replay (the producer's thread; Drain without waiting).
+  void PublishAll() { Publish(); }
 
   // IUnknown, ID3D12Object, ID3D12DeviceChild, ID3D12CommandList.
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override;
@@ -294,6 +313,8 @@ class CommandRecorder final : public ID3D12GraphicsCommandList {
 
   static constexpr uint64_t kRingBytes = 8ull << 20;
   static constexpr uint64_t kPublishBytes = 4096;
+
+  static inline thread_local Side* t_side_ = nullptr;  // local change (24/11/2026): SetSide
 
   ID3D12GraphicsCommandList* real_ = nullptr;
   Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList9> list9_;

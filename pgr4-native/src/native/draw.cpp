@@ -162,6 +162,22 @@ REXCVAR_DEFINE_STRING(pgr4_native_watch_trace, "", "PGR4 native",
 REXCVAR_DEFINE_STRING(pgr4_native_hide_ps, "", "PGR4 native",
                       "Development: the pixel shaders whose draws are left out (their ucode hashes in "
                       "hex, separated by commas or spaces; live)");
+// Local change (24/11/2026, Tazz: « en bas des roues ça fait comme si le brouillard ne s'appliquait
+// pas »): the cars' shadow on the ground (psCarShadow5, shaders/71DABE33068D02F5.ps.hlsl, made by
+// work/make_car_shadow_fog.py) in the volumetric fog darkens the ground's share alone and gives the
+// fog's light back (its blend src + dst x src.a, CarShadowFogOn); the game's (dst x src, faded by its
+// own thinner fog) darkened the fog under the cars with the ground. Read at each draw.
+REXCVAR_DEFINE_BOOL(pgr4_native_car_shadow_fog, true, "PGR4 native",
+                    "The cars' shadow on the ground in the volumetric fog darkens the ground alone, "
+                    "not the fog in front of it (off: as the game, the fog darkened too)");
+// Local change (24/11/2026, Tazz: « pour TV et course »): only with the replay's cameras that film
+// from afar, the game's view mode (g_pgr4_view_mode, the view camera's +496, pgr4_hooks.cpp
+// NoteCameraCut): 768 television, 769 « course », 770 the one the replay starts with. Near the car
+// (the driving views 256-259, the photo mode 513) the shadow faded in the fog left a flat patch
+// of the fog's glow under the cars: the game's shadow there. Read at each draw.
+REXCVAR_DEFINE_STRING(pgr4_native_car_shadow_fog_views, "768 769 770", "PGR4 native",
+                      "The game's view modes (decimal, separated by spaces) whose cars' shadow "
+                      "darkens the ground alone in the volumetric fog (pgr4_native_car_shadow_fog)");
 REXCVAR_DEFINE_BOOL(pgr4_native_dynamic_depth_bias, true, "PGR4 native",
                     "Set the polygon offset with RSSetDepthBias instead of baking it into the "
                     "pipeline state, where the driver supports it (the game animates it, which "
@@ -210,12 +226,27 @@ float g_pgr4_fog_clip[16] = {};
 // early (Volumetrics::Apply), 2 the volume made at the resolve, 3 the first fog draw's camera, 4 the
 // in-shader probe, 5 the fog's constants per draw, 6 the flares' collection, 7 the fog endings' probe.
 uint64_t g_pgr4_vol_ticks[8] = {};
-bool g_pgr4_vol_timing = false;
+std::atomic<bool> g_pgr4_vol_timing{false};
 // Development (22/11/2026): the capture dir set (pgr4_native_capture_dir: the development build's
 // toml only), so the probes run in development and never in the release (Initialize).
-bool g_pgr4_dev = false;
+// Local change (24/11/2026, the CPU audit's T0: "mesurer la release"): read again at each frame
+// (RefreshFrameFlags), with --pgr4_native_dev_probes, so the development build can be measured
+// with and without its probes in one session (A/B/A/B). Atomic: the guest thread (pgr4_d3d_trace)
+// and the pipeline workers read it too.
+std::atomic<bool> g_pgr4_dev{false};
+REXCVAR_DEFINE_BOOL(pgr4_native_dev_probes, true, "PGR4 native",
+                    "Development: the probes of the draws and frames (the race probe, the "
+                    "volumetric fog's, the GTAO fog's, the blur's, the motion's, the car shaders', "
+                    "the flares', the long frames), only with pgr4_native_capture_dir set; read at "
+                    "each frame (off: the draws as in the release, to measure them)");
 // Development (22/11/2026, Tazz: the volumetric fog gone in the bumper and cockpit views at night):
 // the fog's probe by the game's view mode (ViewProbe below), with the capture dir only.
+// Development (23/11/2026, Tazz: white spots on the far trees with the volumetric fog laid by the
+// shaders, psSceneTreeBillboardLod's draws): the trees' shaders' fog constants and the game's T
+// they give, by shader, every 2 s (TreeFogProbe in Impl::Draw), the capture dir set only.
+REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_tree_fog_probe, true, "PGR4 native",
+                    "Development: the trees' and their billboards' fog constants and the game's T "
+                    "they give, by shader, every 2 s (the capture dir set only)");
 REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_view_probe, true, "PGR4 native",
                     "Development: the volumetric fog by the game's view mode, every 2 s (the "
                     "capture dir set only)");
@@ -442,9 +473,25 @@ uint64_t g_pgr4_fog_order_before[8] = {}, g_pgr4_fog_order_after[8] = {};
 REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_in_shader, true, "PGR4 native",
                     "Volumetric fog laid by each translated shader where the game ends its own fog "
                     "(the instruction found and taken again); off: not touched");
+// Development (23/11/2026): mode 3's view (the translator's EmitVolumetricFog): 0 the game's T, ours
+// and the light's factor; 1 the distance and the height the shader was given (its r1.w, r2.y) and
+// ours from the depth. Read at each draw (fog_shader[15], 2 for 1).
+REXCVAR_DEFINE_INT32(pgr4_native_volumetric_in_shader_debug_view, 0, "PGR4 native",
+                     "Development, the fog in the shaders' mode 3: 0 red the game's T, green ours, "
+                     "blue the light's factor / 4; 1 red the distance given (r1.w) / 4096, green "
+                     "ours / 4096, blue 0.5 + the height given (r2.y) / 512; 2 the light added; 3 "
+                     "Tv, A (beyond the range), the ratio; 4 one (the shader's own after the fog)");
+// Local change (23/11/2026, Tazz: white spots on the far trees' billboards): the volumetric fog's
+// game's T taken from the component the fog ending's mad reads it from (its swizzle: the
+// billboards' LOD read r3.zzzz, the register's x was taken, the exponent before exp, so the pure
+// fog colour). Read at each draw (kSysFlag_FogTFromSwizzle).
+REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_fog_t_swizzle, true, "PGR4 native",
+                    "Volumetric fog in the shaders: the game's T from the component its fog's mad "
+                    "reads (off: the register's x, as before)");
 REXCVAR_DEFINE_INT32(pgr4_native_volumetric_in_shader_mode, 2, "PGR4 native",
                      "Volumetric fog in the shaders: 0 the game's result, 1 the same computed again "
-                     "(a check), 2 the volumetric fog");
+                     "(a check), 2 the volumetric fog, 3 (development) its values shown: red the "
+                     "game's transmittance, green ours, blue the light's factor / 4");
 // 21/11/2026 (Tazz, Shanghai's Heavy Fog in mode 2: regions and their lights coming and going, the
 // safety barriers, the flags): the volume made before the frame's first fog-laying draw (about 190
 // draws a frame came before it, 33 shaders on either side from frame to frame: they kept the game's
@@ -558,10 +605,26 @@ REXCVAR_DEFINE_BOOL(pgr4_native_precompile_stamp_parts, true, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_fog_ending_shared, true, "PGR4 native",
                     "The fog endings of the shaders found once for all the threads (off: once per "
                     "thread)");
+// Local change (24/11/2026, branch cpu_thread): the draws on two threads (DrawRenderer::Impl
+// EncodePacket, EncodeWorker), read at each frame's first draw. Off: in line, the same code.
+REXCVAR_DEFINE_BOOL(pgr4_native_draw_encode_thread, true, "PGR4 native",
+                    "The draws on two threads: the render thread decides, a second one packs the "
+                    "constants and records the draws (off: all on the render thread, as before)");
+// Local change (24/11/2026, the CPU audit's T2): the fog's answers of a pixel shader kept in its
+// PsTraits (DrawRenderer::Impl FogEndingOf ...), read at each frame.
+REXCVAR_DEFINE_BOOL(pgr4_native_draw_memo_fog, true, "PGR4 native",
+                    "The draws' fog answers kept per pixel shader: its fog ending, its fog scale, "
+                    "car or not, its replacement's fog (off: asked at each draw, as before)");
 // Local addition (22/11/2026): the freeze probe (hang_probe.h), read by its thread.
 REXCVAR_DEFINE_BOOL(pgr4_native_freeze_probe, true, "PGR4 native",
                     "When no frame comes for 5 s, log what each of the renderer's threads waits for "
                     "(again every 5 s while it lasts)");
+// Local change (24/11/2026, the CPU audit's T1): the freeze probe's marks timed by the time-stamp
+// counter, its steps without a clock, its draw count without a locked add (hang_probe.h
+// g_hang_light; read at each frame). Off: a clock read at every step, as before.
+REXCVAR_DEFINE_BOOL(pgr4_native_freeze_probe_light, true, "PGR4 native",
+                    "The freeze probe at a few ns a draw: its marks timed by the CPU's counter, its "
+                    "steps untimed (off: a system clock read at each of a draw's steps, as before)");
 // Local change (22/11/2026, Tazz: the volumetric fog gone in the bumper view at night): the volume's
 // copy of the game's fog from the main view's draws only (its viewport over 400 half-width).
 REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_fog_main_view, true, "PGR4 native",
@@ -1336,6 +1399,18 @@ constexpr D3D12_BLEND_OP kD3DBlendOp[8] = {
     D3D12_BLEND_OP_ADD,          D3D12_BLEND_OP_SUBTRACT, D3D12_BLEND_OP_MIN, D3D12_BLEND_OP_MAX,
     D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_OP_ADD,      D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_ADD};
 
+// Local change (24/11/2026, pgr4_native_car_shadow_fog): the cars' shadow's blend back to the game's
+// (dst x src, dst alpha x src alpha) when it is ours (src + dst x src.a, dst alpha kept: Draw,
+// CarShadowFogOn) but the pipeline is made with the game's shader.
+static void GameShadowBlend(D3D12_RENDER_TARGET_BLEND_DESC& b) {
+  if (b.BlendEnable && b.SrcBlend == D3D12_BLEND_ONE && b.DestBlend == D3D12_BLEND_SRC_ALPHA &&
+      b.SrcBlendAlpha == D3D12_BLEND_ZERO && b.DestBlendAlpha == D3D12_BLEND_ONE) {
+    b.SrcBlend = D3D12_BLEND_ZERO;
+    b.DestBlend = D3D12_BLEND_SRC_COLOR;
+    b.DestBlendAlpha = D3D12_BLEND_SRC_ALPHA;
+  }
+}
+
 // ---- samplers ----
 
 // Every sampler field the guest's fetch constant and shader binding select, packed losslessly.
@@ -1640,6 +1715,11 @@ void FitHudOrtho(CachedCbv& cb, const DxbcShader* vs, bool full_width) {
 
 }  // namespace
 
+// Local change (24/11/2026, T2): defined below, asked by the draws through PsTraits.
+struct FogEnding;
+static const FogEnding& FindFogEnding(const DxbcShader& shader);
+static int FogScaleConstant(const DxbcShader& shader);
+
 struct DrawRenderer::Impl {
   NativeRenderer& r;
   DrawRenderer::Stats& stats;
@@ -1920,7 +2000,10 @@ struct DrawRenderer::Impl {
   // pso_mutex), moved into the frame's stats by WaitForPipelines (RaceProbeFrame), which also
   // logs the frames far longer than the recent ones and every 2 s a summary naming what went
   // wrong.
-  bool race_probe = false;
+  // Atomic (24/11/2026): switched at a frame's start (RefreshFrameFlags), read by the workers too.
+  std::atomic<bool> race_probe{false};
+  // The capture dir set at the start (development); false in the precompile (24/11/2026).
+  bool dev_build = false;
   uint64_t probe_compiled = 0, probe_fog = 0, probe_fog_twin = 0, probe_loaded = 0,
            probe_max_us = 0;
   uint64_t probe_hlsl = 0;  // draw thread only
@@ -2366,6 +2449,7 @@ struct DrawRenderer::Impl {
 
   Impl(NativeRenderer& renderer, DrawRenderer::Stats& s) : r(renderer), stats(s) {}
   ~Impl() {
+    StopEncode();  // local change (24/11/2026, branch cpu_thread)
     g_prewarm_running = false;  // local change: a race's loading waits no more
     if (freeze_thread.joinable()) {  // local change: the freeze probe
       {
@@ -2570,6 +2654,14 @@ struct DrawRenderer::Impl {
     uint64_t replaced_tag = 0;
     bool replaced = false, road = false, paint_checked = false;
     uint32_t capture_period = UINT32_MAX;  // the capture dir's logging (SelectPipeline)
+    // Local change (24/11/2026, the CPU audit's T2, --pgr4_native_draw_memo_fog): the fog's answers
+    // the draws ask (each worked out at its first ask, then kept like the above): the fog ending
+    // (FindFogEnding: this thread's copy, whose address stays), the fog's scale constant
+    // (FogScaleConstant), whether it is a car's shader (IsCarShader), whether its replacement reads
+    // the volume (UsesFogVolume) or lays the fog itself (UsesFogShader). -1: not asked yet.
+    const FogEnding* fog_ending = nullptr;
+    int fog_scale_at = -2;  // -2: not asked yet (-1 is an answer)
+    int8_t car = -1, fog_volume = -1, fog_shader = -1;
   };
   mutable std::array<PsTraits, 512> ps_traits;
   PsTraits& Traits(const DxbcShader* ps) const {
@@ -2587,6 +2679,206 @@ struct DrawRenderer::Impl {
     }
     return t;
   }
+  // Local change (24/11/2026, the CPU audit's T2, --pgr4_native_draw_memo_fog, read at each
+  // frame): the fog's answers of a pixel shader kept in its PsTraits (with the memo of
+  // --pgr4_native_draw_memo, invalidated by the replacer's stamp as `replaced`); off: asked at each
+  // draw, as before. Development (the probes on): each kept answer checked against a direct ask,
+  // the differences counted and logged (RefreshFrameFlags, every 2 s).
+  bool memo_fog = true;
+  uint64_t fog_memo_asks = 0, fog_memo_wrong = 0;
+  void FogMemoCheck(bool same, const char* what, uint64_t hash) {
+    ++fog_memo_asks;
+    if (!same) {
+      ++fog_memo_wrong;
+      PGR4_LOG_FIRST(50, WARN, "PGR4 fog memo: {} of {:016X} differs from a direct ask", what, hash);
+    }
+  }
+  const FogEnding& FogEndingOf(const DxbcShader* ps) {
+    if (!memo_fog) return FindFogEnding(*ps);
+    PsTraits& t = Traits(ps);
+    if (!t.fog_ending) t.fog_ending = &FindFogEnding(*ps);
+    const FogEnding* const fe = t.fog_ending;
+    // This thread's copy, never changed once made: the same address is the same answer.
+    if (g_pgr4_dev) FogMemoCheck(&FindFogEnding(*ps) == fe, "the fog ending", ps->ucode_data_hash());
+    return *fe;
+  }
+  int FogScaleOf(const DxbcShader* ps) {
+    if (!memo_fog) return FogScaleConstant(*ps);
+    PsTraits& t = Traits(ps);
+    if (t.fog_scale_at == -2) t.fog_scale_at = FogScaleConstant(*ps);
+    const int at = t.fog_scale_at;
+    if (g_pgr4_dev) FogMemoCheck(FogScaleConstant(*ps) == at, "the fog scale", ps->ucode_data_hash());
+    return at;
+  }
+  bool CarOf(const DxbcShader* ps) {
+    const uint64_t hash = ps->ucode_data_hash();
+    if (!memo_fog) return IsCarShader(hash);
+    PsTraits& t = Traits(ps);
+    if (t.car < 0) t.car = IsCarShader(hash) ? 1 : 0;
+    const bool car = t.car != 0;
+    if (g_pgr4_dev) FogMemoCheck(IsCarShader(hash) == car, "the car shader", hash);
+    return car;
+  }
+  // Local change (24/11/2026, pgr4_native_car_shadow_fog): the cars' shadow (UsesShadowBlend, which
+  // reads the volume) drawn its own way in the volumetric fog: the volume made this frame and given
+  // to such draws (Share::values[15], as Draw copies it into sys_sun.fog_volume). One answer per draw
+  // sets both its blend (after BuildPipelineKey) and the volume its HLSL sees (PgrShadowOurs), so
+  // that they agree.
+  bool CarShadowFogOn(const DxbcShader* ps_generic) {
+    if (!ps_generic || !REXCVAR_GET(pgr4_native_car_shadow_fog) ||
+        !replacer.UsesShadowBlend(ps_generic->ucode_data_hash()) || !FogVolumeOf(ps_generic))
+      return false;
+    // The view modes it applies with (pgr4_native_car_shadow_fog_views), read again when it changes.
+    {
+      static std::string views_text;
+      static std::vector<uint32_t> views;
+      if (const std::string& want = REXCVAR_GET(pgr4_native_car_shadow_fog_views);
+          want != views_text) {
+        views_text = want;
+        views.clear();
+        uint32_t value = 0;
+        bool digits = false;
+        for (size_t i = 0; i <= want.size(); ++i) {
+          const char ch = i < want.size() ? want[i] : ' ';
+          if (ch >= '0' && ch <= '9') {
+            value = value * 10 + uint32_t(ch - '0');
+            digits = true;
+          } else if (digits) {
+            views.push_back(value);
+            value = 0;
+            digits = false;
+          }
+        }
+        REXLOG_INFO("PGR4 native car shadow in the fog: view modes {}", want);
+      }
+      const uint32_t mode = g_pgr4_view_mode.load(std::memory_order_relaxed);
+      if (std::find(views.begin(), views.end(), mode) == views.end()) return false;
+    }
+    const Volumetrics* const v = r.volumetrics();
+    return v && v->share().volume && v->share().range && v->share().frame == r.frame_index() &&
+           v->share().values[15] > 0.5f;
+  }
+  bool FogVolumeOf(const DxbcShader* ps) {
+    const uint64_t hash = ps->ucode_data_hash();
+    if (!memo_fog) return replacer.UsesFogVolume(hash);
+    PsTraits& t = Traits(ps);
+    if (t.fog_volume < 0) t.fog_volume = replacer.UsesFogVolume(hash) ? 1 : 0;
+    const bool v = t.fog_volume != 0;
+    if (g_pgr4_dev) FogMemoCheck(replacer.UsesFogVolume(hash) == v, "the fog volume", hash);
+    return v;
+  }
+  bool FogShaderOf(const DxbcShader* ps) {
+    const uint64_t hash = ps->ucode_data_hash();
+    if (!memo_fog) return replacer.UsesFogShader(hash);
+    PsTraits& t = Traits(ps);
+    if (t.fog_shader < 0) t.fog_shader = replacer.UsesFogShader(hash) ? 1 : 0;
+    const bool v = t.fog_shader != 0;
+    if (g_pgr4_dev) FogMemoCheck(replacer.UsesFogShader(hash) == v, "the fog shader", hash);
+    return v;
+  }
+  bool ReplacedOf(const DxbcShader* ps) {
+    const uint64_t hash = ps->ucode_data_hash();
+    if (!memo_fog) return replacer.Has(hash);
+    const bool v = Traits(ps).replaced;
+    if (g_pgr4_dev) FogMemoCheck(replacer.Has(hash) == v, "the replacement", hash);
+    return v;
+  }
+
+  // Local change (24/11/2026, branch cpu_thread, --pgr4_native_draw_encode_thread): the draws on
+  // two threads, both in draw order. A (the render thread) decides everything ordered and records
+  // its commands "on the side" (CommandRecorder::Side) into the draw's packet; B (EncodeWorker)
+  // keeps its own register file (the same writes, in order), splices each packet's side commands
+  // into the recorder's ring, then packs the float constants, uploads and binds the constant
+  // buffers, the motion vectors' previous constants, sets the list state and records the draw
+  // (Encode). B is the ring's only producer while it runs; A waits for it (FlushEncode) before
+  // anything that goes past the draws: clears, resolves, queries, the Swap, a submission, a batch's
+  // end. B owns the list state (bound_*, list_dirty), the constant buffers' caches (cb_*), the
+  // constant upload pool and the motion history while it runs; A asks for their resets in the
+  // packet. Off (or without the recorder, the render thread, or with the draw log or a snapshot):
+  // Encode called in line by A, the same code in the same order.
+  struct EncodePacket {
+    std::vector<uint8_t> side;          // A's commands of this draw (ExecuteDraw's and Draw's)
+    const RegWrite* writes = nullptr;   // the register writes up to this draw, for B's file
+    uint32_t write_count = 0;
+    bool new_frame = false;             // SyncListFrame's part on B's state
+    bool keep_previous = false, prefetch = false, prefetch_whole = false;
+    uint64_t frame = 0;
+    bool reset_list = false;            // ResetListState asked by A while recording this draw
+    bool draw = false;                  // false: only the side commands, the writes and the resets
+    uint64_t regs_hash[5] = {};         // development (the probes on): A's file at this draw
+    // Encode's inputs.
+    SystemConstantsWithSun sys_sun;
+    const DxbcShader* vs = nullptr;
+    const DxbcShader* ps = nullptr;
+    const DxbcShader* vs_generic = nullptr;
+    uint32_t ui_fit = 0;
+    bool hud_full_width = false;
+    uint32_t desc_vs[64] = {}, desc_ps[64] = {};
+    uint32_t n_desc_vs = 0, n_desc_ps = 0;
+    D3D12_VIEWPORT viewport{};
+    D3D12_RECT scissor{};
+    ID3D12PipelineState* pso = nullptr;
+    D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    float depth_bias = 0.0f, slope_bias = 0.0f;
+    bool stencil_back = false;          // the back face's stencil reference
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv[DxbcShaderTranslator::kMotionVectorRenderTarget + 1] = {};
+    uint32_t rt_count = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
+    bool motion = false;
+    uint32_t index_address = 0, count = 0, primitive = 0;  // BindPreviousConstants's DrawState
+    uint8_t ibv_kind = 0;               // 0 none, 1 always set (fans), 2 set when it changed
+    D3D12_INDEX_BUFFER_VIEW ibv{};
+    bool draw_indexed = true;
+    uint32_t draw_count = 0, first_index = 0;
+    ID3D12PipelineState* cover = nullptr;  // the occlusion coverage pipeline (A: `pipelines`)
+    bool no_depth = false, shaders_selected = false;
+    float guest_per_host = 1.0f;
+    uint32_t snap_now = 0, draw_index = 0;  // the targets' snapshot (in line only)
+    BoundTargets targets;
+  };
+  static constexpr uint32_t kEncodeSlots = 256;
+  std::unique_ptr<EncodePacket[]> enc_slots;
+  EncodePacket inline_packet;                // in line (off): the same Encode
+  EncodePacket* enc_packet = nullptr;        // A's slot for the draw it is on (BeginDrawSide)
+  CommandRecorder* enc_recorder = nullptr;
+  CommandRecorder::Side enc_side;
+  std::unique_ptr<uint32_t[]> enc_regs;      // B's register file
+  const RegWrite* enc_writes = nullptr;      // the renderer's writes for the next draw
+  uint32_t enc_write_count = 0;
+  bool enc_feed = false;                     // the renderer's render thread feeds the writes
+  bool enc_fed = false;                      // ... and did for the next draw (SetEncodeWrites)
+  bool enc_on = false;                       // A: this frame on two threads
+  uint64_t enc_decided_frame = UINT64_MAX;
+  bool enc_pending_reset = false;
+  std::thread enc_thread;
+  alignas(64) std::atomic<uint64_t> enc_head{0};       // packets pushed (A)
+  alignas(64) std::atomic<uint64_t> enc_tail{0};       // packets done (B)
+  alignas(64) std::atomic<uint64_t> enc_idle{0};       // B idle and published up to this packet
+  std::atomic<uint32_t> enc_b_sleeping{0}, enc_a_waiting{0};
+  std::atomic<bool> enc_stop{false};
+  // B's counters, read and cleared by A while B is idle (FlushEncode).
+  DrawRenderer::Stats enc_stats;
+  uint64_t enc_diag_draws = 0;
+  uint64_t enc_profile[profile::kStageCount] = {};
+  uint64_t enc_profile_counters[profile::kCounterCount] = {};
+  uint64_t enc_busy_ns = 0, enc_packets = 0, enc_side_bytes = 0, enc_regs_differ = 0,
+           enc_regs_checked = 0;
+  // A's counters (the probe): its waits for B by cause, the packets' depth.
+  uint64_t enc_wait_ns[4] = {}, enc_waits[4] = {}, enc_depth_max = 0;
+  enum EncodeWait : uint32_t { kWaitFlush, kWaitSlot, kWaitSide, kWaitReset };
+  void Encode(EncodePacket& p, const uint32_t* raw, ID3D12GraphicsCommandList* list,
+              DrawRenderer::Stats& st, uint64_t& diag_draws);
+  void DoResetListState();
+  void EncodeWorker();
+  void StartEncode();
+  void StopEncode();
+  void WaitEncodeIdle(EncodeWait why);
+  void BeginDrawSide(const uint32_t* regs);
+  void EndDrawSide();
+  void FlushEncode(EncodeWait why = kWaitFlush);
+  void ApplyEncodeWrites(const RegWrite* writes, uint32_t n);
+  static void FlushFromSide(void* impl);
+  void EncodeProbeLog();
   // Once per frame (Draw): whether the capture dir is set (a string cvar read), and the 2 s period
   // of SelectPipeline's car shader logging.
   uint64_t flags_frame = UINT64_MAX;
@@ -2605,6 +2897,7 @@ struct DrawRenderer::Impl {
     memo_on = REXCVAR_GET(pgr4_native_draw_memo);
     memo_guard = REXCVAR_GET(pgr4_native_bind_memo_guard);  // local change (20/11/2026), live
     memo_hd = REXCVAR_GET(pgr4_native_bind_memo_hd);        // local change (20/11/2026), live
+    memo_fog = REXCVAR_GET(pgr4_native_draw_memo_fog);      // local change (24/11/2026, T2), live
     // Local change (20/11/2026), live: the memo switched on again starts empty (its entries were
     // not kept up to date meanwhile).
     if (const bool on = REXCVAR_GET(pgr4_native_bind_memo); on != bind_memo_on) {
@@ -2620,6 +2913,12 @@ struct DrawRenderer::Impl {
           REXLOG_INFO("PGR4 native draw: binding memo guard: {} texture(s) changed without their page "
                       "watch seeing it, uploaded again (last {:08X} {}x{} fmt{})",
                       m.count, m.address, m.width, m.height, m.format);
+        // Local change (24/11/2026, T2): the fog memo's check (development, the probes on).
+        if (fog_memo_asks)
+          REXLOG_INFO("PGR4 fog memo check: {} answers kept checked against a direct ask, {} "
+                      "different{}", fog_memo_asks, fog_memo_wrong,
+                      fog_memo_wrong ? " (DIFFERENT)" : "");
+        fog_memo_asks = fog_memo_wrong = 0;
         if (const TextureCache::MissedCount m = r.textures().TakeHdUnsettled(); m.count)
           REXLOG_INFO("PGR4 native draw: binding memo HD: {} binding(s) through Get for an HD version "
                       "not settled (last {:08X} {}x{} fmt{})",
@@ -2630,7 +2929,18 @@ struct DrawRenderer::Impl {
     if (const uint32_t bits = uint32_t(std::clamp(REXCVAR_GET(pgr4_native_bind_memo_bits), 11, 15));
         bits != bind_memo_bits)
       ResizeBindMemo(bits);
-    capture_on = !REXCVAR_GET(pgr4_native_capture_dir).empty();
+    // Local change (24/11/2026, T0): the development probes switched at a frame's start.
+    const bool probes = REXCVAR_GET(pgr4_native_dev_probes);
+    if (const bool dev = dev_build && probes; dev != race_probe.load(std::memory_order_relaxed)) {
+      race_probe = dev;
+      g_pgr4_vol_timing = dev;
+      g_pgr4_dev = dev;
+      REXLOG_INFO("PGR4 native draw: development probes {} (frame {})", dev ? "on" : "off",
+                  frame_count);
+    }
+    capture_on = probes && !REXCVAR_GET(pgr4_native_capture_dir).empty();
+    // Local change (24/11/2026, T1), live.
+    g_hang_light.store(REXCVAR_GET(pgr4_native_freeze_probe_light), std::memory_order_relaxed);
     capture_period = uint32_t(std::chrono::duration_cast<std::chrono::seconds>(
                                   std::chrono::steady_clock::now().time_since_epoch())
                                   .count() /
@@ -3042,9 +3352,10 @@ bool DrawRenderer::Impl::Initialize() {
     }
   }
   replacer.Initialize();
-  race_probe = !REXCVAR_GET(pgr4_native_capture_dir).empty();  // development (22/11/2026)
-  g_pgr4_vol_timing = race_probe;
-  g_pgr4_dev = race_probe;
+  dev_build = !REXCVAR_GET(pgr4_native_capture_dir).empty();  // development (22/11/2026)
+  race_probe = dev_build && REXCVAR_GET(pgr4_native_dev_probes);
+  g_pgr4_vol_timing = race_probe.load();
+  g_pgr4_dev = race_probe.load();
   if (REXCVAR_GET(pgr4_native_async_pipelines)) {
     pipeline_wait = REXCVAR_GET(pgr4_native_pipeline_wait);
     pipeline_wait_min = size_t(std::max(1, REXCVAR_GET(pgr4_native_pipeline_wait_min)));
@@ -3180,6 +3491,18 @@ void DrawRenderer::Impl::PipelineWorker(bool saves, bool on_wait) {
 }
 
 void DrawRenderer::Impl::ResetListState() {
+  // Local change (24/11/2026, branch cpu_thread): the list state is B's while it runs. During a
+  // draw A records on the side: B resets it at that packet, after its side commands, before its
+  // own; otherwise B is idle first.
+  if (enc_packet) {
+    enc_pending_reset = true;
+    return;
+  }
+  if (enc_on) FlushEncode(kWaitReset);
+  DoResetListState();
+}
+
+void DrawRenderer::Impl::DoResetListState() {
   list_dirty = true;
   bound_pso = nullptr;
   bound_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
@@ -4235,6 +4558,9 @@ void DrawRenderer::Impl::ResumeAwaiting(Pipeline* p) {
   p->await_desc.PS.BytecodeLength = code->size();
   p->awaiting_hlsl = false;
   p->made_with_ours = code != &p->await_ps->translated_binary();
+  // Local change (24/11/2026): ours failed: the game's shader with the game's blend (CreatePipeline).
+  if (!p->made_with_ours && replacer.UsesShadowBlend(p->await_ps->shader().ucode_data_hash()))
+    GameShadowBlend(p->await_desc.BlendState.RenderTarget[0]);
   if (!pso_threads.empty()) {
     {
       std::lock_guard<std::mutex> lock(pso_mutex);
@@ -4265,7 +4591,7 @@ void DrawRenderer::Impl::WaitForPipelines() {
   const double frame_ms = std::chrono::duration<double, std::milli>(frame_end - last_frame_end).count();
   const size_t pending_now = frame_pending.size();
   std::string pending_list;
-  if (!REXCVAR_GET(pgr4_native_capture_dir).empty()) {
+  if (capture_on) {  // local change (24/11/2026, T0): with the development probes
     for (size_t k = 0; k < frame_pending.size() && k < 8; ++k) {
       const Pipeline* q = frame_pending[k];
       pending_list += fmt::format(" {:016X}{}{}", q->ps_ucode_hash, q->awaiting_hlsl ? ":hlsl" : ":pso", q->surface ? ":surface" : "");
@@ -4308,7 +4634,7 @@ void DrawRenderer::Impl::WaitForPipelines() {
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
             .count());
   }
-  if (!REXCVAR_GET(pgr4_native_capture_dir).empty()) {
+  if (capture_on) {  // local change (24/11/2026, T0): with the development probes
     const auto done = std::chrono::steady_clock::now();
     const double wait_ms = std::chrono::duration<double, std::milli>(done - frame_end).count();
     if (frame_ms + wait_ms > 60.0)
@@ -4505,6 +4831,7 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(
   D3D12_GRAPHICS_PIPELINE_STATE_DESC d;
   std::memset(&d, 0, sizeof(d));  // padding too: PipelineLibrary hashes the bytes
   bool awaiting = false;  // local change: our HLSL compiling (Pipeline::awaiting_hlsl)
+  bool ours_ps = false;   // local change (24/11/2026): made with our HLSL
   d.pRootSignature = root_signature.Get();
   if (dynamic_depth_bias) d.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
   d.IBStripCutValue = key.strip_cut == 1   ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF
@@ -4521,6 +4848,7 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(
     const bool replaced = hash != XXH3_64bits(&key, sizeof(key));
     const std::vector<uint8_t>* code = replaced ? replacer.Get(*ps) : nullptr;
     awaiting = replaced && !code && replacer.Pending(*ps);
+    ours_ps = code != nullptr;  // local change (24/11/2026): GameShadowBlend
     if (!code) code = &ps->translated_binary();
     d.PS.pShaderBytecode = code->data();
     d.PS.BytecodeLength = code->size();
@@ -4581,6 +4909,11 @@ DrawRenderer::Impl::Pipeline* DrawRenderer::Impl::CreatePipeline(
     b.LogicOp = D3D12_LOGIC_OP_NOOP;
     b.RenderTargetWriteMask = rt.mask;
   }
+  // Local change (24/11/2026): the cars' shadow keyed with our blend (Draw, CarShadowFogOn) made
+  // with the game's shader (the pipeline kept as the game's while ours compiles, or ours failed):
+  // the game's blend back, the one its output is for. Awaiting ours: ResumeAwaiting decides.
+  if (ps && !ours_ps && !awaiting && replacer.UsesShadowBlend(ps->shader().ucode_data_hash()))
+    GameShadowBlend(d.BlendState.RenderTarget[0]);
   if (ps && DxbcShaderTranslator::Modification(ps->modification()).pixel.motion_vectors) {
     constexpr uint32_t kMotion = DxbcShaderTranslator::kMotionVectorRenderTarget;
     d.NumRenderTargets = kMotion + 1;
@@ -4683,6 +5016,7 @@ static bool FogVariantModification(const DxbcShader& ps, uint64_t mod, uint64_t*
 
 void DrawRenderer::Impl::PrecompileAndExit() {
   race_probe = false;  // development: the precompile's jobs are no draw's (before any is queued)
+  dev_build = false;   // local change (24/11/2026): nor switched on again at a frame (T0)
   g_pgr4_vol_timing = false;
   const std::vector<PipelineStore::Pipeline>& list = store.loaded_pipelines();
   auto load = [&](uint64_t hash, xenos::ShaderType type) -> DxbcShader* {
@@ -5907,13 +6241,25 @@ void DrawRenderer::Impl::SyncListFrame() {
   // frames' constants may have been recycled.
   list_frame = r.frame_index();
   opaque_taken = false;
-  ResetListState();
   shared_state = D3D12_RESOURCE_STATE_COMMON;
-  for (CachedCbv* cb : Cbvs()) cb->Reset();
   // The motion vector pass reads the previous frame's constants where that frame uploaded them.
-  constant_upload.set_keep_previous_frame(r.upscaler() != nullptr);
-  motion_history.BeginFrame(list_frame, REXCVAR_GET(pgr4_native_motion_prefetch),
-                            REXCVAR_GET(pgr4_native_motion_prefetch_whole));
+  const bool keep_previous = r.upscaler() != nullptr;
+  const bool prefetch = REXCVAR_GET(pgr4_native_motion_prefetch);
+  const bool prefetch_whole = REXCVAR_GET(pgr4_native_motion_prefetch_whole);
+  // Local change (24/11/2026, branch cpu_thread): B's state reset by B, at this draw's packet.
+  if (enc_packet) {
+    enc_packet->new_frame = true;
+    enc_packet->frame = list_frame;
+    enc_packet->keep_previous = keep_previous;
+    enc_packet->prefetch = prefetch;
+    enc_packet->prefetch_whole = prefetch_whole;
+    return;
+  }
+  if (enc_on) FlushEncode(kWaitReset);
+  DoResetListState();
+  for (CachedCbv* cb : Cbvs()) cb->Reset();
+  constant_upload.set_keep_previous_frame(keep_previous);
+  motion_history.BeginFrame(list_frame, prefetch, prefetch_whole);
 }
 
 DxbcShader::Translation* DrawRenderer::Impl::Translated(DxbcShader& shader, uint64_t modification) {
@@ -7104,8 +7450,12 @@ static int FogScaleConstant(const DxbcShader& shader) {
 
 
 void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
-  // Local change (22/11/2026): the freeze probe.
-  g_hang_draws.fetch_add(1, std::memory_order_relaxed);
+  // Local change (22/11/2026): the freeze probe. Light (24/11/2026, T1): this thread is the
+  // count's only writer (the watchdog only reads it), so no locked add.
+  if (g_hang_light.load(std::memory_order_relaxed))
+    g_hang_draws.store(g_hang_draws.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+  else
+    g_hang_draws.fetch_add(1, std::memory_order_relaxed);
   HangMark hang_mark(HangWhat::kDrawing);
   // Local change (18/11/2026): the recorder while it is on (command_recorder.h).
   ID3D12GraphicsCommandList* list = r.recording_list();
@@ -7271,9 +7621,9 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f &&
       !(REXCVAR_GET(pgr4_native_volumetric_in_shader_no_sky) &&
         IsSkyShader(ps_generic->ucode_data_hash())) &&
-      (!replacer.Has(ps->ucode_data_hash()) || replacer.UsesFogShader(ps->ucode_data_hash()))) {
+      (!ReplacedOf(ps) || FogShaderOf(ps))) {  // local change (24/11/2026, T2): kept per shader
     HangStep(1000 + 2);  // local change: the freeze probe's step
-    const FogEnding& fe = FindFogEnding(*ps);
+    const FogEnding& fe = FogEndingOf(ps);
     if (fe.form && fe.address >= 0 && fe.address < 2048) {
       DxbcShaderTranslator::Modification m(mods.pixel);
       m.pixel.fog_form = uint32_t(fe.form);
@@ -7578,6 +7928,25 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   // one (grey sheets over the road). Drawn behind everything, its depth hides nothing.
   if (ps_generic && IsSkyShader(ps_generic->ucode_data_hash()) && !OriginalLook())
     key.depth_write = 0;
+  // Local change (24/11/2026, pgr4_native_car_shadow_fog): the cars' shadow in the volumetric fog
+  // (CarShadowFogOn): src + dst x src.a in color, the dst's alpha kept, over the game's dst x src
+  // (and dst alpha x src alpha, its alpha 1): its HLSL then returns the fog's light given back and
+  // the ground's share kept (71DABE33068D02F5.ps.hlsl). Only over that blend of the game's; any
+  // other, the game's way (the volume then not given to it, below).
+  bool car_shadow_fog = CarShadowFogOn(ps_generic);
+  if (car_shadow_fog) {
+    PipelineKey::Rt& rt = key.rt[0];
+    if (rt.blend && rt.mask && rt.src == uint8_t(BlendFactor::kZero) &&
+        rt.dst == uint8_t(BlendFactor::kSrcColor) && rt.op == 0 &&
+        rt.src_a == uint8_t(BlendFactor::kZero) && rt.dst_a == uint8_t(BlendFactor::kSrcAlpha) &&
+        rt.op_a == 0) {
+      rt.src = uint8_t(BlendFactor::kOne);
+      rt.dst = uint8_t(BlendFactor::kSrcAlpha);
+      rt.dst_a = uint8_t(BlendFactor::kOne);
+    } else {
+      car_shadow_fog = false;
+    }
+  }
   if (ps_generic && ps_generic->ucode_data_hash() == kRainShader && vs_generic) [[unlikely]] {
     RainDraw& d = rain_draws[vs_generic->ucode_data_hash()];
     ++d.draws;
@@ -8476,7 +8845,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         // The volumetric fog's sun (volumetrics.cpp): the scenery's only. At night the cars' shaders
         // still read a key light (2.5 in Las Vegas, 21/11/2026, whiter than the day's sun) that lights
         // nothing of the scenery, whose lighting is in its maps: the fog lit by it went white.
-        const bool car = IsCarShader(ps->ucode_data_hash());
+        const bool car = CarOf(ps);  // local change (24/11/2026, T2): kept per shader
         if (!car) {
           for (int k = 0; k < 3; ++k) {
             g_pgr4_sun_dir[k].store(sun.direction[k], std::memory_order_relaxed);
@@ -8514,7 +8883,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       // fog by its code (FogScaleConstant: exp of c10.w times the distance), as the volumetric's
       // copy (pgr4_native_volumetric_fog_from_code); any draw reading c10 gave its own, the last of
       // the frame winning: the GTAO's distant occlusion flickered (Tazz, MSAA, its occlusion view).
-      const bool fog_code = FogScaleConstant(*ps) >= 0;
+      const bool fog_code = FogScaleOf(ps) >= 0;  // local change (24/11/2026, T2)
       if (g_pgr4_dev) {  // development: the densities the draws give, every 2 s (the probe below)
         std::lock_guard<std::mutex> lock(g_gtao_fog_probe_mutex);
         ++g_gtao_fog_probe.all[density];
@@ -8542,7 +8911,14 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   // every 2 s while the volumetric option is on: the distance fog (c10.w per metre, c10.rgb its
   // color), the height fog (bool 158 on: c11.x its layer's height, c11.y its density, c11.z its
   // falloff; the eye's height c5.y), their ranges over the draws that read c11.
-  if (ps && Upscaler::IsScene(sdr.rb_surface_info) && REXCVAR_GET(pgr4_native_volumetric)) {
+  // Local change (24/11/2026, the CPU audit's T3, Tazz: « tu l'intègres direct »): only while the
+  // volumetric fog runs (Volumetrics::Enabled: the launcher's VOLUMETRIC EFFECTS, added on
+  // 22/11/2026 to Enabled and fog_where but not here, the game's option, a race's screens or its
+  // loading, not the original look). All this block's outputs are read by Volumetrics::Apply,
+  // which returns at once without Enabled (volumetrics.cpp), or by development probes: before, it
+  // ran at every scene draw for nothing in the menus, with F2's original look, or unticked in the
+  // launcher with the game's option still on.
+  if (ps && Upscaler::IsScene(sdr.rb_surface_info) && Volumetrics::Enabled()) {
     HangStep(1000 + 8);  // local change: the freeze probe's step
     const Pgr4VolTimer vol_timer(0);  // development (22/11/2026)
     const Shader::ConstantRegisterMap& pmap = ps->constant_register_map();
@@ -8567,7 +8943,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       // The volumetric fog's copy of the game's (volumetrics.cpp): the last scene draw's whose
       // shader's fog code was read (its scale where it has it, its eye c5 read too).
       const bool from_code = REXCVAR_GET(pgr4_native_volumetric_fog_from_code);
-      const int scale_at = FogScaleConstant(*ps);
+      const int scale_at = FogScaleOf(ps);  // local change (24/11/2026, T2)
       const bool full = scale_at >= 0 && ((pmap.float_bitmap[0] >> 5) & 1) &&
                         ((pmap.float_bitmap[0] >> 10) & 1);
       const float scale = full ? regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + scale_at)
@@ -8955,7 +9331,10 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       fs = FirstStats{};
     }
   }
-  SystemConstantsWithSun sys_sun;
+  // Local change (24/11/2026, branch cpu_thread): straight into the draw's packet (B's slot, or
+  // the in-line one), every field written at each draw (FillSystemConstants clears `sys`).
+  EncodePacket& pk = enc_packet ? *enc_packet : inline_packet;
+  SystemConstantsWithSun& sys_sun = pk.sys_sun;
   DxbcShaderTranslator::SystemConstants& sys = sys_sun.sys;
   FillSystemConstants(s, regs, prim, polygonal, index_endian, vp, used_textures, signs, targets,
                       sys);
@@ -8969,9 +9348,13 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     sys.flags |= DxbcShaderTranslator::kSysFlag_MotionCameraOnly;
   // The game's fog ending's mode (Modification::pixel.fog_form), read at each draw (live).
   if (fog_in_shader) {
-    const uint32_t fog_mode = uint32_t(std::clamp(REXCVAR_GET(pgr4_native_volumetric_in_shader_mode), 0, 2));
+    const uint32_t fog_mode = uint32_t(std::clamp(REXCVAR_GET(pgr4_native_volumetric_in_shader_mode), 0, 3));
     sys.flags = (sys.flags & ~(3u << DxbcShaderTranslator::kSysFlag_FogMode_Shift)) |
                 (fog_mode << DxbcShaderTranslator::kSysFlag_FogMode_Shift);
+    if (REXCVAR_GET(pgr4_native_volumetric_fog_t_swizzle))
+      sys.flags |= DxbcShaderTranslator::kSysFlag_FogTFromSwizzle;
+    else
+      sys.flags &= ~uint32_t(DxbcShaderTranslator::kSysFlag_FogTFromSwizzle);
   }
   // Its probe: the draws given the modification by mode, those left out (one of ours in HLSL, no
   // ending, its address too far), every 2 s.
@@ -8979,10 +9362,10 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       Upscaler::IsScene(sdr.rb_surface_info)) {
     HangStep(1000 + 12);  // local change: the freeze probe's step
     const Pgr4VolTimer vol_timer(4);  // development (22/11/2026)
-    static uint64_t in_shader_draws[3] = {}, hlsl_draws = 0, no_ending = 0, far_address = 0;
+    static uint64_t in_shader_draws[4] = {}, hlsl_draws = 0, no_ending = 0, far_address = 0;
     static auto in_shader_last = std::chrono::steady_clock::now();
     if (fog_in_shader) {
-      ++in_shader_draws[std::clamp(REXCVAR_GET(pgr4_native_volumetric_in_shader_mode), 0, 2)];
+      ++in_shader_draws[std::clamp(REXCVAR_GET(pgr4_native_volumetric_in_shader_mode), 0, 3)];
     } else {
       const FogEnding& fe = FindFogEnding(*ps_generic);
       if (!fe.form) ++no_ending;
@@ -8993,13 +9376,14 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     if (const auto now = std::chrono::steady_clock::now(); now - in_shader_last >= std::chrono::seconds(2)) {
       in_shader_last = now;
       REXLOG_INFO("PGR4 volumetric in shader ({}, mode {}): scene draws with the fog taken in the "
-                  "shader: mode 0 {}, mode 1 {}, mode 2 {}; left out: ours in HLSL {}, no fog ending "
+                  "shader: mode 0 {}, mode 1 {}, mode 2 {}, mode 3 {}; left out: ours in HLSL {}, no fog ending "
                   "{}, address past 2047 {}{}",
                   REXCVAR_GET(pgr4_native_volumetric_in_shader) ? "on" : "off",
                   REXCVAR_GET(pgr4_native_volumetric_in_shader_mode), in_shader_draws[0],
-                  in_shader_draws[1], in_shader_draws[2], hlsl_draws, no_ending, far_address,
+                  in_shader_draws[1], in_shader_draws[2], in_shader_draws[3], hlsl_draws, no_ending,
+                  far_address,
                   far_address ? " ADDRESS TOO FAR" : "");
-      in_shader_draws[0] = in_shader_draws[1] = in_shader_draws[2] = 0;
+      in_shader_draws[0] = in_shader_draws[1] = in_shader_draws[2] = in_shader_draws[3] = 0;
       hlsl_draws = no_ending = far_address = 0;
     }
   }
@@ -9127,7 +9511,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   // The fog laid by the shader (fog_in_shader): SystemConstants::fog_shader, its last value 0 (the
   // game's fog kept) unless the volume was made this frame.
   std::memset(sys.fog_shader, 0, sizeof(sys.fog_shader));
-  const bool flags_volume = ps_generic && replacer.UsesFogVolume(ps_generic->ucode_data_hash());
+  const bool flags_volume = ps_generic && FogVolumeOf(ps_generic);  // local change (24/11/2026, T2)
   if (flags_volume || fog_in_shader) {
     HangStep(1000 + 13);  // local change: the freeze probe's step
     const Pgr4VolTimer vol_timer(5);  // development (22/11/2026)
@@ -9166,20 +9550,99 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       }
       if (flags_volume) {
         std::memcpy(sys_sun.fog_volume, sh.values, sizeof(sys_sun.fog_volume));
+        // Local change (24/11/2026): the cars' shadow drawn the game's way (car_shadow_fog false:
+        // the switch off, another blend) sees no volume (its HLSL's PgrShadowOurs false).
+        if (!car_shadow_fog && replacer.UsesShadowBlend(ps_generic->ucode_data_hash()))
+          sys_sun.fog_volume[15] = 0.0f;
         ++given;
       }
       if (fog_in_shader) {
         std::memcpy(sys.fog_shader, sh.shader, sizeof(sys.fog_shader));
         ++shader_given;
+        // Development: mode 3's second view (the volume made: 1; this view: 2).
+        if (const int32_t view = REXCVAR_GET(pgr4_native_volumetric_in_shader_debug_view);
+            sys.fog_shader[15] > 0.5f && view >= 1 && view <= 4)
+          sys.fog_shader[15] = 1.0f + float(view);
         // This draw's own scale after the fog and c10 (pgr4_native_volumetric_in_shader_own_scale),
         // and their probe: by shader, the values against the volume's, every 2 s.
-        const FogEnding& fe = FindFogEnding(*ps);
+        const FogEnding& fe = FogEndingOf(ps);  // local change (24/11/2026, T2)
         const auto pc = [&](int reg, int k) {
           return regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + reg * 4 + k);
         };
         const float post = fe.post_c >= 0 ? pc(fe.post_c, fe.post_comp) : 1.0f;
         const float own_inv = post > 0.0f && std::isfinite(post) ? 1.0f / post : 1.0f;
         const float own_c10[3] = {pc(10, 0), pc(10, 1), pc(10, 2)};
+        // Development (23/11/2026, pgr4_native_volumetric_tree_fog_probe): the trees' shaders'
+        // fog constants, by shader, every 2 s.
+        if (g_pgr4_dev && REXCVAR_GET(pgr4_native_volumetric_tree_fog_probe)) {
+          const uint64_t ph = ps_generic->ucode_data_hash();
+          // The billboards' LOD (its variants by bools too), the near billboards, the trees.
+          const bool lod = ph == 0x14895469FF7619D8ull || ph == 0xB8F68FE56E3BAB98ull ||
+                           ph == 0xDF3DF150367F0733ull;
+          const bool tree = lod || ph == 0x81877027139C7BF5ull || ph == 0x9B7F58E4AA0701CEull ||
+                            ph == 0xF797C4DF8C6B6E5Eull || ph == 0xF721A5038AE73E8Bull;
+          if (tree) {
+            struct TreeFog {
+              uint64_t draws = 0, blended = 0, depth_write = 0, alpha_test = 0;
+              uint32_t src = 0, dst = 0;
+              float alpha_ref = 0.0f;
+              bool lod = false;
+              float ps[5][4] = {}, vs[5][4] = {};  // the last draw's
+              float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+              uint32_t bools = 0;
+            };
+            static std::map<uint64_t, TreeFog> tree_fog;
+            static auto tree_fog_last = std::chrono::steady_clock::now();
+            TreeFog& t = tree_fog[ph];
+            ++t.draws;
+            t.lod = lod;
+            t.blended += key.rt[0].blend != 0;
+            t.src = uint32_t(key.rt[0].src);
+            t.dst = uint32_t(key.rt[0].dst);
+            t.depth_write += key.depth_write;
+            const bool at = regs.Get<reg::RB_COLORCONTROL>().alpha_test_enable;
+            t.alpha_test += at;
+            t.alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
+            static constexpr int kPs[5] = {10, 11, 12, 255, 98};
+            static constexpr int kVs[5] = {24, 51, 55, 97, 255};
+            for (int i = 0; i < 5; ++i)
+              for (int k = 0; k < 4; ++k) {
+                t.ps[i][k] = pc(kPs[i], k);
+                t.vs[i][k] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + kVs[i] * 4 + k);
+              }
+            const uint32_t* b = &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
+            t.bools = ((b[128 / 32] >> (128 % 32)) & 1) | ((b[158 / 32] >> (158 % 32)) & 1) << 1 |
+                      ((b[253 / 32] >> (253 % 32)) & 1) << 2;
+            // The game's T at 100, 450, 2000 m by its formula, without the height part.
+            static constexpr float kAt[3] = {100.0f, 450.0f, 2000.0f};
+            const float scale = lod ? pc(255, 3) : pc(255, 0);
+            for (int i = 0; i < 3; ++i) {
+              const float tg = std::exp2(scale * -kAt[i] * pc(10, 3));
+              t.lo[i] = std::min(t.lo[i], tg);
+              t.hi[i] = std::max(t.hi[i], tg);
+            }
+            if (const auto now = std::chrono::steady_clock::now(); now - tree_fog_last >= std::chrono::seconds(2)) {
+              tree_fog_last = now;
+              for (auto& [hash, q] : tree_fog) {
+                auto v4 = [](const float* v) {
+                  return fmt::format("{:.5g} {:.5g} {:.5g} {:.5g}", v[0], v[1], v[2], v[3]);
+                };
+                REXLOG_INFO(
+                    "PGR4 tree fog probe: {:016X}{} {} draws ({} blended, src {} dst {}; {} "
+                    "writing depth; {} alpha tested, ref {:.3f}); bools 128 {} 158 {} 253 {}; "
+                    "PS c10 {} | c11 {} | c12 {} | c255 {} | c98 {}; VS c24 {} | c51 {} | c55 {} | "
+                    "c97 {} | c255 {}; the game's T (c255.{}, no height) at 100 m {:.4f}..{:.4f}, "
+                    "450 m {:.4f}..{:.4f}, 2000 m {:.4f}..{:.4f}",
+                    hash, q.lod ? " (billboards' LOD)" : "", q.draws, q.blended, q.src, q.dst,
+                    q.depth_write, q.alpha_test, q.alpha_ref, q.bools & 1, (q.bools >> 1) & 1,
+                    (q.bools >> 2) & 1, v4(q.ps[0]), v4(q.ps[1]), v4(q.ps[2]), v4(q.ps[3]),
+                    v4(q.ps[4]), v4(q.vs[0]), v4(q.vs[1]), v4(q.vs[2]), v4(q.vs[3]), v4(q.vs[4]),
+                    q.lod ? "w" : "x", q.lo[0], q.hi[0], q.lo[1], q.hi[1], q.lo[2], q.hi[2]);
+              }
+              tree_fog.clear();
+            }
+          }
+        }
         if (REXCVAR_GET(pgr4_native_volumetric_in_shader_own_scale)) {
           sys.fog_shader[11] = own_inv;
           for (int k = 0; k < 3; ++k) sys.fog_shader[12 + k] = own_c10[k];
@@ -9596,14 +10059,6 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   sys.textures_resolution_scaled = resolution_scaled;
   profile::Mark(profile::kSysConst);
 
-  // Float constants packed by the shaders' maps (UpdateBindings), compared and staged in place.
-  PackFloats(cb_float_vs, vs, s.regs, XE_GPU_REG_SHADER_CONSTANT_000_X);
-  // Local change (pgr4 project): the render height's HUD; a menu's full-screen background keeps
-  // the game's width, stretched to the whole frame.
-  if (ui_fit == 2) FitHudOrtho(cb_float_vs, vs, hud_full_width);
-  PackFloats(cb_float_ps, ps, s.regs, XE_GPU_REG_SHADER_CONSTANT_256_X);
-  profile::Mark(profile::kPack);
-
   // Vertex data and indices into shared memory (made by Prepare with `prep`).
   const uint32_t index_bytes = count * (s.index_32bit ? 4u : 2u);
   const bool fan = prim == xenos::PrimitiveType::kTriangleFan;
@@ -9619,19 +10074,136 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   FlushCopies(list);
   profile::Mark(profile::kVertices);
 
+  // Local change (24/11/2026, branch cpu_thread): what Encode records, decided here (A) into the
+  // draw's packet; Encode then packs and uploads the constants and records the draw, in line or
+  // on B (EncodeWorker). The fans' indices (the vertex upload), the motion vectors' target (its
+  // barrier and clear) and the occlusion's coverage pipeline (the pipelines' table) are A's.
   // Fixed-function state, in the targets' host pixels. The pixel position PsParamGen gives
   // stays in host pixels: the scene's shader that reads it in the race (3F533EA17A8E6CFC, draw
   // logs of td-265) uses only its facing sign.
   const float sx = targets.scale.factor(0), sy = targets.scale.factor(1);
-  D3D12_VIEWPORT viewport = {float(vp.xy_offset[0]) * sx,
-                             float(vp.xy_offset[1]) * sy,
-                             float(vp.xy_extent[0]) * sx,
-                             float(vp.xy_extent[1]) * sy,
-                             vp.z_min,
-                             vp.z_max};
-  const D3D12_RECT scissor_rect = targets.scale.Rect(
+  pk.viewport = {float(vp.xy_offset[0]) * sx,
+                 float(vp.xy_offset[1]) * sy,
+                 float(vp.xy_extent[0]) * sx,
+                 float(vp.xy_extent[1]) * sy,
+                 vp.z_min,
+                 vp.z_max};
+  pk.scissor = targets.scale.Rect(
       {LONG(scissor.offset[0]), LONG(scissor.offset[1]),
        LONG(scissor.offset[0] + scissor.extent[0]), LONG(scissor.offset[1] + scissor.extent[1])});
+  pk.draw_count = count;
+  pk.first_index = 0;
+  pk.draw_indexed = true;
+  pk.ibv_kind = 0;
+  if (fan) {
+    if (count < 3) {
+      ++stats.skipped;
+      return;
+    }
+    const FanIndices f = prep ? FanIndices{prep->fan_indices, prep->fan_count, prep->fan_wide}
+                              : UploadFanIndices(s, r.frame_fence());
+    if (!f.count) {
+      ++stats.failed;
+      return;
+    }
+    pk.ibv.BufferLocation = f.gpu;
+    pk.ibv.SizeInBytes = f.count * (f.wide ? 4 : 2);
+    pk.ibv.Format = f.wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+    pk.ibv_kind = 1;
+    pk.draw_count = f.count;
+  } else if (s.indexed) {
+    // The whole shared memory buffer is the index buffer and the draw starts at the guest
+    // address, so consecutive draws only rebind it when the index format changes.
+    const uint32_t index_size = s.index_32bit ? 4u : 2u;
+    const bool aligned = (s.index_address & (index_size - 1)) == 0;
+    pk.ibv.BufferLocation = aligned ? shared_gpu : shared_gpu + s.index_address;
+    pk.ibv.SizeInBytes = aligned ? kSharedMemorySize : index_bytes;
+    pk.ibv.Format = s.index_32bit ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+    pk.ibv_kind = 2;
+    pk.first_index = aligned ? s.index_address / index_size : 0;
+  } else {
+    pk.draw_indexed = false;
+  }
+  // Render targets: only the ones the pipeline declares (the guest's, null ones up to the motion
+  // vectors with them), the DSV only when it is used.
+  std::memset(pk.rtv, 0, sizeof(pk.rtv));
+  pk.rt_count = key.num_rts;
+  if (motion) {
+    pk.rt_count = DxbcShaderTranslator::kMotionVectorRenderTarget + 1;
+    for (uint32_t i = 0; i < DxbcShaderTranslator::kMotionVectorRenderTarget; ++i)
+      pk.rtv[i] = targets.rtv[i];
+    pk.rtv[DxbcShaderTranslator::kMotionVectorRenderTarget] = r.upscaler()->MotionTarget(list);
+  } else {
+    for (uint32_t i = 0; i < key.num_rts; ++i) pk.rtv[i] = targets.rtv[i];
+  }
+  pk.dsv = {};
+  if (key.dsv != DXGI_FORMAT_UNKNOWN) pk.dsv = targets.dsv;
+  // Occlusion: Encode takes the pair (the queries are begun and ended by ExecuteQuery, which B
+  // never overlaps). Without a depth target nothing is tested, and every sample passes. A
+  // generic pipeline's shaders differ from the key's, which the bindings were made for, and a
+  // coverage pipeline still compiling leaves the pair uncounted rather than reported fully
+  // visible. The coverage pipeline asked for whenever the queries count (before: only once a
+  // pair was taken; the same pipeline, compiled in the background).
+  pk.no_depth = key.dsv == DXGI_FORMAT_UNKNOWN;
+  pk.shaders_selected = vs == vs_selected && ps == ps_selected;
+  pk.cover = nullptr;
+  if (OcclusionQueries* const occlusion = r.occlusion();
+      occlusion && occlusion->counting() && !pk.no_depth && pk.shaders_selected)
+    pk.cover = CoveragePipeline(key, *vst, pst);
+  {
+    const RenderTarget* const t = targets.depth ? targets.depth : targets.color[0];
+    pk.guest_per_host =
+        t ? float(t->edram_samples) /
+                (float(t->samples) * targets.scale.factor(0) * targets.scale.factor(1))
+          : 1.0f;
+  }
+  pk.vs = vs;
+  pk.ps = ps;
+  pk.vs_generic = vs_generic;
+  pk.ui_fit = ui_fit;
+  pk.hud_full_width = hud_full_width;
+  pk.n_desc_vs = n_desc_vs;
+  pk.n_desc_ps = n_desc_ps;
+  std::memcpy(pk.desc_vs, desc_vs, n_desc_vs * 4);
+  std::memcpy(pk.desc_ps, desc_ps, n_desc_ps * 4);
+  pk.pso = pso;
+  pk.topology = topology;
+  pk.depth_bias = depth_bias;
+  pk.slope_bias = slope_bias;
+  pk.stencil_back = polygonal && depth_control.backface_enable && sc.cull_front && !sc.cull_back;
+  pk.motion = motion;
+  pk.index_address = s.index_address;
+  pk.count = s.count;
+  pk.primitive = s.primitive;
+  // The targets' snapshot reads them in line (A): on two threads it waits for a frame in line
+  // (BeginDrawSide turns them off while one is asked).
+  pk.snap_now = enc_packet ? 0 : snap_now;
+  pk.draw_index = draw_index;
+  pk.targets = targets;
+  pk.draw = true;
+  if (!enc_packet) {
+    Encode(pk, s.regs, list, stats, diag.draws);
+    return;
+  }
+  // Development (the probes on): B checks its register file against A's at every 64th draw
+  // (80 KB hashed on each side: a few us).
+  if (g_pgr4_dev && (draw_index & 63) == 0) HashRegisterBlocks(s.regs, pk.regs_hash);
+}
+
+// Local change (24/11/2026, branch cpu_thread): a draw's packing, constant buffers and recording,
+// from its packet and the register file at that draw (A's in line, B's on two threads); `st` and
+// `diag_draws` the thread's counters. The code that ended Draw before, in the same order.
+void DrawRenderer::Impl::Encode(EncodePacket& p, const uint32_t* raw,
+                                ID3D12GraphicsCommandList* list, DrawRenderer::Stats& st,
+                                uint64_t& diag_draws) {
+  const RegisterFile& regs = *reinterpret_cast<const RegisterFile*>(raw);
+  // Float constants packed by the shaders' maps (UpdateBindings), compared and staged in place.
+  PackFloats(cb_float_vs, p.vs, raw, XE_GPU_REG_SHADER_CONSTANT_000_X);
+  // Local change (pgr4 project): the render height's HUD; a menu's full-screen background keeps
+  // the game's width, stretched to the whole frame.
+  if (p.ui_fit == 2) FitHudOrtho(cb_float_vs, p.vs, p.hud_full_width);
+  PackFloats(cb_float_ps, p.ps, raw, XE_GPU_REG_SHADER_CONSTANT_256_X);
+  profile::Mark(profile::kPack);
 
   // Root state.
   if (list_dirty) {
@@ -9645,45 +10217,52 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     list->SetGraphicsRootDescriptorTable(kBindlessRoot_ViewHeap, table);
     list_dirty = false;
   }
-  static_assert(sizeof(sys_sun) <= CachedCbv::kMaxSize);
+  static_assert(sizeof(p.sys_sun) <= CachedCbv::kMaxSize);
   bool ok =
-      UploadCbv(cb_system, &sys_sun, sizeof(sys_sun), kBindlessRoot_SystemConstants, list) &&
+      UploadCbv(cb_system, &p.sys_sun, sizeof(p.sys_sun), kBindlessRoot_SystemConstants, list) &&
       CommitCbv(cb_float_vs, kBindlessRoot_FloatConstantsVertex, list) &&
       CommitCbv(cb_float_ps, kBindlessRoot_FloatConstantsPixel, list) &&
       UploadCbv(cb_bool_loop, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], (8 + 32) * 4,
                 kBindlessRoot_BoolLoopConstants, list) &&
       UploadCbv(cb_fetch, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 32 * 6 * 4,
                 kBindlessRoot_FetchConstants, list) &&
-      UploadCbv(cb_desc_vs, desc_vs, n_desc_vs * 4, kBindlessRoot_DescriptorIndicesVertex, list) &&
-      UploadCbv(cb_desc_ps, desc_ps, n_desc_ps * 4, kBindlessRoot_DescriptorIndicesPixel, list);
+      UploadCbv(cb_desc_vs, p.desc_vs, p.n_desc_vs * 4, kBindlessRoot_DescriptorIndicesVertex,
+                list) &&
+      UploadCbv(cb_desc_ps, p.desc_ps, p.n_desc_ps * 4, kBindlessRoot_DescriptorIndicesPixel,
+                list);
   if (!ok) {
-    ++stats.failed;
+    ++st.failed;
     return;
   }
-  if (motion) {
+  if (p.motion) {
     profile::Scope motion_scope(profile::kCbvMotion);  // local change
-    BindPreviousConstants(s, *vs_generic, vs, list);
+    DrawState ds;
+    ds.regs = raw;
+    ds.index_address = p.index_address;
+    ds.count = p.count;
+    ds.primitive = p.primitive;
+    BindPreviousConstants(ds, *p.vs_generic, p.vs, list);
   }
   profile::Mark(profile::kCbv);
-  if (bound_pso != pso) {
+  if (bound_pso != p.pso) {
     profile::Scope rec_pso(profile::kRecPso);  // local change
-    list->SetPipelineState(pso);
-    bound_pso = pso;
+    list->SetPipelineState(p.pso);
+    bound_pso = p.pso;
     // SetPipelineState loads the pipeline's depth bias, dynamic or not (DirectX-Specs
     // VulkanOn12, "initial dynamic depth bias state"). These pipelines are keyed with zero bias.
     if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
   }
-  if (bound_topology != topology) {
-    list->IASetPrimitiveTopology(topology);
-    bound_topology = topology;
+  if (bound_topology != p.topology) {
+    list->IASetPrimitiveTopology(p.topology);
+    bound_topology = p.topology;
   }
-  if (std::memcmp(&bound_viewport, &viewport, sizeof(viewport))) {
-    list->RSSetViewports(1, &viewport);
-    bound_viewport = viewport;
+  if (std::memcmp(&bound_viewport, &p.viewport, sizeof(p.viewport))) {
+    list->RSSetViewports(1, &p.viewport);
+    bound_viewport = p.viewport;
   }
-  if (std::memcmp(&bound_scissor, &scissor_rect, sizeof(scissor_rect))) {
-    list->RSSetScissorRects(1, &scissor_rect);
-    bound_scissor = scissor_rect;
+  if (std::memcmp(&bound_scissor, &p.scissor, sizeof(p.scissor))) {
+    list->RSSetScissorRects(1, &p.scissor);
+    bound_scissor = p.scissor;
   }
   float blend[4] = {
       regs.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
@@ -9693,97 +10272,50 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     std::memcpy(bound_blend, blend, sizeof(blend));
   }
   {
-    const bool bf = polygonal && depth_control.backface_enable && sc.cull_front && !sc.cull_back;
-    uint32_t ref = regs.Get<reg::RB_STENCILREFMASK>(bf ? XE_GPU_REG_RB_STENCILREFMASK_BF
-                                                       : XE_GPU_REG_RB_STENCILREFMASK)
+    uint32_t ref = regs.Get<reg::RB_STENCILREFMASK>(p.stencil_back ? XE_GPU_REG_RB_STENCILREFMASK_BF
+                                                                   : XE_GPU_REG_RB_STENCILREFMASK)
                        .stencilref;
     if (ref != bound_stencil_ref) {
       list->OMSetStencilRef(ref);
       bound_stencil_ref = ref;
     }
   }
-  if (dynamic_depth_bias && (depth_bias != bound_depth_bias || slope_bias != bound_slope_bias)) {
+  if (dynamic_depth_bias &&
+      (p.depth_bias != bound_depth_bias || p.slope_bias != bound_slope_bias)) {
     // Local change: recorded with the recorder, whose replay makes it on the real list's
     // ID3D12GraphicsCommandList9 in order (a List9 of the real list here would go before).
     if (CommandRecorder* recorder = CommandRecorder::From(list)) {
-      recorder->RSSetDepthBias(depth_bias, 0.0f, slope_bias);
+      recorder->RSSetDepthBias(p.depth_bias, 0.0f, p.slope_bias);
     } else {
       if (list9_of != list) {
         list9.Reset();
         list->QueryInterface(IID_PPV_ARGS(&list9));
         list9_of = list;
       }
-      if (list9) list9->RSSetDepthBias(depth_bias, 0.0f, slope_bias);
+      if (list9) list9->RSSetDepthBias(p.depth_bias, 0.0f, p.slope_bias);
     }
-    bound_depth_bias = depth_bias;
-    bound_slope_bias = slope_bias;
+    bound_depth_bias = p.depth_bias;
+    bound_slope_bias = p.slope_bias;
   }
-  // Render targets: only the ones the pipeline declares (the guest's, null ones up to the motion
-  // vectors with them), the DSV only when it is used.
   std::optional<profile::Scope> rec_rtv(std::in_place, profile::kRecRtv);  // local change
-  D3D12_CPU_DESCRIPTOR_HANDLE rtv[DxbcShaderTranslator::kMotionVectorRenderTarget + 1] = {};
-  uint32_t rt_count = key.num_rts;
-  if (motion) {
-    rt_count = DxbcShaderTranslator::kMotionVectorRenderTarget + 1;
-    for (uint32_t i = 0; i < DxbcShaderTranslator::kMotionVectorRenderTarget; ++i)
-      rtv[i] = targets.rtv[i];
-    rtv[DxbcShaderTranslator::kMotionVectorRenderTarget] = r.upscaler()->MotionTarget(list);
-  } else {
-    for (uint32_t i = 0; i < key.num_rts; ++i) rtv[i] = targets.rtv[i];
-  }
-  D3D12_CPU_DESCRIPTOR_HANDLE dsv = {};
-  if (key.dsv != DXGI_FORMAT_UNKNOWN) dsv = targets.dsv;
-  if (bound_rt_count != rt_count || std::memcmp(bound_rtv, rtv, sizeof(rtv)) ||
-      bound_dsv.ptr != dsv.ptr) {
-    list->OMSetRenderTargets(rt_count, rt_count ? rtv : nullptr, FALSE, dsv.ptr ? &dsv : nullptr);
-    std::memcpy(bound_rtv, rtv, sizeof(rtv));
-    bound_dsv = dsv;
-    bound_rt_count = rt_count;
+  if (bound_rt_count != p.rt_count || std::memcmp(bound_rtv, p.rtv, sizeof(p.rtv)) ||
+      bound_dsv.ptr != p.dsv.ptr) {
+    list->OMSetRenderTargets(p.rt_count, p.rt_count ? p.rtv : nullptr, FALSE,
+                             p.dsv.ptr ? &p.dsv : nullptr);
+    std::memcpy(bound_rtv, p.rtv, sizeof(p.rtv));
+    bound_dsv = p.dsv;
+    bound_rt_count = p.rt_count;
   }
   rec_rtv.reset();
-
-  uint32_t draw_count = count, first_index = 0;
-  bool draw_indexed = true;
-  if (fan) {
-    if (count < 3) {
-      ++stats.skipped;
-      return;
-    }
-    const FanIndices f = prep ? FanIndices{prep->fan_indices, prep->fan_count, prep->fan_wide}
-                              : UploadFanIndices(s, r.frame_fence());
-    if (!f.count) {
-      ++stats.failed;
-      return;
-    }
-    D3D12_INDEX_BUFFER_VIEW ibv;
-    ibv.BufferLocation = f.gpu;
-    ibv.SizeInBytes = f.count * (f.wide ? 4 : 2);
-    ibv.Format = f.wide ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
-    list->IASetIndexBuffer(&ibv);
-    bound_ibv = ibv;
-    draw_count = f.count;
-  } else if (s.indexed) {
-    // The whole shared memory buffer is the index buffer and the draw starts at the guest
-    // address, so consecutive draws only rebind it when the index format changes.
-    const uint32_t index_size = s.index_32bit ? 4u : 2u;
-    const bool aligned = (s.index_address & (index_size - 1)) == 0;
-    D3D12_INDEX_BUFFER_VIEW ibv;
-    ibv.BufferLocation = aligned ? shared_gpu : shared_gpu + s.index_address;
-    ibv.SizeInBytes = aligned ? kSharedMemorySize : index_bytes;
-    ibv.Format = s.index_32bit ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
-    if (std::memcmp(&bound_ibv, &ibv, sizeof(ibv))) {
-      list->IASetIndexBuffer(&ibv);
-      bound_ibv = ibv;
-    }
-    first_index = aligned ? s.index_address / index_size : 0;
-  } else {
-    draw_indexed = false;
+  if (p.ibv_kind == 1 || (p.ibv_kind == 2 && std::memcmp(&bound_ibv, &p.ibv, sizeof(p.ibv)))) {
+    list->IASetIndexBuffer(&p.ibv);
+    bound_ibv = p.ibv;
   }
   auto issue = [&] {
-    if (draw_indexed)
-      list->DrawIndexedInstanced(draw_count, 1, first_index, 0, 0);
+    if (p.draw_indexed)
+      list->DrawIndexedInstanced(p.draw_count, 1, p.first_index, 0, 0);
     else
-      list->DrawInstanced(draw_count, 1, 0, 0);
+      list->DrawInstanced(p.draw_count, 1, 0, 0);
   };
   HangStep(1000 + 15);  // local change: the freeze probe's step
   profile::Scope rec_draw(profile::kRecDraw);  // local change
@@ -9796,15 +10328,12 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     occlusion->BeginPass(list, pair);
     issue();
     occlusion->EndPass(list, pair);
-    // Without a depth target nothing is tested, and every sample passes. A generic pipeline's
-    // shaders differ from the key's, which the bindings were made for, and a coverage pipeline
-    // still compiling leaves the pair uncounted rather than reported fully visible.
     ID3D12PipelineState* cover = nullptr;
     auto coverage = OcclusionQueries::Coverage::kUnknown;
-    if (key.dsv == DXGI_FORMAT_UNKNOWN) {
+    if (p.no_depth) {
       coverage = OcclusionQueries::Coverage::kPasses;
-    } else if (vs == vs_selected && ps == ps_selected) {
-      cover = CoveragePipeline(key, *vst, pst);
+    } else if (p.shaders_selected) {
+      cover = p.cover;
       if (cover) coverage = OcclusionQueries::Coverage::kCounted;
     }
     occlusion->BeginCoverage(list, pair);
@@ -9814,21 +10343,281 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
       issue();
     }
-    const RenderTarget* const t = targets.depth ? targets.depth : targets.color[0];
-    const float guest_per_host =
-        t ? float(t->edram_samples) /
-                (float(t->samples) * targets.scale.factor(0) * targets.scale.factor(1))
-          : 1.0f;
-    occlusion->EndCoverage(list, pair, coverage, guest_per_host);
+    occlusion->EndCoverage(list, pair, coverage, p.guest_per_host);
     if (draw_log) std::fprintf(draw_log, "  occ pair=%u cov=%u\n", pair, uint32_t(coverage));
   }
-  ++stats.draws;
-  ++diag.draws;
-  if (snap_now) {
-    snap_pending &= ~snap_now;
-    SnapshotTargets(list, targets, draw_index);
+  ++st.draws;
+  ++diag_draws;
+  if (p.snap_now) {
+    snap_pending &= ~p.snap_now;
+    SnapshotTargets(list, p.targets, p.draw_index);
   }
   profile::Mark(profile::kRecord);
+}
+
+// Local change (24/11/2026, branch cpu_thread): the draws' second stage (EncodePacket above).
+void DrawRenderer::Impl::StartEncode() {
+  if (enc_thread.joinable()) return;
+  if (!enc_slots) enc_slots = std::make_unique<EncodePacket[]>(kEncodeSlots);
+  if (!enc_regs) enc_regs = std::make_unique<uint32_t[]>(kGuestRegisterCount);
+  enc_stop.store(false, std::memory_order_relaxed);
+  enc_thread = std::thread([this] { EncodeWorker(); });
+}
+
+void DrawRenderer::Impl::StopEncode() {
+  if (!enc_thread.joinable()) return;
+  WaitEncodeIdle(kWaitFlush);
+  enc_stop.store(true, std::memory_order_seq_cst);
+  WakeByAddressAll(&enc_head);
+  enc_thread.join();
+  enc_on = false;
+}
+
+void DrawRenderer::Impl::EncodeWorker() {
+  SetThreadDescription(GetCurrentThread(), L"PGR4 native encode");
+  uint64_t t = enc_tail.load(std::memory_order_relaxed);
+  for (;;) {
+    uint64_t h = enc_head.load(std::memory_order_acquire);
+    if (h == t) {
+      // Idle: what was recorded made visible to the replay, the profile handed over, then A
+      // told (WaitEncodeIdle).
+      if (enc_recorder) enc_recorder->PublishAll();
+      if (profile::On()) {
+        for (uint32_t i = 0; i < profile::kStageCount; ++i) {
+          enc_profile[i] += profile::g.ticks[i];
+          profile::g.ticks[i] = 0;
+        }
+        for (uint32_t i = 0; i < profile::kCounterCount; ++i) {
+          enc_profile_counters[i] += profile::g.counters[i];
+          profile::g.counters[i] = 0;
+        }
+      }
+      enc_idle.store(t, std::memory_order_seq_cst);
+      if (enc_a_waiting.load(std::memory_order_seq_cst)) WakeByAddressAll(&enc_idle);
+      const uint64_t spin = Ticks();
+      while ((h = enc_head.load(std::memory_order_acquire)) == t &&
+             !enc_stop.load(std::memory_order_relaxed) && TicksToNs(Ticks() - spin) < 20000)
+        YieldProcessor();
+      while (h == t && !enc_stop.load(std::memory_order_relaxed)) {
+        HangMark hang_mark(HangWhat::kEncodeWaitWork);
+        enc_b_sleeping.store(1, std::memory_order_seq_cst);
+        h = enc_head.load(std::memory_order_seq_cst);
+        if (h == t && !enc_stop.load(std::memory_order_seq_cst))
+          WaitOnAddress(&enc_head, &t, sizeof(t), 50);
+        enc_b_sleeping.store(0, std::memory_order_relaxed);
+        h = enc_head.load(std::memory_order_acquire);
+      }
+      if (h == t) return;  // stopped
+    }
+    HangMark hang_mark(HangWhat::kDrawing);
+    const uint64_t t0 = Ticks();
+    EncodePacket& p = enc_slots[t % kEncodeSlots];
+    for (uint32_t i = 0; i < p.write_count; ++i) enc_regs[p.writes[i].reg] = p.writes[i].value;
+    // Development: B's register file against A's at this draw.
+    if (p.regs_hash[0]) {
+      uint64_t now[5];
+      HashRegisterBlocks(enc_regs.get(), now);
+      ++enc_regs_checked;
+      if (std::memcmp(now, p.regs_hash, sizeof(now))) {
+        ++enc_regs_differ;
+        PGR4_LOG_FIRST(20, WARN,
+                       "PGR4 encode probe: B's register file DIFFERS from A's at draw {} "
+                       "(blocks differing: state {}, VS floats {}, PS floats {}, fetch {}, "
+                       "bool/loop {})",
+                       p.draw_index, now[0] != p.regs_hash[0], now[1] != p.regs_hash[1],
+                       now[2] != p.regs_hash[2], now[3] != p.regs_hash[3], now[4] != p.regs_hash[4]);
+      }
+    }
+    if (!p.side.empty()) {
+      enc_recorder->Splice(p.side.data(), p.side.size());
+      enc_side_bytes += p.side.size();
+    }
+    if (p.new_frame) {
+      DoResetListState();
+      for (CachedCbv* cb : Cbvs()) cb->Reset();
+      constant_upload.set_keep_previous_frame(p.keep_previous);
+      motion_history.BeginFrame(p.frame, p.prefetch, p.prefetch_whole);
+    }
+    if (p.reset_list) DoResetListState();
+    if (p.draw) {
+      profile::Begin();
+      Encode(p, enc_regs.get(), enc_recorder, enc_stats, enc_diag_draws);
+    }
+    // CommitCbv's streaming stores visible before anything that follows (the frame's submission
+    // after A's FlushEncode: its sfence is on A's core).
+    simde_mm_sfence();
+    enc_busy_ns += TicksToNs(Ticks() - t0);
+    ++enc_packets;
+    enc_tail.store(++t, std::memory_order_seq_cst);
+    if (enc_a_waiting.load(std::memory_order_seq_cst)) WakeByAddressAll(&enc_tail);
+  }
+}
+
+void DrawRenderer::Impl::WaitEncodeIdle(EncodeWait why) {
+  const uint64_t h = enc_head.load(std::memory_order_relaxed);
+  uint64_t v = enc_idle.load(std::memory_order_acquire);
+  if (v == h) return;
+  HangMark hang_mark(HangWhat::kEncodeWaitIdle, why);
+  const uint64_t start = Ticks();
+  while (v != h && TicksToNs(Ticks() - start) < 20000) {
+    YieldProcessor();
+    v = enc_idle.load(std::memory_order_acquire);
+  }
+  while (v != h) {
+    enc_a_waiting.store(1, std::memory_order_seq_cst);
+    v = enc_idle.load(std::memory_order_seq_cst);
+    if (v != h) WaitOnAddress(&enc_idle, &v, sizeof(v), 50);
+    v = enc_idle.load(std::memory_order_acquire);
+  }
+  enc_a_waiting.store(0, std::memory_order_relaxed);
+  enc_wait_ns[why] += TicksToNs(Ticks() - start);
+  ++enc_waits[why];
+}
+
+void DrawRenderer::Impl::FlushEncode(EncodeWait why) {
+  if (!enc_thread.joinable()) return;
+  WaitEncodeIdle(why);
+  // B's counters, merged while it is idle.
+  stats.draws += enc_stats.draws;
+  stats.failed += enc_stats.failed;
+  stats.skipped += enc_stats.skipped;
+  enc_stats = {};
+  diag.draws += enc_diag_draws;
+  enc_diag_draws = 0;
+  if (profile::On()) {
+    for (uint32_t i = 0; i < profile::kStageCount; ++i) {
+      profile::g.ticks[i] += enc_profile[i];
+      enc_profile[i] = 0;
+    }
+    for (uint32_t i = 0; i < profile::kCounterCount; ++i) {
+      profile::g.counters[i] += enc_profile_counters[i];
+      enc_profile_counters[i] = 0;
+    }
+  }
+}
+
+void DrawRenderer::Impl::ApplyEncodeWrites(const RegWrite* writes, uint32_t n) {
+  if (!enc_on || !enc_regs) return;
+  for (uint32_t i = 0; i < n; ++i) enc_regs[writes[i].reg] = writes[i].value;
+}
+
+void DrawRenderer::Impl::FlushFromSide(void* impl) {
+  Impl& d = *static_cast<Impl*>(impl);
+  if (!d.enc_packet) return;
+  // B's packets before this draw done (and published), then this draw's side commands so far
+  // into the ring by A itself, in their place; the draw goes on on the side.
+  d.WaitEncodeIdle(kWaitSide);
+  CommandRecorder::SetSide(nullptr);
+  EncodePacket& p = *d.enc_packet;
+  if (!p.side.empty()) {
+    d.enc_recorder->Splice(p.side.data(), p.side.size());
+    p.side.clear();
+  }
+  CommandRecorder::SetSide(&d.enc_side);
+}
+
+void DrawRenderer::Impl::BeginDrawSide(const uint32_t* regs) {
+  enc_packet = nullptr;
+  if (const uint64_t frame = r.frame_index(); frame != enc_decided_frame) {
+    // At a frame's first draw (B idle since the Swap): on two threads or in line.
+    enc_decided_frame = frame;
+    CommandRecorder* const recorder = CommandRecorder::From(r.recording_list());
+    const bool want = REXCVAR_GET(pgr4_native_draw_encode_thread) && enc_feed && recorder &&
+                      memo_on && !draw_log && !snap_pending;
+    if (want != enc_on) {
+      if (want) {
+        StartEncode();
+        WaitEncodeIdle(kWaitFlush);
+        std::memcpy(enc_regs.get(), regs, kGuestRegisterCount * sizeof(uint32_t));
+        enc_recorder = recorder;
+        enc_side = {nullptr, &FlushFromSide, this};
+      } else {
+        FlushEncode();
+      }
+      enc_on = want;
+      REXLOG_INFO("PGR4 native draw: the draws {} (frame {})",
+                  want ? "on two threads (A decides, B encodes)" : "on one thread", frame);
+    }
+  }
+  // A diagnostic that reads the draws in line, asked during the frame; or a draw without its
+  // register writes (not from the render thread's batches: B's file would miss them).
+  const bool fed = enc_fed;
+  enc_fed = false;
+  if (enc_on && (draw_log || snap_pending || !fed)) {
+    FlushEncode();
+    enc_on = false;
+    REXLOG_INFO("PGR4 native draw: the draws on one thread ({})",
+                fed ? "the draw log or a snapshot" : "a draw without the render thread's writes");
+  }
+  if (!enc_on) return;
+  // A slot B is done with.
+  const uint64_t h = enc_head.load(std::memory_order_relaxed);
+  if (h - enc_tail.load(std::memory_order_acquire) >= kEncodeSlots) {
+    HangMark hang_mark(HangWhat::kEncodeWaitIdle, kWaitSlot);
+    const uint64_t start = Ticks();
+    uint64_t t = enc_tail.load(std::memory_order_acquire);
+    while (h - t >= kEncodeSlots) {
+      enc_a_waiting.store(1, std::memory_order_seq_cst);
+      t = enc_tail.load(std::memory_order_seq_cst);
+      if (h - t >= kEncodeSlots) WaitOnAddress(&enc_tail, &t, sizeof(t), 50);
+      t = enc_tail.load(std::memory_order_acquire);
+    }
+    enc_a_waiting.store(0, std::memory_order_relaxed);
+    enc_wait_ns[kWaitSlot] += TicksToNs(Ticks() - start);
+    ++enc_waits[kWaitSlot];
+  }
+  EncodePacket& p = enc_slots[h % kEncodeSlots];
+  p.side.clear();
+  p.writes = enc_writes;
+  p.write_count = enc_write_count;
+  p.new_frame = p.reset_list = p.draw = false;
+  p.regs_hash[0] = 0;
+  enc_writes = nullptr;
+  enc_write_count = 0;
+  enc_packet = &p;
+  enc_side.bytes = &p.side;
+  CommandRecorder::SetSide(&enc_side);
+}
+
+void DrawRenderer::Impl::EndDrawSide() {
+  if (!enc_packet) return;
+  CommandRecorder::SetSide(nullptr);
+  EncodePacket& p = *enc_packet;
+  if (enc_pending_reset) {
+    p.reset_list = true;
+    enc_pending_reset = false;
+  }
+  enc_packet = nullptr;
+  const uint64_t h = enc_head.load(std::memory_order_relaxed) + 1;
+  enc_depth_max = std::max(enc_depth_max, h - enc_tail.load(std::memory_order_relaxed));
+  enc_head.store(h, std::memory_order_seq_cst);
+  if (enc_b_sleeping.load(std::memory_order_seq_cst)) WakeByAddressSingle(&enc_head);
+}
+
+// Development (the probes on): every 2 s, B's time, A's waits for it by cause, the packets.
+void DrawRenderer::Impl::EncodeProbeLog() {
+  if (!g_pgr4_dev || !enc_thread.joinable()) return;
+  static auto last = std::chrono::steady_clock::now();
+  static uint64_t frames = 0;
+  ++frames;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(2)) return;
+  last = now;
+  const double f = double(std::max<uint64_t>(frames, 1));
+  REXLOG_INFO(
+      "PGR4 encode probe ({}): {} frames; B busy {:.2f} ms a frame, {:.0f} packets, {:.1f} KB of "
+      "side commands; A waited {:.3f} ms a frame for B at the flushes ({:.0f} a frame), {:.3f} "
+      "for a slot ({:.0f}), {:.3f} on the side ({:.0f}), {:.3f} for a reset ({:.0f}); queue up to "
+      "{}; registers checked {}, DIFFERENT {}",
+      enc_on ? "two threads" : "one thread", frames, enc_busy_ns / 1e6 / f, enc_packets / f,
+      enc_side_bytes / 1024.0 / f, enc_wait_ns[kWaitFlush] / 1e6 / f, enc_waits[kWaitFlush] / f,
+      enc_wait_ns[kWaitSlot] / 1e6 / f, enc_waits[kWaitSlot] / f, enc_wait_ns[kWaitSide] / 1e6 / f,
+      enc_waits[kWaitSide] / f, enc_wait_ns[kWaitReset] / 1e6 / f, enc_waits[kWaitReset] / f,
+      enc_depth_max, enc_regs_checked, enc_regs_differ);
+  frames = 0;
+  enc_busy_ns = enc_packets = enc_side_bytes = enc_regs_checked = enc_regs_differ = 0;
+  enc_depth_max = 0;
+  for (uint32_t i = 0; i < 4; ++i) enc_wait_ns[i] = enc_waits[i] = 0;
 }
 
 void DrawRenderer::Impl::SnapshotTargets(ID3D12GraphicsCommandList* list,
@@ -10021,6 +10810,20 @@ void DrawRenderer::BeforeSubmit() {
   m.coherency_inflight.push_back(std::move(job));
 }
 
+// Local change (24/11/2026, branch cpu_thread): the draws on two threads (Impl::EncodeWorker).
+void DrawRenderer::EnableEncodeFeed(bool on) { impl_->enc_feed = on; }
+void DrawRenderer::SetEncodeWrites(const RegWrite* writes, uint32_t n) {
+  impl_->enc_writes = n ? writes : nullptr;
+  impl_->enc_write_count = n;
+  impl_->enc_fed = true;
+}
+void DrawRenderer::BeginDrawSide(const uint32_t* regs) { impl_->BeginDrawSide(regs); }
+void DrawRenderer::EndDrawSide() { impl_->EndDrawSide(); }
+void DrawRenderer::FlushEncode() { impl_->FlushEncode(); }
+void DrawRenderer::ApplyEncodeWrites(const RegWrite* writes, uint32_t n) {
+  if (n) impl_->ApplyEncodeWrites(writes, n);
+}
+
 void DrawRenderer::InvalidateListState(ListBreak why) {
   impl_->ResetListState();
   // Recording goes on in a new list, and the submitted one left shared memory in the common
@@ -10160,6 +10963,8 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
     if ((impl_->trace.frame & 255) == 0) impl_->trace.Flush();
   }
   if (!impl_->threaded) impl_->vertex_upload.EndFrame(completed_fence);
+  impl_->FlushEncode();     // local change (24/11/2026, branch cpu_thread): B idle (the Swap's)
+  impl_->EncodeProbeLog();  // development
   impl_->constant_upload.EndFrame(completed_fence);
   if (!impl_->coherency_inflight.empty()) impl_->CheckCoherencyJobs(completed_fence);
   if (!impl_->audit_inflight.empty()) impl_->CheckAuditJobs(completed_fence);

@@ -113,6 +113,12 @@ enum Str {
   kVolumetricHelp,
   kEffectsOn,
   kEffectsOff,
+  // Local change (24/11/2026): the multithreaded rendering's row (pgr4_native_draw_encode_thread),
+  // its help, its two values (singular: fr, es and it agree them).
+  kMultithread,
+  kMultithreadHelp,
+  kOneOn,
+  kOneOff,
   kStrCount
 };
 
@@ -128,7 +134,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"LANGUAGE",
         L"The language of the game and of this launcher.",
         L"SYSTEM LINK NETWORK",
-        L"The system link's main network. Automatic searches every network (LAN, Radmin VPN…): start the VPN before the game.",
+        L"The main System Link network. On Automatic, the game searches every network (LAN, Radmin VPN…): start the VPN before the game.",
         L"AUTOMATIC",
         L"QUIT",
         L"Close the launcher.",
@@ -177,6 +183,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Volumetric fog and lights in races. On: their shaders are prepared too (a longer first start) and the game's GRAPHICS menu offers them.",
         L"ON",
         L"OFF",
+        L"MULTITHREADED RENDERING",
+        L"The game's draws prepared on two processor threads: more frames per second when the processor holds the game back. Turn it off if you lose performance or the game crashes.",
+        L"ON",
+        L"OFF",
     },
     {  // fr
         L"JOUER",
@@ -194,7 +204,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"QUITTER",
         L"Fermer le lanceur.",
         L"INSTALLER VISUAL C++",
-        L"Le jeu a besoin du Visual C++ Redistributable 2015-2022 (x64). Ouvre la page de téléchargement de Microsoft.",
+        L"Le jeu a besoin du Visual C++ Redistributable 2015-2022 (x64). Ouvrir la page de téléchargement de Microsoft.",
         L"VÉRIFICATIONS",
         L"Jeu",
         L"Title Update 2",
@@ -229,15 +239,19 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Trop ancienne pour le jeu : il faut DirectX 12 avec le resource binding tier 2",
         L"DLC",
         L"Le dossier de vos contenus téléchargeables PGR4 (paquets Xbox), installés au démarrage du jeu.",
-        L"Choisir le dossier des DLC",
+        L"Choisissez le dossier des DLC",
         L"Aucun paquet DLC de PGR4 dans ce dossier.",
         L"Manette",
         L"Aucune : branchez une manette",
         L"Préparation des shaders",
         L"EFFETS VOLUMÉTRIQUES",
-        L"Brouillard et lumières volumétriques en course. Activés : leurs shaders sont aussi préparés (premier lancement plus long) et le menu GRAPHICS du jeu les propose.",
+        L"Brouillard et lumières volumétriques en course. Activés : leurs shaders sont aussi préparés (premier lancement plus long) et le menu GRAPHISMES du jeu les propose.",
         L"ACTIVÉS",
         L"DÉSACTIVÉS",
+        L"RENDU MULTITHREAD",
+        L"Les dessins du jeu préparés sur deux fils du processeur : plus d'images par seconde quand le processeur limite le jeu. Désactivez-le en cas de perte de performances ou de plantage.",
+        L"ACTIVÉ",
+        L"DÉSACTIVÉ",
     },
     {  // de
         L"SPIELEN",
@@ -250,7 +264,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"SPRACHE",
         L"Die Sprache des Spiels und dieses Launchers.",
         L"SYSTEM-LINK-NETZWERK",
-        L"Das Hauptnetzwerk für System Link. Automatisch sucht in allen Netzwerken (LAN, Radmin VPN…): Starte das VPN vor dem Spiel.",
+        L"Das Hauptnetzwerk für System Link. Bei „Automatisch“ sucht das Spiel in allen Netzwerken (LAN, Radmin VPN…): Starte das VPN vor dem Spiel.",
         L"AUTOMATISCH",
         L"BEENDEN",
         L"Den Launcher schließen.",
@@ -282,7 +296,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"SPIELEN",
         L"SPIELERNAME",
         L"Dein Gamertag im Spiel (Spieler 2: derselbe mit einer 2). A zum Ändern.",
-        L"Tippe den Namen, oder ↑↓ Buchstabe, ←→ Position, X löschen. A bestätigen, B abbrechen.",
+        L"Tippe den Namen oder ↑↓ Buchstabe, ←→ Position, X löschen. A zum Bestätigen, B zum Abbrechen.",
         L"1 bis 15 Buchstaben, Ziffern oder Leerzeichen, beginnend mit einem Buchstaben.",
         L"Kein PGR4 oder unbekannte Version",
         L"Im Spiel enthalten",
@@ -290,19 +304,23 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Zu alt für das Spiel: DirectX 12 mit Resource Binding Tier 2 nötig",
         L"DLC",
         L"Der Ordner deiner PGR4-Zusatzinhalte (Xbox-Pakete), beim Spielstart installiert.",
-        L"DLC-Ordner wählen",
+        L"Wähle den DLC-Ordner",
         L"Kein PGR4-DLC-Paket in diesem Ordner.",
         L"Controller",
         L"Keiner: Controller anschließen",
         L"Shader werden vorbereitet",
         L"VOLUMETRISCHE EFFEKTE",
-        L"Volumetrischer Nebel und Lichter in Rennen. An: ihre Shader werden mit vorbereitet (längerer erster Start), und das Grafikmenü des Spiels bietet sie an.",
-        L"AN",
+        L"Volumetrischer Nebel und Lichter in Rennen. Ein: Ihre Shader werden mit vorbereitet (längerer erster Start), und das Grafikmenü des Spiels bietet sie an.",
+        L"EIN",
+        L"AUS",
+        L"MULTITHREAD-RENDERING",
+        L"Die Zeichenbefehle des Spiels werden auf zwei Prozessor-Threads vorbereitet: mehr Bilder pro Sekunde, wenn der Prozessor das Spiel ausbremst. Schalte es aus, wenn du Leistung verlierst oder das Spiel abstürzt.",
+        L"EIN",
         L"AUS",
     },
     {  // es
         L"JUGAR",
-        L"Iniciar Project Gotham Racing 4. Y lo inicia desde cualquier lugar.",
+        L"Iniciar Project Gotham Racing 4. El botón Y lo inicia desde cualquier lugar.",
         L"Falta algo para jugar: mira las comprobaciones a la derecha.",
         L"CARPETA DEL JUEGO",
         L"La carpeta de tu copia de PGR4, la que contiene default.xex.",
@@ -324,7 +342,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Tarjeta gráfica",
         L"Sin definir: A para elegir",
         L"Encontrado",
-        L"No encontrado",
+        L"No se encuentra",
         L"Extraída",
         L"Paquete de Xbox",
         L"Versión no reconocida",
@@ -351,7 +369,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Demasiado antigua para el juego: requiere DirectX 12 con resource binding tier 2",
         L"DLC",
         L"La carpeta de tu contenido descargable de PGR4 (paquetes de Xbox), instalado al iniciar el juego.",
-        L"Elegir la carpeta de DLC",
+        L"Elige la carpeta de DLC",
         L"No hay ningún paquete DLC de PGR4 en esta carpeta.",
         L"Mando",
         L"Ninguno: conecta un mando",
@@ -360,6 +378,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Niebla y luces volumétricas en carrera. Activados: sus shaders también se preparan (primer inicio más largo) y el menú de gráficos del juego los ofrece.",
         L"ACTIVADOS",
         L"DESACTIVADOS",
+        L"RENDERIZADO MULTIHILO",
+        L"Los dibujos del juego se preparan en dos hilos del procesador: más imágenes por segundo cuando el procesador limita el juego. Desactívalo si pierdes rendimiento o si el juego se cierra inesperadamente.",
+        L"ACTIVADO",
+        L"DESACTIVADO",
     },
     {  // it
         L"GIOCA",
@@ -385,7 +407,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Scheda video",
         L"Non impostata: A per scegliere",
         L"Trovato",
-        L"Non trovato",
+        L"Non presente",
         L"Estratta",
         L"Pacchetto Xbox",
         L"Versione non riconosciuta",
@@ -418,9 +440,13 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Nessuno: collega un controller",
         L"Preparazione degli shader",
         L"EFFETTI VOLUMETRICI",
-        L"Nebbia e luci volumetriche in gara. Attivi: anche i loro shader vengono preparati (primo avvio più lungo) e il menu grafica del gioco li propone.",
-        L"ATTIVI",
+        L"Nebbia e luci volumetriche in gara. Attivati: anche i loro shader vengono preparati (primo avvio più lungo) e il menu GRAFICA del gioco li propone.",
+        L"ATTIVATI",
         L"DISATTIVATI",
+        L"RENDERING MULTITHREAD",
+        L"I disegni del gioco vengono preparati su due thread del processore: più fotogrammi al secondo quando il processore limita il gioco. Disattivalo se perdi prestazioni o se il gioco si arresta in modo anomalo.",
+        L"ATTIVATO",
+        L"DISATTIVATO",
     },
     {  // cz
         L"HRÁT",
@@ -433,7 +459,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"JAZYK",
         L"Jazyk hry a tohoto spouštěče.",
         L"SÍŤ SYSTEM LINK",
-        L"Hlavní síť pro System Link. Automaticky hra hledá ve všech sítích (LAN, Radmin VPN…): spusťte VPN před hrou.",
+        L"Hlavní síť pro System Link. V automatickém režimu hra hledá ve všech sítích (LAN, Radmin VPN…): spusťte VPN před hrou.",
         L"AUTOMATICKY",
         L"KONEC",
         L"Zavřít spouštěč.",
@@ -482,6 +508,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Objemová mlha a světla v závodech. Zapnuto: připraví se i jejich shadery (delší první spuštění) a nabídka grafiky ve hře je nabídne.",
         L"ZAPNUTO",
         L"VYPNUTO",
+        L"VÍCEVLÁKNOVÉ VYKRESLOVÁNÍ",
+        L"Vykreslovací příkazy hry se připravují ve dvou vláknech procesoru: více snímků za sekundu, když hru brzdí procesor. Vypněte ho, pokud ztrácíte výkon nebo pokud hra padá.",
+        L"ZAPNUTO",
+        L"VYPNUTO",
     },
     {  // hu
         L"JÁTÉK",
@@ -493,7 +523,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"A Title Update 2 mappája: kicsomagolva (default.xexp) vagy Xbox-csomagként.",
         L"NYELV",
         L"A játék és az indító nyelve.",
-        L"SYSTEM LINK HÁLÓZAT",
+        L"SYSTEM LINK-HÁLÓZAT",
         L"A System Link fő hálózata. Automatikus módban a játék minden hálózaton keres (LAN, Radmin VPN…): a VPN-t a játék előtt indítsd el.",
         L"AUTOMATIKUS",
         L"KILÉPÉS",
@@ -534,13 +564,17 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Túl régi a játékhoz: DirectX 12 kell resource binding tier 2-vel",
         L"DLC",
         L"A PGR4 letölthető tartalmainak mappája (Xbox-csomagok), a játék indításakor települnek.",
-        L"Válaszd ki a DLC mappát",
+        L"Válaszd ki a DLC-mappát",
         L"Ebben a mappában nincs PGR4 DLC-csomag.",
         L"Kontroller",
         L"Nincs: csatlakoztass egy kontrollert",
         L"Árnyalók előkészítése",
         L"VOLUMETRIKUS EFFEKTEK",
-        L"Volumetrikus köd és fények versenyben. Be: a shadereik is elkészülnek (hosszabb első indítás), és a játék grafikai menüje felkínálja őket.",
+        L"Volumetrikus köd és fények versenyben. Be: az árnyalóik is elkészülnek (hosszabb első indítás), és a játék grafikai menüje felkínálja őket.",
+        L"BE",
+        L"KI",
+        L"TÖBBSZÁLÚ RENDERELÉS",
+        L"A játék rajzolási parancsai két processzorszálon készülnek: több képkocka másodpercenként, amikor a processzor fogja vissza a játékot. Kapcsold ki, ha teljesítményt veszítesz, vagy ha a játék összeomlik.",
         L"BE",
         L"KI",
     },
@@ -604,6 +638,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Wolumetryczna mgła i światła w wyścigach. Włączone: ich shadery też są przygotowywane (dłuższe pierwsze uruchomienie), a menu grafiki gry je oferuje.",
         L"WŁĄCZONE",
         L"WYŁĄCZONE",
+        L"RENDEROWANIE WIELOWĄTKOWE",
+        L"Polecenia rysowania gry są przygotowywane w dwóch wątkach procesora: więcej klatek na sekundę, gdy procesor ogranicza grę. Wyłącz je, jeśli tracisz wydajność lub gra się zawiesza.",
+        L"WŁĄCZONE",
+        L"WYŁĄCZONE",
     },
     {  // ru
         L"ИГРАТЬ",
@@ -648,14 +686,14 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"ИГРАТЬ",
         L"ИМЯ ИГРОКА",
         L"Ваше имя в игре (у игрока 2 — то же с цифрой 2). A — изменить.",
-        L"Введите имя или ↑↓ буква, ←→ позиция, X стереть. A — подтвердить, B — отмена.",
+        L"Введите имя или ↑↓ буква, ←→ позиция, X стереть. A — подтвердить, B — отменить.",
         L"От 1 до 15 латинских букв, цифр или пробелов, первой — буква.",
         L"Не PGR4 или неизвестная версия",
         L"Встроена в игру",
         L"Сначала выберите игру",
         L"Слишком старая для игры: нужен DirectX 12 с resource binding tier 2",
         L"DLC",
-        L"Папка с загружаемым контентом PGR4 (пакеты Xbox), устанавливается при запуске игры.",
+        L"Папка с загружаемым контентом PGR4 (пакеты Xbox), который устанавливается при запуске игры.",
         L"Выберите папку DLC",
         L"В этой папке нет пакетов DLC для PGR4.",
         L"Геймпад",
@@ -663,6 +701,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Подготовка шейдеров",
         L"ОБЪЁМНЫЕ ЭФФЕКТЫ",
         L"Объёмный туман и свет в гонках. Вкл.: их шейдеры тоже готовятся (первый запуск дольше), и меню графики игры их предлагает.",
+        L"ВКЛ.",
+        L"ВЫКЛ.",
+        L"МНОГОПОТОЧНЫЙ РЕНДЕРИНГ",
+        L"Команды отрисовки игры готовятся в двух потоках процессора: больше кадров в секунду, когда игру ограничивает процессор. Отключите его, если теряется производительность или игра вылетает.",
         L"ВКЛ.",
         L"ВЫКЛ.",
     },
@@ -702,7 +744,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"決定",
         L"終了",
         L"ゲームフォルダーを選択（default.xex を含む）",
-        L"Title Update 2 のフォルダーを選択",
+        L"Title Update 2 フォルダーを選択",
         L"このフォルダーには default.xex がありません。",
         L"このフォルダーに Title Update 2 がありません（default.xexp または Xbox パッケージ）。",
         L"pgr4.exe を起動できません。ランチャーと同じフォルダーに置いてください。",
@@ -722,8 +764,12 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"コントローラー",
         L"なし：コントローラーを接続してください",
         L"シェーダーを準備中",
-        L"ボリューメトリック効果",
+        L"ボリューメトリックエフェクト",
         L"レース中のボリューメトリックフォグとライト。オン：シェーダーも準備され（初回起動が長くなります）、ゲームのグラフィック設定に表示されます。",
+        L"オン",
+        L"オフ",
+        L"マルチスレッドレンダリング",
+        L"ゲームの描画処理をプロセッサーの2つのスレッドで準備します。プロセッサーが限界のときにフレームレートが上がります。パフォーマンスが下がったり、ゲームがクラッシュしたりする場合はオフにしてください。",
         L"オン",
         L"オフ",
     },
@@ -737,8 +783,8 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Title Update 2 폴더: 압축 해제됨(default.xexp) 또는 Xbox 패키지.",
         L"언어",
         L"게임과 이 런처의 언어입니다.",
-        L"시스템 링크 네트워크",
-        L"시스템 링크의 기본 네트워크입니다. 자동으로 두면 모든 네트워크(LAN, Radmin VPN…)를 검색합니다. 게임 전에 VPN을 시작하세요.",
+        L"시스템 연결 네트워크",
+        L"시스템 연결의 기본 네트워크입니다. 자동으로 두면 모든 네트워크(LAN, Radmin VPN…)를 검색합니다. 게임 전에 VPN을 시작하세요.",
         L"자동",
         L"종료",
         L"런처를 닫습니다.",
@@ -775,7 +821,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"PGR4가 아니거나 알 수 없는 버전",
         L"게임에 포함됨",
         L"먼저 게임을 선택하세요",
-        L"게임에 비해 너무 오래되었습니다: resource binding tier 2를 지원하는 DirectX 12가 필요합니다",
+        L"이 게임에는 너무 오래되었습니다: resource binding tier 2를 지원하는 DirectX 12가 필요합니다",
         L"DLC",
         L"PGR4 다운로드 콘텐츠(Xbox 패키지) 폴더입니다. 게임 시작 시 설치됩니다.",
         L"DLC 폴더 선택",
@@ -783,8 +829,12 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"컨트롤러",
         L"없음: 컨트롤러를 연결하세요",
         L"셰이더 준비 중",
-        L"볼류메트릭 효과",
-        L"레이스 중 볼류메트릭 안개와 조명. 켜기: 셰이더도 준비되며(첫 실행이 길어짐) 게임의 그래픽 메뉴에 표시됩니다.",
+        L"체적 효과",
+        L"레이스 중 체적 안개와 조명. 켜기: 셰이더도 준비되며(첫 실행이 길어짐) 게임의 그래픽 메뉴에 표시됩니다.",
+        L"켜기",
+        L"끄기",
+        L"멀티스레드 렌더링",
+        L"게임의 그리기 작업을 프로세서의 두 스레드에서 준비합니다. 프로세서가 게임을 제한할 때 초당 프레임이 늘어납니다. 성능이 떨어지거나 게임이 충돌하면 끄세요.",
         L"켜기",
         L"끄기",
     },
@@ -798,8 +848,8 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Title Update 2 的資料夾：已解壓縮（default.xexp）或 Xbox 套件。",
         L"語言",
         L"遊戲與本啟動器的語言。",
-        L"系統連結網路",
-        L"系統連結的主要網路。自動模式會搜尋所有網路（區域網路、Radmin VPN…）：請在遊戲前啟動 VPN。",
+        L"系統連線網路",
+        L"系統連線的主要網路。自動模式會搜尋所有網路（區域網路、Radmin VPN…）：請在遊戲前啟動 VPN。",
         L"自動",
         L"結束",
         L"關閉啟動器。",
@@ -845,7 +895,11 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"無：請連接控制器",
         L"正在準備著色器",
         L"體積效果",
-        L"比賽中的體積霧與光線。開啟：其著色器也會一併準備（首次啟動較久），遊戲的圖形選單會提供此選項。",
+        L"比賽中的體積霧與光線。開啟：其著色器也會一併準備（首次啟動較久），遊戲的視訊選單會提供此選項。",
+        L"開啟",
+        L"關閉",
+        L"多執行緒渲染",
+        L"在處理器的兩個執行緒上準備遊戲的繪製指令：處理器限制遊戲時可提高每秒影格數。若效能下降或遊戲當機，請關閉此選項。",
         L"開啟",
         L"關閉",
     },
@@ -859,8 +913,8 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"Title Update 2 的文件夹：已解压（default.xexp）或 Xbox 安装包。",
         L"语言",
         L"游戏和本启动器的语言。",
-        L"系统链接网络",
-        L"系统链接的主网络。自动模式会搜索所有网络（局域网、Radmin VPN…）：请在游戏前启动 VPN。",
+        L"系统互联的网络",
+        L"系统互联的主网络。自动模式会搜索所有网络（局域网、Radmin VPN…）：请在游戏前启动 VPN。",
         L"自动",
         L"退出",
         L"关闭启动器。",
@@ -899,7 +953,7 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"请先选择游戏",
         L"对本游戏而言过旧：需要支持 resource binding tier 2 的 DirectX 12",
         L"DLC",
-        L"PGR4 下载内容 (Xbox 包) 的文件夹，在游戏启动时安装。",
+        L"PGR4 下载内容 (Xbox 安装包) 的文件夹，在游戏启动时安装。",
         L"选择 DLC 文件夹",
         L"此文件夹中没有 PGR4 的 DLC 包。",
         L"控制器",
@@ -907,6 +961,10 @@ const wchar_t* const kTexts[][kStrCount] = {
         L"正在准备着色器",
         L"体积效果",
         L"比赛中的体积雾与光线。开启：其着色器也会一并准备（首次启动较久），游戏的图形菜单会提供此选项。",
+        L"开启",
+        L"关闭",
+        L"多线程渲染",
+        L"在处理器的两个线程上准备游戏的绘制指令：处理器限制游戏时可提高帧率。若性能下降或游戏崩溃，请关闭此选项。",
         L"开启",
         L"关闭",
     },
@@ -1087,6 +1145,9 @@ struct State {
   int network = 0;   // 0 automatic, else 1 + index in adapters
   // Local change (22/11/2026): the volumetric effects (pgr4_native_volumetric_effects), off by default.
   bool volumetric = false;
+  // Local change (24/11/2026): the multithreaded rendering (pgr4_native_draw_encode_thread), on
+  // unless the toml says false (the game's default).
+  bool multithread = true;
   std::vector<Adapter> adapters;
   std::wstring profile;
 
@@ -1511,6 +1572,7 @@ void Load() {
   for (size_t i = 0; i < g.adapters.size(); ++i)
     if (g.adapters[i].ip == lan_ip) g.network = int(i) + 1;
   g.volumetric = ReadSetting("pgr4_native_volumetric_effects") == "true";
+  g.multithread = ReadSetting("pgr4_native_draw_encode_thread") != "false";
 
   // The release's layout found on its own: game\ and title-update\ beside the launcher (the
   // folders pgr4.exe looks for itself).
@@ -1566,7 +1628,7 @@ void Load() {
 // ---------------------------------------------------------------------------------------------
 // The menu.
 
-enum class Row { kPlay, kVcRedist, kName, kGameDir, kUpdate, kDlc, kLanguage, kNetwork, kVolumetric, kQuit };
+enum class Row { kPlay, kVcRedist, kName, kGameDir, kUpdate, kDlc, kLanguage, kNetwork, kVolumetric, kMultithread, kQuit };
 
 std::vector<Row> g_rows;
 int g_selected = 0;
@@ -1592,6 +1654,7 @@ void BuildRows() {
   g_rows.push_back(Row::kLanguage);
   g_rows.push_back(Row::kNetwork);
   g_rows.push_back(Row::kVolumetric);  // local change (22/11/2026)
+  g_rows.push_back(Row::kMultithread);  // local change (24/11/2026)
   g_rows.push_back(Row::kQuit);
   auto index = [](Row row) {
     for (int i = 0; i < int(g_rows.size()); ++i)
@@ -1657,10 +1720,14 @@ void Step(Row row, int delta) {
     // Turned on: the game's option on too (Tazz: "l'option est là et activée par défaut"); the
     // player may turn it off in the game's GRAPHICS menu.
     if (g.volumetric) WriteSetting("pgr4_native_volumetric", "true");
+  } else if (row == Row::kMultithread) {
+    g.multithread = !g.multithread;
+    WriteSetting("pgr4_native_draw_encode_thread", g.multithread ? "true" : "false");
   }
 }
 
 HANDLE g_precompile = nullptr;  // pgr4.exe compiling the shaders (PollPrecompile)
+bool g_show_precompile = false;  // --render's precompile look (no process there; 24/11/2026)
 
 bool Launch(bool precompile) {
   const fs::path exe = g_dir / "pgr4.exe";
@@ -1942,6 +2009,7 @@ void Activate(HWND hwnd, Row row) {
     case Row::kLanguage:
     case Row::kNetwork:
     case Row::kVolumetric:
+    case Row::kMultithread:
       Step(row, 1);
       break;
     case Row::kQuit:
@@ -2114,6 +2182,7 @@ std::wstring RowLabel(Row row) {
     case Row::kLanguage: return T(kLanguage);
     case Row::kNetwork: return T(kNetwork);
     case Row::kVolumetric: return T(kVolumetric);
+    case Row::kMultithread: return T(kMultithread);
     case Row::kQuit: return T(kQuit);
   }
   return {};
@@ -2130,6 +2199,7 @@ std::wstring RowHelp(Row row) {
     case Row::kLanguage: return T(kLanguageHelp);
     case Row::kNetwork: return T(kNetworkHelp);
     case Row::kVolumetric: return T(kVolumetricHelp);
+    case Row::kMultithread: return T(kMultithreadHelp);
     case Row::kQuit: return T(kQuitHelp);
   }
   return {};
@@ -2152,27 +2222,85 @@ std::wstring RowValue(Row row) {
       return g.network ? g.adapters[g.network - 1].name + L" " + g.adapters[g.network - 1].ip
                        : T(kAuto);
     case Row::kVolumetric: return g.volumetric ? T(kEffectsOn) : T(kEffectsOff);
+    case Row::kMultithread: return g.multithread ? T(kOneOn) : T(kOneOff);
     default: return {};
   }
 }
 
 bool IsSpinner(Row row) {
-  return row == Row::kLanguage || row == Row::kNetwork || row == Row::kVolumetric;
+  return row == Row::kLanguage || row == Row::kNetwork || row == Row::kVolumetric ||
+         row == Row::kMultithread;
+}
+
+// Local change (24/11/2026, Tazz: « affiche le texte sur la totalité de la longueur et les boutons
+// en dessous »): the help line spans the menu's left edge to the panel's right one, the button
+// hints under it, and the window as tall as the tallest help needs (each language, each row of
+// these rows, PLAY counted before it shows so a controller does not move it); 600 at least.
+constexpr float kHelpRight = 1000;
+float g_height = kHeight;            // the window's height, DIPs
+float g_help_height = 50;            // the help box's height
+float g_hints_y = 560;               // the button hints' top
+std::vector<Row> g_fitted_rows;      // the rows those were measured for
+
+float HelpHeight(const std::wstring& text) {
+  ComPtr<IDWriteTextLayout> layout;
+  g_dwrite->CreateTextLayout(text.c_str(), UINT32(text.size()), g_help.Get(), kHelpRight - kMenuLeft,
+                             2000, &layout);
+  DWRITE_TEXT_METRICS metrics = {};
+  layout->GetMetrics(&metrics);
+  return metrics.height;
+}
+
+float HelpTop() { return std::max(498.0f, RowRect(int(g_rows.size()) - 1).bottom + 8); }
+
+void FitLayout() {
+  if (g_rows == g_fitted_rows) return;
+  g_fitted_rows = g_rows;
+  const bool play = !g_rows.empty() && g_rows.front() == Row::kPlay;
+  const float top = std::max(498.0f, RowRect(int(g_rows.size()) - 1).bottom + 8 +
+                                         (play ? 0 : kPlayHeight + 8));
+  float help = 50;
+  const wchar_t* const* texts = g_texts;
+  const bool playstation = g_playstation;
+  for (const auto& language : kTexts) {
+    g_texts = language;
+    for (bool ps : {false, true}) {  // the PlayStation wording of some helps too
+      g_playstation = ps;
+      help = std::max({help, HelpHeight(T(kPlayHelp)), HelpHeight(T(kNameEditHelp))});
+      for (Row row : g_rows) help = std::max(help, HelpHeight(RowHelp(row)));
+    }
+  }
+  g_texts = texts;
+  g_playstation = playstation;
+  g_help_height = std::ceil(help) + 2;
+  g_hints_y = std::max(560.0f, top + g_help_height + 8);
+  g_height = std::max(kHeight, g_hints_y + 40);
+}
+
+// The window to g_height (the rows changed: a check, the controller).
+void FitWindow(HWND hwnd) {
+  FitLayout();
+  RECT rc;
+  GetClientRect(hwnd, &rc);
+  const int height = int(g_height * g_dpi / 96);
+  if (rc.bottom != height)
+    SetWindowPos(hwnd, nullptr, 0, 0, rc.right, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 void DrawBackdrop() {
-  g_render->FillRectangle(D2D1::RectF(0, 0, kWidth, kHeight), g_backdrop.Get());
+  g_backdrop->SetEndPoint(D2D1::Point2F(0, g_height));
+  g_render->FillRectangle(D2D1::RectF(0, 0, kWidth, g_height), g_backdrop.Get());
   // Wide pale bands drifting right, like the front end's backdrops.
   const float drift = float(std::fmod(g_time * 12.0, 260.0));
   for (int i = -2; i < 7; ++i) {
     const float x = i * 260.0f + drift;
-    FillSlanted(x, 0, x + 120, kHeight, 340, Brush(kWhite, 0.35f));
+    FillSlanted(x, 0, x + 120, g_height, 340, Brush(kWhite, 0.35f));
   }
   // Speed lines in the bottom right corner.
   for (int i = 0; i < 6; ++i) {
     const float x = 760 + i * 46.0f;
     const float phase = float(std::fmod(g_time * 0.8 + i * 0.37, 1.0));
-    FillSlanted(x, 492, x + 18 + 10 * phase, kHeight, -90, Brush(kRed, 0.05f + 0.07f * i / 5));
+    FillSlanted(x, 492, x + 18 + 10 * phase, g_height, -90, Brush(kRed, 0.05f + 0.07f * i / 5));
   }
   // The red rule under the heading.
   FillSlanted(0, 160, 700, 166, 6, Brush(kRed));
@@ -2285,8 +2413,10 @@ void DrawHeader() {
   }
   // Minimize and close.
   if (g_hover_button == 0) g_render->FillRectangle(kMinimize, Brush(kInk, 0.10f));
-  if (g_hover_button == 1) g_render->FillRectangle(kClose, Brush(kRed));
   g_render->DrawLine({960, 25}, {972, 25}, Brush(kInk), 1.5f);
+  // Local change (24/11/2026): no close while the shaders are prepared (it does nothing then).
+  if (g_precompile || g_show_precompile) return;
+  if (g_hover_button == 1) g_render->FillRectangle(kClose, Brush(kRed));
   const D2D1_COLOR_F cross = g_hover_button == 1 ? kWhite : kInk;
   g_render->DrawLine({1004, 19}, {1016, 31}, Brush(cross), 1.5f);
   g_render->DrawLine({1016, 19}, {1004, 31}, Brush(cross), 1.5f);
@@ -2440,29 +2570,30 @@ void DrawButtonHint(float x, float y, const wchar_t* letter, D2D1_COLOR_F color,
   Text(label, g_menu.Get(), {x + 32, y - 4, x + 400, y + 30}, kInk);
 }
 
-// The precompile step's bar, in place of the help line.
-void DrawPrecompile(float top) {
-  const float left = kMenuLeft, right = 610, y = top + 28;
+// The precompile step alone, in the middle under the heading (local change, 24/11/2026, Tazz: « fais
+// tout disparaître et mets-le au milieu du launcher », the inputs being off meanwhile): its name,
+// the bar, the count once the game reports it.
+void DrawPrecompile() {
+  const float mid = (166 + g_height) / 2, left = 220, right = kWidth - 220;
   const float part =
       std::min(1.0f, float(g_precompile_done) / float(std::max<size_t>(g_precompile_total, 1)));
-  Text(g_precompile_total ? std::wstring(T(kPrecompile)) + L"  " + std::to_wstring(g_precompile_done) +
-                                L" / " + std::to_wstring(g_precompile_total)
-                          : std::wstring(T(kPrecompile)),
-       g_help.Get(), {left, top, right, top + 24}, kInk);
-  FillSlanted(left, y, right, y + 12, 4, Brush(kInk, 0.15f));
-  if (part > 0) FillSlanted(left, y, left + (right - left) * part, y + 12, 4, Brush(kRed));
+  Text(T(kPrecompile), g_menu_big.Get(), {0, mid - 64, kWidth, mid - 14}, kInk,
+       DWRITE_TEXT_ALIGNMENT_CENTER);
+  FillSlanted(left, mid, right, mid + 14, 5, Brush(kInk, 0.15f));
+  if (part > 0) FillSlanted(left, mid, left + (right - left) * part, mid + 14, 5, Brush(kRed));
+  if (g_precompile_total) {
+    Text(std::to_wstring(g_precompile_done) + L" / " + std::to_wstring(g_precompile_total),
+         g_menu_small.Get(), {0, mid + 24, kWidth, mid + 52}, kInk, DWRITE_TEXT_ALIGNMENT_CENTER);
+  }
 }
 
 void DrawFooter() {
-  if (g_precompile) {
-    DrawPrecompile(std::max(498.0f, RowRect(int(g_rows.size()) - 1).bottom + 8));
-    return;
-  }
   const std::wstring help = !g.message.empty() ? g.message
                            : g_editing         ? std::wstring(T(kNameEditHelp))
                                                : RowHelp(g_rows[std::clamp(g_selected, 0, int(g_rows.size()) - 1)]);
-  const float top = std::max(498.0f, RowRect(int(g_rows.size()) - 1).bottom + 8);
-  Text(help, g_help.Get(), {kMenuLeft, top, 610, top + 50}, g.message.empty() ? kInk : kRed);
+  const float top = HelpTop();
+  Text(help, g_help.Get(), {kMenuLeft, top, kHelpRight, std::min(top + g_help_height, g_hints_y - 4)},
+       g.message.empty() ? kInk : kRed);
   struct Hint {
     const wchar_t* letter;
     D2D1_COLOR_F color;
@@ -2471,10 +2602,10 @@ void DrawFooter() {
   std::vector<Hint> hints = {{L"A", kGreen, kSelect}};
   if (Ready()) hints.push_back({L"Y", kYellow, kLaunchHint});
   hints.push_back({L"B", kRed, kBack});
-  float x = 1000;
+  float x = kHelpRight;
   for (int i = int(hints.size()) - 1; i >= 0; --i) {
     x -= 32 + TextWidth(T(hints[i].label), g_menu.Get());
-    DrawButtonHint(x, 560, hints[i].letter, hints[i].color, T(hints[i].label));
+    DrawButtonHint(x, g_hints_y, hints[i].letter, hints[i].color, T(hints[i].label));
     x -= 22;
   }
 }
@@ -2483,6 +2614,10 @@ void Draw() {
   g_render->SetTransform(D2D1::Matrix3x2F::Identity());
   DrawBackdrop();
   DrawHeader();
+  if (g_precompile || g_show_precompile) {  // local change (24/11/2026): the step alone
+    DrawPrecompile();
+    return;
+  }
   DrawMenu();
   DrawPanel();
   DrawFooter();
@@ -2495,7 +2630,8 @@ bool RenderToPng(const fs::path& file) {
                               IID_PPV_ARGS(&wic)))) {
     return false;
   }
-  const UINT width = UINT(kWidth * 2), height = UINT(kHeight * 2);
+  FitLayout();
+  const UINT width = UINT(kWidth * 2), height = UINT(g_height * 2);
   ComPtr<IWICBitmap> bitmap;
   wic->CreateBitmap(width, height, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bitmap);
   ComPtr<ID2D1RenderTarget> target;
@@ -2700,6 +2836,8 @@ void PollPad(HWND hwnd) {
     g_pad.repeat_at = now + 120;
   }
   g_pad.buttons = buttons;
+  // Local change (24/11/2026): nothing while the shaders are prepared (g_precompile), the game next.
+  if (g_precompile) return;
   if (g_editing) {
     if (act & XINPUT_GAMEPAD_DPAD_UP) EditCycle(1);
     if (act & XINPUT_GAMEPAD_DPAD_DOWN) EditCycle(-1);
@@ -2739,7 +2877,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
       }
       if (GetForegroundWindow() == hwnd) PollPad(hwnd);
-      if (IsWindow(hwnd)) InvalidateRect(hwnd, nullptr, FALSE);
+      if (!IsWindow(hwnd)) return 0;
+      FitWindow(hwnd);  // local change (24/11/2026): the rows changed, the help's room with them
+      InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
     case WM_PAINT: {
       PAINTSTRUCT ps;
@@ -2772,7 +2912,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       const D2D1_POINT_2F p = ToDips(lparam);
       g_hover_button = Inside(kMinimize, p) ? 0 : Inside(kClose, p) ? 1 : -1;
       const int row = RowAt(p);
-      if (!g_editing && row >= 0 && row != g_selected) {
+      if (!g_editing && !g_precompile && row >= 0 && row != g_selected) {
         g.message.clear();
         g_selected = row;
       }
@@ -2789,6 +2929,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         ShowWindow(hwnd, SW_MINIMIZE);
         return 0;
       }
+      // Local change (24/11/2026): while the shaders are prepared, minimizing only.
+      if (g_precompile) return 0;
       if (Inside(kClose, p)) {
         DestroyWindow(hwnd);
         return 0;
@@ -2811,9 +2953,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
       return 0;
     }
     case WM_CHAR:
-      if (g_editing && wparam >= 32) EditType(wchar_t(wparam));
+      if (g_editing && !g_precompile && wparam >= 32) EditType(wchar_t(wparam));
       return 0;
     case WM_KEYDOWN:
+      if (g_precompile) return 0;  // local change (24/11/2026): the shaders being prepared
       if (g_editing) {
         switch (wparam) {
           case VK_LEFT: EditMove(-1); break;
@@ -2901,6 +3044,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
       g_texts = kTexts[g.language];
       Check();
     }
+    // A fifth argument "precompile": the shaders' step as it shows, half done.
+    if (argc >= 6 && std::wstring(argv[5]) == L"precompile") {
+      g_show_precompile = true;
+      g_precompile_done = 1820;
+      g_precompile_total = 3639;
+    }
     const bool ok = RenderToPng(argv[2]);
     CoUninitialize();
     return ok ? 0 : 1;
@@ -2927,7 +3076,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
   g_dpi = float(dpi_x);
   MONITORINFO info = {sizeof(info)};
   GetMonitorInfoW(monitor, &info);
-  const int width = int(kWidth * g_dpi / 96), height = int(kHeight * g_dpi / 96);
+  FitLayout();  // local change (24/11/2026): the window as tall as the help needs
+  const int width = int(kWidth * g_dpi / 96), height = int(g_height * g_dpi / 96);
   const int x = (info.rcWork.left + info.rcWork.right - width) / 2;
   const int y = (info.rcWork.top + info.rcWork.bottom - height) / 2;
   HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"Project Gotham Racing 4",

@@ -52,6 +52,7 @@ REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_mvec_x);  // pgr4-native upscaler.c
 REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_mvec_y);
 REXCVAR_DECLARE(double, pgr4_native_tune_flare);       // pgr4-native shader_replace.cpp
 REXCVAR_DECLARE(double, pgr4_native_tune_flare_halo);
+REXCVAR_DECLARE(double, pgr4_native_tune_flare_car);  // pgr4-native shader_replace.cpp
 REXCVAR_DECLARE(std::string, pgr4_native_tune_water_light_rain);
 REXCVAR_DECLARE(std::string, pgr4_native_xegtao_fog);   // pgr4-native scene_effects.cpp
 REXCVAR_DECLARE(double, pgr4_native_xegtao_intensity);
@@ -454,7 +455,7 @@ void Pgr4MigrateSettings() {
   // Local change (16/11/2026): each step once, for a pgr4.toml older than it (pgr4_settings_version;
   // pgr4.default.toml has the current one). Before, the steps ran at every start: a player who
   // chose the GTAO's old values again had them replaced at the next.
-  constexpr int32_t kSettingsVersion = 7;
+  constexpr int32_t kSettingsVersion = 10;
   const int32_t from = REXCVAR_GET(pgr4_settings_version);
   if (from >= kSettingsVersion) return;
   if (from < 1) MigrateToVersion1();
@@ -556,6 +557,26 @@ void Pgr4MigrateSettings() {
                 "# With DLSS Frame Generation, wait for the GPU at the end of every frame: off "
                 "(src/pgr4_profile.cpp).");
     REXLOG_INFO("PGR4 settings: pgr4_native_gpu_serialize_fg in pgr4.toml from true to false");
+  }
+  // Version 8 (23/11/2026, V1.51): the cars' headlights' flares with the volumetric fog moved from
+  // 0.5 to 0.75. Back to 0.5 the same day (Tazz: « remets 0.5 pour le shader des phares en
+  // volumetrique »): version 8 does nothing any more, and version 9 gives V1.51's 0.75 back its
+  // 0.5, only for a pgr4.toml V1.51 brought to version 8 (an older one's 0.75 is the player's).
+  if (from == 8 && REXCVAR_GET(pgr4_native_tune_flare_car) == 0.75) {
+    REXCVAR_SET(pgr4_native_tune_flare_car, 0.5);
+    SaveSetting("pgr4_native_tune_flare_car", "0.500000",
+                "# The cars' headlights' flares with the volumetric fog (src/pgr4_profile.cpp).");
+    REXLOG_INFO("PGR4 settings: pgr4_native_tune_flare_car in pgr4.toml from V1.51's 0.75 to 0.5");
+  }
+  // Version 10 (24/11/2026, Tazz: « fallait aussi passer le xegtao avec le brouillard de 0.1 à
+  // 0.05 »): XeGTAO's intensity in fog; the same rule as versions 4 and 5: exactly the old default
+  // (version 4's, which a pgr4.toml from before it has by then too) gets the new one.
+  if (from < 10 && REXCVAR_GET(pgr4_native_xegtao_fog) == "intensity=0.1 falloff=1") {
+    REXCVAR_SET(pgr4_native_xegtao_fog, std::string("intensity=0.05 falloff=1"));
+    SaveSetting("pgr4_native_xegtao_fog", "\"intensity=0.05 falloff=1\"",
+                "# XeGTAO in fog: Tazz's tuning as the new default (src/pgr4_profile.cpp).");
+    REXLOG_INFO("PGR4 settings: pgr4_native_xegtao_fog in pgr4.toml from \"intensity=0.1 "
+                "falloff=1\" to \"intensity=0.05 falloff=1\"");
   }
   REXCVAR_SET(pgr4_settings_version, kSettingsVersion);
   SaveSetting("pgr4_settings_version", std::to_string(kSettingsVersion),

@@ -319,9 +319,11 @@ bool Pgr4CarPreviewChainHook(PPCRegister& r3, PPCRegister& r10) {
 // Xenia rewrites the instructions in memory; recompiled code ignores that, so each patch is a
 // mid-asm hook after the instruction (config/tu2.toml). sub_829DEA18 / sub_829D6FB0: li r11,1 is
 // the "enabled" byte (stb r11,96(r1)) of the option registered through sub_82297010.
+// Local change (23/11/2026): read at each frame by pgr4-native (renderer.cpp ApplyMotionBlurRule:
+// a race and its replay only, the menus, the pause and the photo mode keeping the game's blur);
+// the hook below gives the game's start its value.
 REXCVAR_DEFINE_BOOL(pgr4_disable_motion_blur, false, "PGR4",
-                    "Disable motion blur (Xenia patch by illusion)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+                    "Disable motion blur in a race and its replay (Xenia patch by illusion)");
 REXCVAR_DEFINE_BOOL(pgr4_disable_hdr, false, "PGR4",
                     "Disable HDR; avoids flickering when upscaling (Xenia patch by remco, "
                     "SuperType1)")
@@ -1522,7 +1524,13 @@ REX_HOOK_RAW(sub_827D4688) {
   const bool zone_before = cuts && base[0x82C922CC] == 1;
   __imp__sub_827D4688(ctx, base);
   if (free_camera) Pgr4FreeCamAfter(base, camera, saved);
-  if (cuts) NoteCameraCut(base, zone_before);
+  if (cuts) {
+    NoteCameraCut(base, zone_before);
+  } else if (camera == 0x82C91D00) {
+    // Local change (24/11/2026): the view mode kept without the cuts too (draw.cpp
+    // pgr4_native_car_shadow_fog_views reads it), as NoteCameraCut stores it.
+    g_pgr4_view_mode.store(BeU32(base + 0x82C91D00 + 496), std::memory_order_relaxed);
+  }
 }
 REX_EXTERN(__imp__sub_8264A358);
 namespace pgr4::native {
@@ -4763,8 +4771,8 @@ REX_HOOK_RAW(sub_82697550) {
 
 // --- The photo mode's camera (mode 513, sub_827D2400), updated at each frame of the photo mode
 // only: the game frame it last ran in, for pgr4-native's motion blur rule (renderer.cpp
-// ApplyMotionBlurRule), which leaves the photo mode its motion blur under DLSS (19/11/2026, Tazz:
-// « le flou qui doit se désactiver c'est celui dans les options seulement »).
+// ApplyMotionBlurRule: the photo mode keeps the game's motion blur) and the photo mode's focus
+// (draw.cpp).
 namespace {
 std::atomic<uint64_t> g_photo_camera_frame{0};
 }  // namespace

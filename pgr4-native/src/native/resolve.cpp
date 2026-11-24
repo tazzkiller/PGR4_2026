@@ -234,12 +234,7 @@ Texture2D<float4> src : register(t0);
 #endif
 // Local change (pgr4 project): flag 11, the scene's ambient occlusion at the target's host size
 // (SceneEffects::DeferredOcclusion), multiplied into the color as the samples are averaged.
-// Local change (22/11/2026): with MSAA a slice per sample (pgr4_native_gtao_ms_per_sample), or one.
-#if MSAA
-Texture2DArray<float> scene_ao : register(t2);
-#else
 Texture2D<float> scene_ao : register(t2);
-#endif
 #endif
 // The destination image through its UINT view (Xenos texel bits), or (B5G6R5, the R32_FLOAT
 // image of depth resolves, and the linear image of flag 15) as floats.
@@ -378,43 +373,12 @@ uint4 PackPixel(int2 p, out float4 floats) {
   floats = (src_format == 1u ? F20e4ToF32(d24) : (float)d24 / 16777215.0).xxxx;
   return uint4((d24 << 8) | (stencil & 0xFFu), 0, 0, 0);
 #else
-#if MSAA
-  // Local change (22/11/2026): each sample darkened by its own occlusion, then averaged (the
-  // copies of the scene's own samples); one slice: the same value for all, as before.
-  float4 c;
-  if ((flags & 0x800u) != 0u && OwnSamples()) {
-    uint aw, ah, an;
-    scene_ao.GetDimensions(aw, ah, an);
-    uint2 q = min(uint2(max(p, int2(0, 0))), uint2(aw, ah) - 1u);
-    if (SampleSelect() <= 3u) {
-      c = EdramSample(src.Load(p, 0));
-      c.rgb *= scene_ao.Load(int4(q, 0, 0));
-    } else {
-      uint n = SampleCount();
-      float4 sum = 0.0;
-      for (uint i = 0u; i < n; ++i) {
-        float4 s = EdramSample(src.Load(p, i));
-        s.rgb *= scene_ao.Load(int4(q, min(i, an - 1u), 0));
-        sum += s;
-      }
-      c = sum / (float)n;
-    }
-  } else {
-    c = LoadColor(p);
-    if (flags & 0x800u) {
-      uint aw, ah, an;
-      scene_ao.GetDimensions(aw, ah, an);
-      c.rgb *= scene_ao.Load(int4(min(uint2(max(p, int2(0, 0))), uint2(aw, ah) - 1u), 0, 0));
-    }
-  }
-#else
   float4 c = LoadColor(p);
   if (flags & 0x800u) {
     uint aw, ah;
     scene_ao.GetDimensions(aw, ah);
     c.rgb *= scene_ao.Load(int3(min(uint2(max(p, int2(0, 0))), uint2(aw, ah) - 1u), 0));
   }
-#endif
   floats = Convert(c);
   return PackDest(floats);
 #endif
@@ -1433,13 +1397,6 @@ bool Resolver::Copy(ID3D12GraphicsCommandList* list, const ResolveParams& p, Ren
   {
     D3D12_SHADER_RESOURCE_VIEW_DESC ad = nd;
     ad.Format = DXGI_FORMAT_R8_UNORM;
-    // Local change (22/11/2026): an array with MSAA (the shader's), a slice per sample or one.
-    if (rt->samples > 1) {
-      ad.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-      ad.Texture2DArray = {};
-      ad.Texture2DArray.MipLevels = 1;
-      ad.Texture2DArray.ArraySize = occlusion ? effects_->DeferredSlices() : 1;
-    }
     device_->CreateShaderResourceView(occlusion, &ad, view(4));
   }
   // The image the shader writes: B5G6R5 without its typed UAV store goes through `bits`.

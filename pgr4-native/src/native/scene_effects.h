@@ -73,12 +73,10 @@ class SceneEffects {
   void Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets, const SurfaceRegs& regs,
              uint64_t frame, class GpuTimer* timer = nullptr, bool defer = false);
   // This frame's occlusion at the scene's host size (R8_UNORM, readable by compute shaders) when
-  // Apply deferred it, else null. Local change (22/11/2026): an array, a slice per sample
-  // (pgr4_native_gtao_ms_per_sample) or one (DeferredSlices).
+  // Apply deferred it, else null.
   ID3D12Resource* DeferredOcclusion(uint64_t frame) const {
     return deferred_frame_ == frame ? full_.Get() : nullptr;
   }
-  uint32_t DeferredSlices() const { return full_slices_; }
 
  private:
   template <typename T>
@@ -96,8 +94,7 @@ class SceneEffects {
   uint64_t applied_frame_ = UINT64_MAX;
   ComPtr<ID3D12RootSignature> compute_signature_, apply_signature_;
   ComPtr<ID3D12PipelineState> down_pso_, down_ms_pso_, ao_pso_, ao_ms_pso_, blur_pso_;
-  // Local change (22/11/2026): `slices` one per sample (pgr4_native_gtao_ms_per_sample), else 1.
-  bool EnsureFull(uint32_t width, uint32_t height, uint32_t slices);
+  bool EnsureFull(uint32_t width, uint32_t height);
   std::map<std::pair<DXGI_FORMAT, uint32_t>, ComPtr<ID3D12PipelineState>> apply_psos_;
   ComPtr<ID3DBlob> apply_vs_, apply_ps_, apply_ps_ms_;  // the pixel shader without, with MSAA
   ComPtr<ID3DBlob> apply_ps_debug_, apply_ps_ms_debug_;  // the debug view's (writes everywhere)
@@ -113,7 +110,7 @@ class SceneEffects {
   // The deferred occlusion at the scene's host size, and the frame it is for.
   ComPtr<ID3D12Resource> full_;
   D3D12_RESOURCE_STATES full_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  uint32_t full_width_ = 0, full_height_ = 0, full_slices_ = 1;
+  uint32_t full_width_ = 0, full_height_ = 0;
   uint64_t deferred_frame_ = UINT64_MAX;
   ComPtr<ID3D12PipelineState> upsample_ms_pso_;
 

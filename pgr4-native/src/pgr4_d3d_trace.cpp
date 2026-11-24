@@ -1403,7 +1403,13 @@ bool Pgr4FrameRateUnlocked() {
 // smeared four times as far as on the console and the road became unreadable. Unscaled, the blur
 // spans one real frame (a shutter open for the frame): the shake as on the console, the speed's
 // blur shorter at a higher rate.
+// Development (23/11/2026): the blur pass run, for the motion blur probe (renderer.cpp
+// ApplyMotionBlurRule, pgr4_native_blur_probe); the capture dir only.
+extern std::atomic<bool> g_pgr4_dev;
+std::atomic<uint32_t> g_pgr4_blur_pass_calls{0};
+
 float Pgr4MotionBlurStep(float step) {
+  if (g_pgr4_dev) g_pgr4_blur_pass_calls.fetch_add(1, std::memory_order_relaxed);
   if (!REXCVAR_GET(pgr4_motion_blur_console_length)) return step;
   constexpr double kConsoleFrameNs = 1e9 / 30;
   constexpr int64_t kMinStepNs = 1'000'000, kMaxStepNs = 100'000'000;

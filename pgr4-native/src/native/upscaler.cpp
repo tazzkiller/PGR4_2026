@@ -13,6 +13,8 @@
 #include <sl_matrix_helpers.h>
 
 #include <rex/cvar.h>
+
+#include <atomic>
 #include <rex/logging.h>
 #include <rex/system/xfile.h>
 
@@ -99,6 +101,17 @@ REXCVAR_DEFINE_INT32(pgr4_native_motion_dump, 0, "PGR4 native",
                      "Local diagnostic: every this many frames (0: off, up to 8 dumps), write the "
                      "motion vectors DLSS gets and the camera's motion of every pixel to "
                      "motion_dump_<frame>.bin beside the executable");
+// Development (23/11/2026, the fog laid by the shaders' probe): the scene's colour before the
+// upscaler, the render's size and format (HDR), written once to scene_dump_<frame>_m<the fog's
+// mode>_v<its view>.bin beside the executable (frame_dump.h), then this set back to 0. The capture
+// dir set only.
+REXCVAR_DEFINE_INT32(pgr4_native_scene_dump, 0, "PGR4 native",
+                     "Development: 1 writes the scene's colour before the upscaler once (HDR) to "
+                     "scene_dump_<frame>_m<mode>_v<view>.bin beside the executable");
+REXCVAR_DECLARE(int32_t, pgr4_native_volumetric_in_shader_mode);        // draw.cpp
+REXCVAR_DECLARE(int32_t, pgr4_native_volumetric_in_shader_debug_view);  // draw.cpp
+REXCVAR_DECLARE(bool, pgr4_native_volumetric);                          // volumetrics.cpp
+extern std::atomic<bool> g_pgr4_dev;                                                 // draw.cpp
 REXCVAR_DEFINE_INT32(pgr4_native_dlss_mvec_sign_x, 1, "PGR4 native",
                      "DLSS: sign of the motion vectors' x given to DLSS (1 or -1)");
 REXCVAR_DEFINE_INT32(pgr4_native_dlss_mvec_sign_y, 1, "PGR4 native",
@@ -1170,6 +1183,21 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
   nb = 0;
   to(input_.Get(), &input_state_, kInputState);
   list->ResourceBarrier(nb, bs);
+  // Development (pgr4_native_scene_dump): the scene's colour as the upscaler took it (in
+  // kInputState, read by the pass above).
+  if (g_pgr4_dev && REXCVAR_GET(pgr4_native_scene_dump) > 0) {
+    REXCVAR_SET(pgr4_native_scene_dump, 0);
+    const std::wstring label =
+        L"scene_dump_" + std::to_wstring(frame_) + L"_m" +
+        (REXCVAR_GET(pgr4_native_volumetric)
+             ? std::to_wstring(REXCVAR_GET(pgr4_native_volumetric_in_shader_mode))
+             : std::wstring(L"off")) +
+        L"_v" + std::to_wstring(REXCVAR_GET(pgr4_native_volumetric_in_shader_debug_view));
+    frame_dump::Capture(device_, list, color->resource.Get(), kInputState, label);
+    REXLOG_INFO("PGR4 native scene dump: frame {} {}x{} format {} queued",
+                frame_, render_width_, render_height_,
+                uint32_t(color->resource->GetDesc().Format));
+  }
 
   // The reactive mask (local change), from the copy before this frame's transparents.
   const bool reactive = reactive_pso_ && opaque_ && opaque_frame_ == frame_ &&

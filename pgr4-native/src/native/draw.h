@@ -206,6 +206,17 @@ class DrawRenderer {
     kSubmit,   // the list was submitted and reset mid-frame
   };
   void InvalidateListState(ListBreak why = ListBreak::kResolve);
+  // Local change (24/11/2026, branch cpu_thread, --pgr4_native_draw_encode_thread): the draws on
+  // two threads (draw.cpp EncodeWorker). The render thread feeds the register writes it applies
+  // (EnableEncodeFeed): before a draw, its writes (SetEncodeWrites); around ExecuteDraw,
+  // BeginDrawSide and EndDrawSide; before anything that is not a draw (and a batch's end),
+  // FlushEncode, then that command's writes (ApplyEncodeWrites). Without them: in line.
+  void EnableEncodeFeed(bool on);
+  void SetEncodeWrites(const RegWrite* writes, uint32_t n);
+  void BeginDrawSide(const uint32_t* regs);
+  void EndDrawSide();
+  void FlushEncode();
+  void ApplyEncodeWrites(const RegWrite* writes, uint32_t n);
   // Write the clear or resolve into the draw log while one is open (draw-debug.txt bit 16).
   void LogClear(const ClearCall& c);
   void LogResolve(const ResolveParams& p);

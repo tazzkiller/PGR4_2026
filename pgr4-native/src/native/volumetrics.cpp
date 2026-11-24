@@ -309,8 +309,8 @@ bool Pgr4GtaoScreen();  // src/pgr4_menu.cpp: a race's, the garage's, a replay's
 // camera, before the race's first screen, 3-2-1-Go).
 extern bool g_pgr4_race_loaded;
 extern uint64_t g_pgr4_vol_ticks[8];  // draw.cpp: the race probe's CPU times (development)
-extern bool g_pgr4_vol_timing;
-extern bool g_pgr4_dev;  // draw.cpp: development (the capture dir set), never in the release
+extern std::atomic<bool> g_pgr4_vol_timing;
+extern std::atomic<bool> g_pgr4_dev;  // draw.cpp: development (the capture dir set), never in the release
 // Local change (22/11/2026, Tazz: "il doit se charger en premier pour éviter un effet moche pendant
 // l'intro", as the water): the volume and the shaders' fog variants from the race's load, as the
 // water's weather (pgr4_native_water_weather_at_load), not from its first screen (Screens\Ingame\
@@ -1232,7 +1232,7 @@ bool ViewDirection(const float* m, const float d[3], const float tan_half[2], fl
 // Local change (21/11/2026): the fog laid by each shader this frame (draw.cpp's switch and mode 2).
 bool Volumetrics::InShader() {
   return REXCVAR_GET(pgr4_native_volumetric_in_shader) &&
-         REXCVAR_GET(pgr4_native_volumetric_in_shader_mode) == 2;
+         REXCVAR_GET(pgr4_native_volumetric_in_shader_mode) >= 2;  // 3: mode 2 shown
 }
 
 bool Volumetrics::Enabled() {

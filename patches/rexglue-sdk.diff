@@ -711,7 +711,7 @@ index a5eaa8f..f760047 100644
                   bool saturate = false) {
      uint32_t dest_write_mask = dest.GetMask();
 diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
-index 3b0fd61..f9089a7 100644
+index 3b0fd61..f2056e7 100644
 --- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
 +++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
 @@ -67,7 +67,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
@@ -792,7 +792,7 @@ index 3b0fd61..f9089a7 100644
    // Some are referenced in xenos_draw.hlsli - check it too when updating!
    enum : uint32_t {
      kSysFlag_SharedMemoryIsUAV_Shift,
-@@ -236,6 +282,21 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -236,6 +282,25 @@ class DxbcShaderTranslator : public ShaderTranslator {
      // taking into account the potential relation with occlusion queries (but
      // should be safe at least temporarily).
      kSysFlag_ROVDepthStencilEarlyWrite_Shift,
@@ -808,13 +808,25 @@ index 3b0fd61..f9089a7 100644
 +    kSysFlag_MotionOverlayHigh_Shift,
 +    // Local change (pgr4 project, 21/11/2026): two bits, at the game's fog ending
 +    // (Modification::pixel.fog_form): 0 the game's result, 1 the same computed again by the fog's
-+    // own code (a check: the image must not change), 2 the volumetric fog (later).
++    // own code (a check: the image must not change), 2 the volumetric fog, 3 (development,
++  // 23/11/2026) mode 2's computation shown: its values in place of the colour (EmitVolumetricFog).
 +    kSysFlag_FogMode_Shift,
 +    kSysFlag_FogModeHigh_Shift,
++    // Local change (pgr4 project, 23/11/2026): the volumetric fog's game's T taken from the
++    // component the fog ending's mad reads it from (its swizzle), not the register's x.
++    kSysFlag_FogTFromSwizzle_Shift,
  
      kSysFlag_Count,
  
-@@ -260,8 +321,25 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -250,6 +315,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
+     kSysFlag_AlphaPassIfEqual = 1u << kSysFlag_AlphaPassIfEqual_Shift,
+     kSysFlag_AlphaPassIfGreater = 1u << kSysFlag_AlphaPassIfGreater_Shift,
+     kSysFlag_ConvertColor0ToGamma = 1u << kSysFlag_ConvertColor0ToGamma_Shift,
++    kSysFlag_FogTFromSwizzle = 1u << kSysFlag_FogTFromSwizzle_Shift,  // local change
+     kSysFlag_ConvertColor1ToGamma = 1u << kSysFlag_ConvertColor1ToGamma_Shift,
+     kSysFlag_ConvertColor2ToGamma = 1u << kSysFlag_ConvertColor2ToGamma_Shift,
+     kSysFlag_ConvertColor3ToGamma = 1u << kSysFlag_ConvertColor3ToGamma_Shift,
+@@ -260,8 +326,25 @@ class DxbcShaderTranslator : public ShaderTranslator {
      kSysFlag_ROVDepthWrite = 1u << kSysFlag_ROVDepthWrite_Shift,
      kSysFlag_ROVStencilTest = 1u << kSysFlag_ROVStencilTest_Shift,
      kSysFlag_ROVDepthStencilEarlyWrite = 1u << kSysFlag_ROVDepthStencilEarlyWrite_Shift,
@@ -840,7 +852,7 @@ index 3b0fd61..f9089a7 100644
  
    // IF SYSTEM CONSTANTS ARE CHANGED OR ADDED, THE FOLLOWING MUST BE UPDATED:
    // - SystemConstants::Index enum.
-@@ -388,6 +466,14 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -388,6 +471,14 @@ class DxbcShaderTranslator : public ShaderTranslator {
      // The constant blend factor for the respective modes.
      float edram_blend_constant[4];
  
@@ -855,7 +867,7 @@ index 3b0fd61..f9089a7 100644
     private:
      friend class DxbcShaderTranslator;
  
-@@ -440,6 +526,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -440,6 +531,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
  
        kEdramBlendConstant,
  
@@ -864,7 +876,7 @@ index 3b0fd61..f9089a7 100644
        kCount,
      };
      static_assert(uint32_t(Index::kCount) <= 64,
-@@ -659,6 +747,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -659,6 +752,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
      return is_vertex_shader() ? modification.vertex.interpolator_mask
                                : modification.pixel.interpolator_mask;
    }
@@ -884,7 +896,7 @@ index 3b0fd61..f9089a7 100644
  
    // Whether to use switch-case rather than if (pc >= label) for control flow.
    bool UseSwitchForControlFlow() const;
-@@ -761,6 +862,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -761,6 +867,13 @@ class DxbcShaderTranslator : public ShaderTranslator {
    void StartPixelShader_LoadROVParameters();
    void StartPixelShader();
  
@@ -898,7 +910,7 @@ index 3b0fd61..f9089a7 100644
    void CompleteVertexOrDomainShader();
    // For RTV, adds the sample to coverage_temp.coverage_temp_component if it
    // passes alpha to mask (or, if initialize == true (for the first sample
-@@ -779,10 +887,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -779,10 +892,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
    // alpha can be exponent-biased.
    void CompletePixelShader_AlphaToMask();
    void CompletePixelShader_WriteToRTVs();
@@ -914,7 +926,7 @@ index 3b0fd61..f9089a7 100644
    void CompleteShaderCode();
  
    // Writes the original instruction disassembly in the output DXBC if enabled,
-@@ -797,6 +910,24 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -797,6 +915,25 @@ class DxbcShaderTranslator : public ShaderTranslator {
    // be done when the operand is not needed anymore.
    dxbc::Src LoadOperand(const InstructionOperand& operand, uint32_t needed_components,
                          bool& temp_pushed_out);
@@ -924,8 +936,9 @@ index 3b0fd61..f9089a7 100644
 +  // channels: the colour channel (0 red, 1 green, 2 blue) of each of the mad's components, as a
 +  // swizzle (its fog operand's component there: the game's fog colour c10 or its premultiplied copy
 +  // keeps red, green and blue in x, y and z).
++  // mode: the temp whose x holds kSysFlag_FogMode (3: the values shown, development).
 +  void EmitVolumetricFog(uint32_t form, const dxbc::Src operands[3], uint32_t used,
-+                         uint32_t channels);
++                         uint32_t channels, uint32_t mode);
 +  // Local change (pgr4 project, 21/11/2026): the colour channel (0 red, 1 green, 2 blue, -1 none)
 +  // each temp register component holds, followed through the ALU instructions before the fog
 +  // ending (UpdateFogChannels): from the fog colour constants c10 (the scene's) and c32 (the
@@ -939,7 +952,7 @@ index 3b0fd61..f9089a7 100644
    // Writes the specified source (src must be usable as a vector `mov` source,
    // including to x#) to an instruction storage target.
    // can_store_memexport_address is for safety, to allow only proper MADs with a
-@@ -992,6 +1123,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
+@@ -992,6 +1129,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
    uint32_t cbuffer_index_bool_loop_constants_;
    uint32_t cbuffer_index_fetch_constants_;
    uint32_t cbuffer_index_descriptor_indices_;
@@ -6000,7 +6013,7 @@ index 2c31a0e..27e0a66 100644
        if ((color_targets_written & 0b1) && !global_flag_force_early_depth_stencil) {
          ao_.OpDclOutput(dxbc::Dest::OMask());
 diff --git a/src/graphics/pipeline/shader/dxbc_translator_alu.cpp b/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
-index 66834e5..5f04d83 100644
+index 66834e5..f7825a0 100644
 --- a/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
 +++ b/src/graphics/pipeline/shader/dxbc_translator_alu.cpp
 @@ -13,7 +13,9 @@
@@ -6013,7 +6026,7 @@ index 66834e5..5f04d83 100644
  #include <rex/math.h>
  
  namespace rex::graphics {
-@@ -928,6 +930,321 @@ void DxbcShaderTranslator::ProcessScalarAluOperation(
+@@ -928,6 +930,396 @@ void DxbcShaderTranslator::ProcessScalarAluOperation(
    PopSystemTemp(operand_temps);
  }
  
@@ -6055,8 +6068,9 @@ index 66834e5..5f04d83 100644
 +      PopSystemTemp();
 +    }
 +    a_.OpAdd(dest, dxbc::Src::R(system_temp_result_), operands[2]);
-+    // Mode 2: the volumetric fog, the volume made this frame (fog_shader[3].w).
-+    a_.OpIEq(dxbc::Dest::R(mode, 0b0100), dxbc::Src::R(mode, dxbc::Src::kXXXX), dxbc::Src::LU(2));
++    // Mode 2: the volumetric fog, the volume made this frame (fog_shader[3].w); mode 3
++    // (development, 23/11/2026) the same, its values shown.
++    a_.OpUGE(dxbc::Dest::R(mode, 0b0100), dxbc::Src::R(mode, dxbc::Src::kXXXX), dxbc::Src::LU(2));
 +    a_.OpIf(true, dxbc::Src::R(mode, dxbc::Src::kZZZZ));
 +    {
 +      const dxbc::Src ok = LoadSystemConstant(SystemConstants::Index::kFogShader,
@@ -6097,7 +6111,8 @@ index 66834e5..5f04d83 100644
 +        REXGPU_INFO("PGR4 fog ending channels: {:016X} at {} mask {:X} channels {}{}{}{}",
 +                    current_shader().ucode_data_hash(), current_alu_address_, used, channels & 3,
 +                    (channels >> 2) & 3, (channels >> 4) & 3, (channels >> 6) & 3);
-+      EmitVolumetricFog(GetDxbcShaderModification().pixel.fog_form, operands, used, channels);
++      EmitVolumetricFog(GetDxbcShaderModification().pixel.fog_form, operands, used, channels,
++                        mode);
 +      a_.OpEndIf();
 +    }
 +    a_.OpEndIf();
@@ -6122,7 +6137,7 @@ index 66834e5..5f04d83 100644
 +//   form 2 (shadow, D = B T + 1): D = B To + F;
 +//   form 3 (the fog's light, D = (1 - T) F): D = L F / c10.
 +void DxbcShaderTranslator::EmitVolumetricFog(uint32_t form, const dxbc::Src operands[3],
-+                                             uint32_t used, uint32_t channels) {
++                                             uint32_t used, uint32_t channels, uint32_t mode) {
 +  // The components written with the volumetric fog: every one the mad writes (its colour, whatever
 +  // components hold it: xy_w, x_zw, _yzw, ___w as well as xyz_), but not a fourth (alpha).
 +  const uint32_t rgb = used == 0b1111 ? 0b0111u : used;
@@ -6154,9 +6169,29 @@ index 66834e5..5f04d83 100644
 +  const uint32_t v = PushSystemTemp(0b1111);  // the volume: L (rgb), Tv (a)
 +  const uint32_t q = PushSystemTemp();        // a texel; scratch
 +  const uint32_t a = PushSystemTemp();        // the address of a load
++  // Mode 3 (development, 23/11/2026): tg, To, the light's factor / 4, Tv; its second view
++  // (fog_shader[3].w over 1.5): the distance given (guest r1.w) / 4096, ours (z) / 4096, 0.5 + the
++  // height given (guest r2.y) / 512.
++  // Development only (the capture dir set, read once as kFogChannelsLog): mode 3's code is
++  // emitted, never in the release.
++  static const bool kFogDebug = !rex::cvar::GetFlagByName("pgr4_native_capture_dir").empty();
++  const uint32_t dbg = PushSystemTemp();
++  const uint32_t dbg2 = PushSystemTemp();
++  // ... the third view's: Tv as used, A (0 within the range), the ratio.
++  const uint32_t dbg3 = PushSystemTemp();
 +  // tg: the game's transmittance, the mad's T (operand 1; operand 0 for the fog's light).
 +  const dxbc::Src t_operand = form == 3 ? operands[0] : operands[1];
 +  a_.OpMov(dxbc::Dest::R(g, 0b0001), t_operand.Select(0), true);
++  // Local change (23/11/2026, kSysFlag_FogTFromSwizzle): the component the mad reads T from for
++  // its first written component (Select(0) is the register's x whatever the swizzle:
++  // psSceneTreeBillboardLod's r3.zzzz read r3.x, the exponent before exp, so tg 0).
++  uint32_t t_component = 0;
++  while (t_component < 3 && !(used & (1u << t_component))) ++t_component;
++  a_.OpMov(dxbc::Dest::R(f, 0b0001), t_operand.SelectFromSwizzled(t_component), true);
++  a_.OpAnd(dxbc::Dest::R(ci, 0b0001), LoadFlagsSystemConstant(),
++           dxbc::Src::LU(kSysFlag_FogTFromSwizzle));
++  a_.OpMovC(dxbc::Dest::R(g, 0b0001), dxbc::Src::R(ci, dxbc::Src::kXXXX),
++            dxbc::Src::R(f, dxbc::Src::kXXXX), dxbc::Src::R(g, dxbc::Src::kXXXX));
 +  // z = near far / ((far - near) d + near).
 +  a_.OpMAd(dxbc::Dest::R(g, 0b0010), pos.Select(2), fc(1, dxbc::Src::kYYYY), fc(1, dxbc::Src::kZZZZ));
 +  a_.OpDiv(dxbc::Dest::R(g, 0b0010), fc(1, dxbc::Src::kXXXX), dxbc::Src::R(g, dxbc::Src::kYYYY));
@@ -6226,6 +6261,7 @@ index 66834e5..5f04d83 100644
 +  a_.OpAdd(dxbc::Dest::R(v, 0b1000), dxbc::Src::R(v, dxbc::Src::kWWWW), dxbc::Src::LF(-1.0f));
 +  a_.OpMAd(dxbc::Dest::R(v, 0b1000), dxbc::Src::R(v, dxbc::Src::kWWWW),
 +           dxbc::Src::R(g, dxbc::Src::kWWWW), dxbc::Src::LF(1.0f));
++  if (kFogDebug) a_.OpMov(dxbc::Dest::R(dbg3, 0b0010), dxbc::Src::LF(0.0f));
 +  // Beyond the range: A = ours / the game's at the range (its column, the nearest).
 +  a_.OpLT(dxbc::Dest::R(q, 0b0001), fc(0, dxbc::Src::kXXXX), dxbc::Src::R(g, dxbc::Src::kYYYY));
 +  a_.OpIf(true, dxbc::Src::R(q, dxbc::Src::kXXXX));
@@ -6238,6 +6274,7 @@ index 66834e5..5f04d83 100644
 +    a_.OpIMin(dxbc::Dest::R(a, 0b0011), dxbc::Src::R(a), dxbc::Src::R(q));
 +    a_.OpMov(dxbc::Dest::R(a, 0b1100), dxbc::Src::LI(0));  // array slice 0, mip 0
 +    a_.OpLd(dxbc::Dest::R(q, 0b0001), dxbc::Src::R(a), 0b1111, range_tex.Select(0));
++    if (kFogDebug) a_.OpMov(dxbc::Dest::R(dbg3, 0b0010), dxbc::Src::R(q, dxbc::Src::kXXXX));
 +    // Tv' = A tg; L += fog (Tv - Tv'); Tv = Tv'.
 +    a_.OpMul(dxbc::Dest::R(q, 0b0010), dxbc::Src::R(q, dxbc::Src::kXXXX),
 +             dxbc::Src::R(g, dxbc::Src::kXXXX));
@@ -6263,6 +6300,34 @@ index 66834e5..5f04d83 100644
 +  a_.OpLT(dxbc::Dest::R(q, 0b1000), dxbc::Src::R(q, dxbc::Src::kYYYY), dxbc::Src::R(v, dxbc::Src::kWWWW));
 +  a_.OpMovC(dxbc::Dest::R(q, 0b0100), dxbc::Src::R(q, dxbc::Src::kWWWW), dxbc::Src::R(q, dxbc::Src::kZZZZ),
 +            dxbc::Src::LF(1.0f));
++  // Mode 3's second view: the interpolators the guest's r1 and r2 start with, z (g.y).
++  if (kFogDebug) {
++    const uint32_t interpolator_mask = GetModificationInterpolatorMask();
++    auto interpolator = [&](uint32_t i, uint32_t component) -> dxbc::Src {
++      if (i >= xenos::kMaxInterpolators || !(interpolator_mask & (UINT32_C(1) << i)) ||
++          in_reg_ps_interpolators_ == UINT32_MAX)
++        return dxbc::Src::LF(0.0f);
++      return dxbc::Src::V1D(in_reg_ps_interpolators_ +
++                            rex::bit_count(interpolator_mask & ((UINT32_C(1) << i) - 1)))
++          .Select(component);
++    };
++    a_.OpMul(dxbc::Dest::R(dbg2, 0b0001), interpolator(1, 3), dxbc::Src::LF(1.0f / 4096.0f));
++    a_.OpMul(dxbc::Dest::R(dbg2, 0b0010), dxbc::Src::R(g, dxbc::Src::kYYYY),
++             dxbc::Src::LF(1.0f / 4096.0f));
++    a_.OpMAd(dxbc::Dest::R(dbg2, 0b0100), interpolator(2, 1), dxbc::Src::LF(1.0f / 512.0f),
++             dxbc::Src::LF(0.5f));
++    a_.OpMov(dxbc::Dest::R(dbg2, 0b1000), dxbc::Src::LF(0.0f));
++  }
++  // Mode 3's values, before tg (g.x) is written over below.
++  if (kFogDebug) {
++    a_.OpMov(dxbc::Dest::R(dbg, 0b0001), dxbc::Src::R(g, dxbc::Src::kXXXX));
++    a_.OpMov(dxbc::Dest::R(dbg, 0b0010), dxbc::Src::R(q, dxbc::Src::kYYYY));
++    a_.OpMul(dxbc::Dest::R(dbg, 0b0100), dxbc::Src::R(q, dxbc::Src::kZZZZ), dxbc::Src::LF(0.25f));
++    a_.OpMov(dxbc::Dest::R(dbg, 0b1000), dxbc::Src::R(v, dxbc::Src::kWWWW));
++    a_.OpMov(dxbc::Dest::R(dbg3, 0b0001), dxbc::Src::R(v, dxbc::Src::kWWWW));
++    a_.OpMov(dxbc::Dest::R(dbg3, 0b0100), dxbc::Src::R(q, dxbc::Src::kXXXX));
++    a_.OpMov(dxbc::Dest::R(dbg3, 0b1000), dxbc::Src::LF(0.0f));
++  }
 +  // ... and / c12.y: L' = L x that (v.rgb).
 +  a_.OpMul(dxbc::Dest::R(q, 0b0100), dxbc::Src::R(q, dxbc::Src::kZZZZ), fc(2, dxbc::Src::kWWWW));
 +  a_.OpMul(dxbc::Dest::R(v, 0b0111), dxbc::Src::R(v), dxbc::Src::R(q, dxbc::Src::kZZZZ));
@@ -6287,7 +6352,30 @@ index 66834e5..5f04d83 100644
 +  } else {
 +    a_.OpMov(out, dxbc::Src::R(g));
 +  }
-+  PopSystemTemp(7);
++  // Mode 3 (development): the values in place of the colour, each component's channel's (red tg,
++  // green To, blue the light's factor / 4).
++  if (kFogDebug) {
++  a_.OpIEq(dxbc::Dest::R(q, 0b0001), dxbc::Src::R(mode, dxbc::Src::kXXXX), dxbc::Src::LU(3));
++  a_.OpIf(true, dxbc::Src::R(q, dxbc::Src::kXXXX));
++  {
++    // Its views by fog_shader[3].w (pgr4-native draw.cpp: 1 + the view): 0 the above, 1 the
++    // distances and the height, 2 the light added as laid (g, component by component), 3 Tv, A and
++    // the ratio, 4 one (what follows the fog shown alone).
++    a_.OpMov(out, dxbc::Src::R(dbg, channels));
++    const float kAbove[4] = {1.5f, 2.5f, 3.5f, 4.5f};
++    for (uint32_t k = 0; k < 4; ++k) {
++      a_.OpLT(dxbc::Dest::R(q, 0b0010), dxbc::Src::LF(kAbove[k]), fc(3, dxbc::Src::kWWWW));
++      a_.OpIf(true, dxbc::Src::R(q, dxbc::Src::kYYYY));
++      if (k == 0) a_.OpMov(out, dxbc::Src::R(dbg2, channels));
++      else if (k == 1) a_.OpMov(out, dxbc::Src::R(g));
++      else if (k == 2) a_.OpMov(out, dxbc::Src::R(dbg3, channels));
++      else a_.OpMov(out, dxbc::Src::LF(1.0f));
++      a_.OpEndIf();
++    }
++  }
++  a_.OpEndIf();
++  }
++  PopSystemTemp(10);
 +}
 +
 +// Local change (pgr4 project, 21/11/2026): the colour channels the temps hold after this
@@ -6335,7 +6423,7 @@ index 66834e5..5f04d83 100644
  void DxbcShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& instr,
                                                   uint8_t memexport_eM_potentially_written_before) {
    if (instr.IsNop()) {
-@@ -947,6 +1264,18 @@ void DxbcShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& ins
+@@ -947,6 +1339,18 @@ void DxbcShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& ins
    uint32_t vector_result_swizzle = dxbc::Src::kXYZW;
    ProcessVectorAluOperation(instr, memexport_eM_potentially_written_before, vector_result_swizzle,
                              predicate_written_vector);

@@ -103,6 +103,9 @@ class ShaderReplacer {
   // Local change (21/11/2026): replacements with the fog laid by the shader (their file has XeFog
   // at the game's fog ending; their prelude defines it).
   bool UsesFogShader(uint64_t hash) const { return enabled_ && fog_shader_files_.count(hash) != 0; }
+  // Local change (24/11/2026): a replacement drawn with its own blend in the volumetric fog (its
+  // file names PGR4_SHADOW_BLEND: the cars' shadow, draw.cpp CarShadowFogOn).
+  bool UsesShadowBlend(uint64_t hash) const { return enabled_ && shadow_blend_files_.count(hash) != 0; }
   // Local change (pgr4 project): whether this translation's replacement is compiling in the
   // background (Get returned nullptr for it meanwhile).
   bool Pending(const DxbcShader::Translation& translation) {
@@ -142,6 +145,7 @@ class ShaderReplacer {
   std::unordered_set<uint64_t> decal_files_;
   std::unordered_set<uint64_t> fog_volume_files_;  // UsesFogVolume (ClassifyFiles)
   std::unordered_set<uint64_t> fog_shader_files_;  // UsesFogShader (ClassifyFiles)
+  std::unordered_set<uint64_t> shadow_blend_files_;  // UsesShadowBlend (ClassifyFiles)
   void ClassifyFiles();  // reflection_files_ from files_ (mutex_ held or not shared yet)
   std::string tuning_;  // TuningDefines as last compiled with
   std::string tuning_wanted_;   // a changed tuning, applied once it held kTuningFrames

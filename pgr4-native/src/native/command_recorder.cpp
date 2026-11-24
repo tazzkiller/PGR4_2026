@@ -151,6 +151,19 @@ void DrainCommandRecording() {
 }
 
 void CommandRecorder::Put(Op op, const void* a, uint32_t na, const void* b, uint32_t nb) {
+  // Local change (24/11/2026, branch cpu_thread): on this thread's side, in the ring's format.
+  if (Side* side = t_side_) [[unlikely]] {
+    const uint64_t size = (8 + uint64_t(na) + nb + 7) & ~uint64_t(7);
+    std::vector<uint8_t>& v = *side->bytes;
+    const size_t at = v.size();
+    v.resize(at + size);
+    uint8_t* p = v.data() + at;
+    const uint32_t header[2] = {uint32_t(op), uint32_t(size)};
+    std::memcpy(p, header, sizeof(header));
+    if (na) std::memcpy(p + 8, a, na);
+    if (nb) std::memcpy(p + 8 + na, b, nb);
+    return;
+  }
   const DWORD tid = GetCurrentThreadId();
   if (producer_tid_.load(std::memory_order_relaxed) != tid)
     producer_tid_.store(tid, std::memory_order_relaxed);
@@ -207,8 +220,21 @@ void CommandRecorder::WaitReplayed(uint64_t position) {
   producer_waiting_.store(0, std::memory_order_relaxed);
 }
 
+void CommandRecorder::Splice(const uint8_t* data, size_t bytes) {
+  for (size_t i = 0; i + 8 <= bytes;) {
+    uint32_t header[2];
+    std::memcpy(header, data + i, sizeof(header));
+    if (header[1] < 8 || i + header[1] > bytes) break;  // never: Put wrote it
+    Put(Op(header[0]), data + i + 8, header[1] - 8);
+    i += header[1];
+  }
+}
+
 void CommandRecorder::Drain() {
   if (!started_) return;
+  // Local change (24/11/2026, branch cpu_thread): recording on the side, the ring's producer's
+  // packets before first, then this side's commands so far (Side::flush).
+  if (Side* side = t_side_; side && side->flush) side->flush(side->context);
   if (GetCurrentThreadId() != producer_tid_.load(std::memory_order_relaxed)) {
     // Not the recording thread: what it published.
     WaitReplayed(head_.load(std::memory_order_acquire));

@@ -179,8 +179,16 @@ void DetailsApply(uint8_t* base) {
   // (Crowds.Render.LODScalingFactor, the game's 1.2, times it) follow the draw distance (Tazz, 14/11/2026).
   Tunable* instances = nullptr;
   Tunable* crowds = nullptr;
+  // Local change (23/11/2026, Tazz, chosen in the overlay: « pour le mode ultra … que maintenant ces
+  // valeurs pour cette partie soient comme ça »): in Ultra, World.Streaming.LodOffset and ForceLod at
+  // 10. The game copies them to its world (+0x724, +0x720) and makes the streaming's choice again
+  // when they change (sub_823D6F68, sub_823D7258 -> sub_823D89A8). High and the game's: released.
+  Tunable* lod_offset = nullptr;
+  Tunable* force_lod = nullptr;
   for (Tunable& t : g_tunables) {
     if (t.address == 0x82AA2628) limit = &t;  // World.Streaming.ForceMemoryLimitInMb
+    if (t.address == 0x82A99F84) lod_offset = &t;
+    if (t.address == 0x82A99F2C) force_lod = &t;
     if (t.address == 0x82A9856C) instances = &t;
     if (t.address == 0x82AA3B4C) crowds = &t;
   }
@@ -191,6 +199,8 @@ void DetailsApply(uint8_t* base) {
     if (limit) Release(base, *limit);
     if (instances) Release(base, *instances);
     if (crowds) Release(base, *crowds);
+    if (lod_offset) Release(base, *lod_offset);
+    if (force_lod) Release(base, *force_lod);
   } else {
     const float distance = details == 1 ? 1.5f : 2.0f;
     g_pgr4_force_world_max_lod.store(details == 1 ? 5 : 10, std::memory_order_relaxed);
@@ -205,6 +215,13 @@ void DetailsApply(uint8_t* base) {
         crowds->saved = true;
       }
       Force(base, *crowds, crowds->original * distance);
+    }
+    if (details == 2) {
+      if (lod_offset) Force(base, *lod_offset, 10.0f);
+      if (force_lod) Force(base, *force_lod, 10.0f);
+    } else {
+      if (lod_offset) Release(base, *lod_offset);
+      if (force_lod) Release(base, *force_lod);
     }
   }
   REXLOG_INFO("PGR4 details: {}", details == 0 ? "original" : details == 1 ? "high" : "ultra");

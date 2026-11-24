@@ -100,22 +100,12 @@ REXCVAR_DEFINE_STRING(pgr4_native_csv, "", "PGR4 native",
                       "Per-frame CSV of the native path: counts and CPU time per hook class");
 REXCVAR_DEFINE_INT32(pgr4_native_width, 1280, "PGR4 native", "Debug window width");
 REXCVAR_DEFINE_INT32(pgr4_native_height, 720, "PGR4 native", "Debug window height");
-// Local change (18/11/2026, Tazz: "a prerequisite of DLSS"): the game's motion blur off while DLSS
-// runs (ApplyMotionBlurRule), whatever the menu's FLOU DE MOUVEMENT (pgr4_disable_motion_blur,
-// which applies at the game's start); without DLSS, the menu's choice. Read at each frame.
-REXCVAR_DEFINE_BOOL(pgr4_native_dlss_no_motion_blur, true, "PGR4 native",
-                    "The game's motion blur off while DLSS runs (its prerequisite)");
-// Local change (19/11/2026, Tazz: « le flou qui doit se désactiver c'est celui dans les options
-// seulement »): the rule above held the byte at 0 in the photo mode too, so its view lost its
-// motion blur under DLSS. The photo mode (its camera, sub_827D2400, ran in the last frames) gets the
-// menu's choice back, as without DLSS. Read at each frame.
-REXCVAR_DEFINE_BOOL(pgr4_native_dlss_blur_in_photo_mode, true, "PGR4 native",
-                    "Under DLSS, the photo mode keeps the game's motion blur (the menu's choice)");
-// The same for the pause (19/11/2026, Tazz: « active le je vais te dire »): the game's clock still
-// for 6 frames (g_pgr4_game_paused, src/pgr4_hooks.cpp: the pause and the photo mode). Read at each
-// frame.
-REXCVAR_DEFINE_BOOL(pgr4_native_dlss_blur_in_pause, true, "PGR4 native",
-                    "Under DLSS, the pause keeps the game's motion blur (the menu's choice)");
+// Development (23/11/2026, the capture dir only): the game's motion blur at each Swap
+// (ApplyMotionBlurRule). Read at each frame.
+REXCVAR_DEFINE_BOOL(pgr4_native_blur_probe, true, "PGR4 native",
+                    "Development: the game's motion blur byte, the rule, the menu's choice, the "
+                    "race, the pause, the photo mode and the game's blur pass, logged (the capture "
+                    "dir only)");
 REXCVAR_DECLARE(bool, pgr4_disable_motion_blur);  // src/pgr4_hooks.cpp
 REXCVAR_DEFINE_BOOL(pgr4_native_profile, false, "PGR4 native",
                     "Per-stage CPU time of the draw path (RDTSC), appended to the native CSV as "
@@ -195,6 +185,13 @@ bool Pgr4InGameScreen();
 bool Pgr4PhotoModeActive();
 // The game's clock stands still (the pause, the photo mode; draw.cpp, set by src/pgr4_hooks.cpp).
 extern bool g_pgr4_game_paused;
+extern std::atomic<bool> g_pgr4_dev;  // draw.cpp: development (the capture dir set), never in the release
+// The game's blur pass run since the last Swap (pgr4_d3d_trace.cpp, its step hook; development).
+extern std::atomic<uint32_t> g_pgr4_blur_pass_calls;
+// A race's or its replay's screens shown (src/pgr4_menu.cpp), or a race loaded before its first
+// screen (src/pgr4_autopilot.cpp); draw.cpp.
+extern bool g_pgr4_race_screen;
+extern bool g_pgr4_race_loaded;
 REXCVAR_DECLARE(int32_t, pgr4_d3d_stats_frames);
 REXCVAR_DECLARE(bool, pgr4_native_luma_probe);
 REXCVAR_DECLARE(bool, pgr4_native_dlss);
@@ -764,6 +761,8 @@ bool NativeRenderer::CreatePipeline() {
   resolver_->SetChangedCallback([this](uint32_t a) { textures_->OnResolved(a); });
   draw_ = std::make_unique<DrawRenderer>(*this);
   if (!draw_->Initialize()) return false;
+  // Local change (24/11/2026, branch cpu_thread): a pipeline rebuilt on the render thread.
+  if (queue_) draw_->EnableEncodeFeed(true);
   resolver_->set_scene_end([this](ID3D12GraphicsCommandList* list, RenderTargets& targets,
                                   const SurfaceRegs& regs) {
     return draw_->OnSceneEnd(list, targets, regs);
@@ -933,6 +932,7 @@ void NativeRenderer::SwitchUpscaler(bool on) {
 }
 
 void NativeRenderer::BeginFrameModules() {
+  draw_->FlushEncode();  // local change (24/11/2026, branch cpu_thread): settings, rebuilds
   // Local change: the frame's Streamline token, Reflex sleep and DLSS-G mode (streamline.h).
   streamline::BeginFrame(frame_index_);
   {
@@ -1037,6 +1037,7 @@ void NativeRenderer::BeginFrameModules() {
 void NativeRenderer::RenderThreadMain() {
   SetThreadDescription(GetCurrentThread(), L"PGR4 native render");
   Queue& q = *queue_;
+  draw_->EnableEncodeFeed(true);  // local change (24/11/2026, branch cpu_thread)
   for (;;) {
     std::unique_ptr<Queue::Batch> b;
     {
@@ -1047,11 +1048,26 @@ void NativeRenderer::RenderThreadMain() {
       q.pending.pop_front();
     }
     size_t reg = 0;
+    size_t encode_reg = 0;  // local change (24/11/2026, branch cpu_thread): the writes given to B
     uint32_t copies_issued = 0;
     size_t segment = 0;
     for (const Queue::Cmd& c : b->cmds) {
       stats_.reg_writes += c.reg_end - reg;
       for (; reg < c.reg_end; ++reg) q.regs[b->regs[reg].reg] = b->regs[reg].value;
+      // Local change (24/11/2026, branch cpu_thread): the draws on two threads. A draw takes its
+      // writes to B in its packet; anything else waits for B first (it goes past the draws), then
+      // gives B its writes itself.
+      {
+        const uint32_t n = uint32_t(c.reg_end - encode_reg);
+        const RegWrite* const writes = n ? &b->regs[encode_reg] : nullptr;
+        encode_reg = c.reg_end;
+        if (c.kind == Queue::kDraw && !g_failed) {
+          draw_->SetEncodeWrites(writes, n);
+        } else {
+          draw_->FlushEncode();
+          draw_->ApplyEncodeWrites(writes, n);
+        }
+      }
       // A read-back resolve: the guest thread waits for it, also after a failure.
       if (c.kind == Queue::kResolve && b->resolves[c.index].readback) {
         if (!g_failed) {
@@ -1126,6 +1142,8 @@ void NativeRenderer::RenderThreadMain() {
         }
       }
     }
+    // Local change (24/11/2026, branch cpu_thread): B done with the batch's draws and writes.
+    draw_->FlushEncode();
     b->Clear();
     std::lock_guard<std::mutex> lock(q.mutex);
     q.spare.push_back(std::move(b));
@@ -1356,27 +1374,99 @@ void NativeRenderer::OnResolve(const uint8_t* base, const HookArgs& args) {
 }
 
 // The game's own switch, Render.PostProcess.MotionBlur.Enable (a byte at 0x82C98CA4, its engine
-// variable: work/rea/variables_moteur.tsv), which its post-processing (sub_8285A848) reads at each
-// frame before its blur pass, and which the photo mode's shutter (sub_824B86F8) saves, sets to 0
-// for its sub-frames and puts back. While DLSS runs, out of the photo mode: 0 at each frame. When
-// DLSS stops or the photo mode starts: the menu's choice, once, and nothing after (the photo mode's
-// shutter keeps its own saving and putting back). Guest thread, at the Swap, before the next frame's
-// post-processing.
+// variable: work/rea/variables_moteur.tsv), on by default, which its post-processing reads at each
+// frame (sub_824C0870; sub_8285A848 runs its blur pass sub_82859FC0 if it and
+// *(0x82A93A8C)+0x81 are set). The game itself only changes it in the photo mode's shutter
+// (sub_824B86F8): saved, 0 for its sub-frames, put back, in one call (no Swap between).
+//
+// Local change (23/11/2026, Tazz: « ça doit bien suivre la logique du jeu qui le garde toujours
+// actif dans le menu ou le mode photo »): the menu's FLOU DE MOUVEMENT (pgr4_disable_motion_blur)
+// is for a race and its replay only, and applies at once (the game's start only before, through
+// Pgr4MotionBlurFlagHook); the menus, the pause and the photo mode keep it on, as the game does.
+// This replaces the rule of 18/11 (off while DLSS runs) and its switches. Guest thread, at the
+// Swap, before the next frame's post-processing. A change is written as the shutter does: the
+// value, its flags word (0x82C98C9C, big-endian: its low byte at +3) |= 4, and 0x82C91B9D = 1.
+namespace {
+// Development (pgr4_native_blur_probe, the capture dir only): at each Swap, in values, the byte
+// the frame just drawn read (its post-processing runs before the Swap), the game's blur pass run
+// in it (g_pgr4_blur_pass_calls), the rule's inputs and what it wrote. A line at each change of
+// those, a summary every 2 s, with the faulty states flagged: the byte changed during the frame
+// by someone else than the rule, the blur pass run with the byte at 0, the byte not the rule's.
+struct BlurProbe {
+  int left = -1;  // the byte as the last Swap left it
+  uint32_t last_key = ~0u;
+  uint64_t frames = 0, byte_on = 0, drawn = 0, calls = 0, race = 0, pause = 0, photo = 0,
+           written = 0, changed_in_frame = 0, drawn_off = 0, not_rule = 0, on_no_pass = 0;
+  uint64_t last_log_ns = 0;
+};
+BlurProbe g_blur_probe;
+}  // namespace
+
 void NativeRenderer::ApplyMotionBlurRule(uint8_t* base) {
   constexpr uint32_t kMotionBlurEnable = 0x82C98CA4;
   uint8_t& enable = base[kMotionBlurEnable];
-  const bool photo = (REXCVAR_GET(pgr4_native_dlss_blur_in_photo_mode) && Pgr4PhotoModeActive()) ||
-                     (REXCVAR_GET(pgr4_native_dlss_blur_in_pause) && g_pgr4_game_paused);
-  if (dlss_running() && REXCVAR_GET(pgr4_native_dlss_no_motion_blur) && !photo) {
-    if (!blur_held_off_) REXLOG_INFO("PGR4 native: the game's motion blur off while DLSS runs");
-    enable = 0;
-    blur_held_off_ = true;
-  } else if (blur_held_off_) {
-    enable = REXCVAR_GET(pgr4_disable_motion_blur) ? 0 : 1;
-    blur_held_off_ = false;
-    REXLOG_INFO("PGR4 native: the game's motion blur back to the menu's choice ({}){}",
-                enable ? "on" : "off", photo ? ", the photo mode or the pause" : "");
+  const uint8_t drew = enable;  // what the frame just drawn read
+  const bool photo_mode = Pgr4PhotoModeActive();
+  const bool paused = g_pgr4_game_paused;  // the pause and the photo mode: the game's clock still
+  const bool race = (g_pgr4_race_screen || g_pgr4_race_loaded) && !paused && !photo_mode;
+  const bool menu_on = !REXCVAR_GET(pgr4_disable_motion_blur);
+  const uint8_t want = race && !menu_on ? 0 : 1;
+  const bool write = enable != want;
+  if (write) {
+    enable = want;
+    base[0x82C98C9F] |= 4;
+    base[0x82C91B9D] = 1;
   }
+  const uint32_t calls = g_pgr4_blur_pass_calls.exchange(0, std::memory_order_relaxed);
+  if (!g_pgr4_dev || !REXCVAR_GET(pgr4_native_blur_probe)) return;
+  BlurProbe& p = g_blur_probe;
+  if (!p.last_log_ns) p.last_log_ns = NowNs();
+  const bool changed = p.left >= 0 && drew != p.left;
+  const bool drawn_off = calls != 0 && drew == 0;
+  const bool not_rule = !write && p.left >= 0 && drew != want;
+  ++p.frames;
+  p.byte_on += drew != 0;
+  p.drawn += calls != 0;
+  p.calls += calls;
+  p.race += race;
+  p.pause += paused;
+  p.photo += photo_mode;
+  p.written += write;
+  p.changed_in_frame += changed;
+  p.drawn_off += drawn_off;
+  p.not_rule += not_rule;
+  // The byte on in a 3D scene's frame without the blur pass (the game's other condition,
+  // sub_8285A848: told, not a fault).
+  p.on_no_pass += drew != 0 && calls == 0 && last_frame_scene_.load(std::memory_order_relaxed);
+  p.left = enable;
+  const uint32_t key = uint32_t(drew != 0) | uint32_t(want) << 1 | uint32_t(race) << 2 |
+                       uint32_t(g_pgr4_race_screen) << 3 | uint32_t(g_pgr4_race_loaded) << 4 |
+                       uint32_t(paused) << 5 | uint32_t(photo_mode) << 6 | uint32_t(menu_on) << 7;
+  if (key != p.last_key || changed || drawn_off || not_rule) {
+    REXLOG_INFO(
+        "PGR4 blur probe change: frame {}: the byte drawn with {}, left for the next {}{}; the blur "
+        "pass {} calls; the menu {}; the race {} (its screen {}, loaded {}), the pause {}, the "
+        "photo mode {}{}{}{}",
+        p.frames, drew, enable, write ? " (written)" : "", calls, menu_on ? "on" : "off", race,
+        g_pgr4_race_screen, g_pgr4_race_loaded, paused, photo_mode,
+        changed ? " CHANGED IN THE FRAME" : "", drawn_off ? " DRAWN WHILE OFF" : "",
+        not_rule ? " NOT THE RULE'S" : "");
+    p.last_key = key;
+  }
+  const uint64_t now = NowNs();
+  if (now - p.last_log_ns < 2'000'000'000ull) return;
+  REXLOG_INFO(
+      "PGR4 blur probe: {} frames: the byte on in {}, the blur pass run in {} ({} calls), the byte "
+      "on in a 3D frame without it {}; the race in {}, the pause in {}, the photo mode in {}; "
+      "written {}; the menu {}{}{}{}",
+      p.frames, p.byte_on, p.drawn, p.calls, p.on_no_pass, p.race, p.pause, p.photo, p.written,
+      menu_on ? "on" : "off", p.changed_in_frame ? " CHANGED IN THE FRAME" : "",
+      p.drawn_off ? " DRAWN WHILE OFF" : "", p.not_rule ? " NOT THE RULE'S" : "");
+  const BlurProbe kept = p;
+  p = BlurProbe{};
+  p.left = kept.left;
+  p.last_key = kept.last_key;
+  p.last_log_ns = now;
 }
 
 void NativeRenderer::OnSwap(uint8_t* base, const HookArgs& args) {
@@ -1468,6 +1558,9 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
   const uint64_t t0 = Ticks();
   profile::Begin();
   BeginFrame();
+  // Local change (24/11/2026, branch cpu_thread): this draw's commands on the side (B splices
+  // them before its own), until EndDrawSide; in line, nothing.
+  draw_->BeginDrawSide(state.regs);
   ++stats_.draws;
   // Local change: the scene's passes (split screen, LimitFrameRate's neighbour below).
   if (Upscaler::IsScene(state.regs[rex::graphics::XE_GPU_REG_RB_SURFACE_INFO]))
@@ -1493,6 +1586,7 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
       hudless_capture_->BeforeDraw(device_->recording_list(), frame_index_, state.regs))
     draw_->InvalidateListState();
   draw_->OnDraw(state, prep);
+  draw_->EndDrawSide();  // local change (24/11/2026, branch cpu_thread)
   SubmitEarly();
   const uint64_t dt = Ticks() - t0;
   draw_ticks_ += dt;
@@ -1669,6 +1763,7 @@ void NativeRenderer::SubmitEarly() {
   if (every <= 0 || stats_.draws - draws_submitted_ < uint64_t(every) || !textures_->UploadsDone())
     return;
   profile::Scope scope(profile::kSubmit);
+  draw_->FlushEncode();  // local change (24/11/2026, branch cpu_thread): the ring's producer A
   if (!CloseUploadLists() || !device_->Submit(upload_lists_)) return Fail();
   draw_->InvalidateListState(DrawRenderer::ListBreak::kSubmit);
   draws_submitted_ = stats_.draws;
@@ -1847,8 +1942,6 @@ uint64_t NativeRenderer::LimitFrameRate() {
 
 void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   const uint64_t t0 = NowNs();
-  // Local change: for the guest thread's ApplyMotionBlurRule.
-  dlss_running_.store(upscaler_on_ && upscaler_ && upscaler_->dlss(), std::memory_order_relaxed);
   TunablesApply();  // local change (development): the game's settings forced (tunables.h)
   // Local change (pgr4 project): a frame with a 3D scene (a pass of the scene's surface, counted
   // until SplitScreenUpscaler below), or a race's screen (the game's InGame\ scripts), is not

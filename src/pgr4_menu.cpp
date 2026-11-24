@@ -64,7 +64,6 @@ REXCVAR_DECLARE(std::string, fullscreen_resolution);
 extern bool g_pgr4_race_screen;  // pgr4-native draw.cpp
 extern bool g_pgr4_race_loaded;  // pgr4-native draw.cpp: the race's weather read, no screen since
 REXCVAR_DECLARE(bool, pgr4_disable_motion_blur);
-REXCVAR_DECLARE(bool, pgr4_native_dlss_no_motion_blur);  // pgr4-native renderer.cpp
 REXCVAR_DECLARE(int32_t, pgr4_native_present_interval);
 REXCVAR_DECLARE(int32_t, pgr4_native_brightness);
 REXCVAR_DECLARE(std::string, pgr4_script_dump_dir);
@@ -211,8 +210,6 @@ enum Text : uint32_t {
   kImageOpen,   // the same with "(A to configure)" (~~{A}~~: the button's icon), GRAPHICS's row
   kRestartTitle,    // the render scale changed: the popup asking to restart the game
   kRestartMessage,
-  kWelcomeTitle,    // the first screen (Intro\TitleMovies.lua), in place of IDS_WARNING
-  kWelcomeText,     // and of IDS_DISCLAIMER
   kVsyncRow,  // the same word in every language
   kDetailOriginal,  // the enhanced details' choices, the same words too
   kDetailHigh,
@@ -223,6 +220,14 @@ enum Text : uint32_t {
   kAspect219,
   kAspect329,
   kVolumetricRow,  // GRAPHICS's volumetric effects (pgr4_native_volumetric), off / on
+  // Local change (23/11/2026): off / on agreeing with their row in French, Spanish and Italian
+  // (kOff and kOn are feminine singular there, la génération d'images, la generación, la
+  // generazione): the HD textures feminine plural, the enhanced and volumetric effects masculine
+  // plural. Every other language: kOff and kOn (TextIn), the same words on every row.
+  kOffFemPlural,
+  kOnFemPlural,
+  kOffMascPlural,
+  kOnMascPlural,
   kTextCount
 };
 // IDS_OVER_A_SYSTEM_LINK_HELP (PGR4UIStrings.loc), the Multiplayer menu's system link line:
@@ -244,7 +249,7 @@ const char16_t* const kTexts[kTextCount] = {
     nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr, nullptr,
     nullptr,  u"X2",    u"X3",    u"X4",    u"X5",    u"X6",    u"MSAA",
     u"DLSS FRAME GENERATION", u"FSR FRAME GENERATION", nullptr, u"60%", u"70%", u"80%", u"90%",
-    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.5 (TAZZ)",
+    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.6 (TAZZ)",
 };
 
 // The others, in each of the game's languages (the loc folders' order), every glyph one the game's
@@ -261,7 +266,7 @@ constexpr Text kLocalized[] = {kTitle,     kUpscaler,     kUpscalerOff, kQuality
                                kSignOutTitle, kSignOutMessage, kLocalXenonHelp,
                                kLocalXenonHelpPs, kSharpRow, kShotHint,
                                kHdRow, kReflectRow, kDetailsRow, kAoRow, kImageRow, kImageOpen,
-                               kRestartTitle, kRestartMessage, kWelcomeTitle, kWelcomeText,
+                               kRestartTitle, kRestartMessage,
                                kAspectRow, kVolumetricRow};
 constexpr size_t kLocalizedCount = std::size(kLocalized);
 const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
@@ -284,7 +289,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ANIZOTROPIE",
         u"HRA",
         u"ZOBRAZENÍ",
-        u"Režim okna a rozlišení vykreslování",
+        u"Režim okna, rozlišení, limit snímků/s a jas",
         u"Obraz a plynulost, textury HD, efekty, anizotropie a rozmazání pohybem",
         u"REŽIM OKNA",
         u"V OKNĚ",
@@ -315,8 +320,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"OBRAZ A PLYNULOST (~~{A}~~ PRO NASTAVENÍ )",
         u"RESTARTOVAT HRU",
         u"Toto nastavení vyžaduje restart hry. Probíhající závod bude ztracen. Restartovat nyní?",
-        u"VÍTEJTE",
-        u"Project Gotham Racing 4 edice 2026 je vylepšená verze hry s novými vizuálními efekty a novými grafickými možnostmi. Tato verze by nevznikla bez práce těchto autorů: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Velké díky jim oběma.",
         u"POMĚR STRAN",
         u"OBJEMOVÉ EFEKTY",
     },
@@ -339,7 +342,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ANISOTROPIE",
         u"SPIEL",
         u"ANZEIGE",
-        u"Fenstermodus und Render-Auflösung",
+        u"Fenstermodus, Auflösung, Bildratenlimit und Helligkeit",
         u"Bild und Flüssigkeit, HD-Texturen, Effekte, Anisotropie und Bewegungsunschärfe",
         u"FENSTERMODUS",
         u"FENSTER",
@@ -370,8 +373,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"BILD UND FLÜSSIGKEIT (~~{A}~~ ZUM EINSTELLEN )",
         u"SPIEL NEU STARTEN",
         u"Diese Einstellung erfordert einen Neustart des Spiels. Ein laufendes Rennen geht verloren. Jetzt neu starten?",
-        u"WILLKOMMEN",
-        u"Project Gotham Racing 4 Edition 2026 ist eine verbesserte Version des Spiels mit neuen visuellen Effekten und neuen Grafikoptionen. Diese Version gäbe es nicht ohne die Arbeit von: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Vielen Dank an die beiden.",
         u"BILDFORMAT",
         u"VOLUMETRISCHE EFFEKTE",
     },
@@ -381,7 +382,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"MSAA",
         u"QUALITY",
         u"AUTO",
-        u"NATIVE (100 %)",
+        u"NATIVE (100%)",
         u"QUALITY",
         u"BALANCED",
         u"PERFORMANCE",
@@ -425,8 +426,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"IMAGE AND SMOOTHNESS (~~{A}~~ TO CONFIGURE )",
         u"RESTART GAME",
         u"This setting requires restarting the game. A race in progress will be lost. Restart now?",
-        u"WELCOME",
-        u"Project Gotham Racing 4 Edition 2026 is an enhanced version of the game with new visual effects and new graphics options. This version would not exist without the work of: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Many thanks to them.",
         u"ASPECT RATIO",
         u"VOLUMETRIC EFFECTS",
     },
@@ -438,7 +437,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"AUTO",
         u"NATIVA (100 %)",
         u"CALIDAD",
-        u"EQUILIBRADO",
+        u"EQUILIBRADA",
         u"RENDIMIENTO",
         u"ULTRA RENDIMIENTO",
         u"GENERACIÓN DE FOTOGRAMAS",
@@ -449,7 +448,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ANISOTROPÍA",
         u"JUEGO",
         u"PANTALLA",
-        u"Modo de ventana y resolución de renderizado",
+        u"Modo de ventana, resolución, límite de FPS y brillo",
         u"Imagen y fluidez, texturas HD, efectos, anisotropía y desenfoque de movimiento",
         u"MODO DE VENTANA",
         u"VENTANA",
@@ -480,8 +479,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"IMAGEN Y FLUIDEZ (~~{A}~~ PARA CONFIGURAR )",
         u"REINICIAR EL JUEGO",
         u"Este ajuste requiere reiniciar el juego. Se perderá la carrera en curso. ¿Reiniciar ahora?",
-        u"BIENVENIDO",
-        u"Project Gotham Racing 4 Edición 2026 es una versión mejorada del juego con nuevos efectos visuales y nuevas opciones gráficas. Esta versión no existiría sin el trabajo de: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Muchas gracias a ambos.",
         u"FORMATO DE IMAGEN",
         u"EFECTOS VOLUMÉTRICOS",
     },
@@ -493,7 +490,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"AUTO",
         u"NATIVE (100 %)",
         u"QUALITÉ",
-        u"ÉQUILIBRÉ",
+        u"ÉQUILIBRÉE",
         u"PERFORMANCE",
         u"ULTRA PERFORMANCE",
         u"GÉNÉRATION D'IMAGES",
@@ -535,8 +532,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"IMAGE ET FLUIDITÉ (~~{A}~~ POUR CONFIGURER )",
         u"REDÉMARRER LE JEU",
         u"Ce réglage nécessite de redémarrer le jeu. Une course en cours sera perdue. Redémarrer maintenant ?",
-        u"BIENVENUE",
-        u"Project Gotham Racing 4 édition 2026 est une version améliorée du jeu proposant de nouveaux effets visuels et de nouvelles options graphiques. Cette version n'existerait pas sans le travail effectué par : ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Un grand merci à eux.",
         u"FORMAT D'IMAGE",
         u"EFFETS VOLUMÉTRIQUES",
     },
@@ -559,7 +554,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ANIZOTRÓPIA",
         u"JÁTÉK",
         u"KIJELZŐ",
-        u"Ablakmód és megjelenítési felbontás",
+        u"Ablakmód, felbontás, FPS-korlát és fényerő",
         u"Kép és folyamatosság, HD textúrák, effektek, környezeti árnyékolás, anizotrópia és mozgási elmosódás",
         u"ABLAKMÓD",
         u"ABLAKOS",
@@ -577,7 +572,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"KÉPERNYŐFELBONTÁS",
         u"FÉNYERŐ",
         u"2. JÁTÉKOS",
-        u"Kijelentkezteted a 2. játékost, és visszatérsz egy játékosra?",
+        u"Kijelentkezteted a 2. játékost, és visszaváltasz egyjátékos módra?",
         u"2. játékos: BACK + START a be- vagy kijelentkezéshez",
         u"2. játékos: SHARE + OPTIONS a be- vagy kijelentkezéshez",
         u"ÉLESSÉG",
@@ -590,8 +585,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"KÉP ÉS FOLYAMATOSSÁG (~~{A}~~: BEÁLLÍTÁS )",
         u"JÁTÉK ÚJRAINDÍTÁSA",
         u"Ehhez a beállításhoz újra kell indítani a játékot. A folyamatban lévő verseny elvész. Újraindítás most?",
-        u"ÜDVÖZÖLJÜK",
-        u"A Project Gotham Racing 4 2026-os kiadása a játék továbbfejlesztett változata új vizuális effektekkel és új grafikai beállításokkal. Ez a változat nem jöhetett volna létre a következők munkája nélkül: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Köszönjük nekik.",
         u"KÉPARÁNY",
         u"VOLUMETRIKUS EFFEKTEK",
     },
@@ -614,7 +607,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ANISOTROPIA",
         u"GIOCO",
         u"SCHERMO",
-        u"Modalità finestra e risoluzione di rendering",
+        u"Modalità finestra, risoluzione, limite FPS e luminosità",
         u"Immagine e fluidità, texture HD, effetti, anisotropia e sfocatura di movimento",
         u"MODALITÀ FINESTRA",
         u"FINESTRA",
@@ -645,8 +638,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"IMMAGINE E FLUIDITÀ (~~{A}~~ PER CONFIGURARE )",
         u"RIAVVIA IL GIOCO",
         u"Questa impostazione richiede il riavvio del gioco. Una gara in corso andrà persa. Riavviare ora?",
-        u"BENVENUTO",
-        u"Project Gotham Racing 4 Edizione 2026 è una versione migliorata del gioco con nuovi effetti visivi e nuove opzioni grafiche. Questa versione non esisterebbe senza il lavoro di: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Un grande grazie a loro.",
         u"FORMATO IMMAGINE",
         u"EFFETTI VOLUMETRICI",
     },
@@ -669,7 +660,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"異方性フィルタリング",
         u"ゲーム",
         u"ディスプレイ",
-        u"ウィンドウモードと描画サイズ",
+        u"ウィンドウモード、ディスプレイサイズ、フレームレート上限、輝度",
         u"画質となめらかさ、HDテクスチャ、エフェクト、異方性フィルタリング、モーションブラー",
         u"ウィンドウモード",
         u"ウィンドウ",
@@ -685,9 +676,9 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ローカルネットワーク (LAN) または VPN で他のプレイヤーと対戦",
         u"画面分割またはネットワーク (LAN または VPN) で他のプレイヤーと対戦",
         u"ディスプレイサイズ",
-        u"GAMMA",
-        u"PLAYER 2",
-        u"Sign player 2 out and go back to one player?",
+        u"輝度",
+        u"プレイヤー2",
+        u"プレイヤー2をサインアウトして1人プレイに戻りますか?",
         u"プレイヤー2: BACK + START でサインイン/サインアウト",
         u"プレイヤー2: SHARE + OPTIONS でサインイン/サインアウト",
         u"シャープネス",
@@ -700,8 +691,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"画質となめらかさ (~~{A}~~で設定 )",
         u"ゲームを再起動",
         u"この設定にはゲームの再起動が必要です。進行中のレースは失われます。再起動しますか?",
-        u"ようこそ",
-        u"Project Gotham Racing 4 エディション 2026 は、新しい視覚効果とグラフィック設定を加えた強化バージョンです。このバージョンは次の方々の作業なしには存在しませんでした。 ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~ありがとうございます。",
         u"画面比率",
         u"ボリューメトリックエフェクト",
     },
@@ -724,7 +713,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"비등방성 필터링",
         u"게임",
         u"디스플레이",
-        u"창 모드와 해상도",
+        u"창 모드, 화면 해상도, 프레임 제한, 밝기",
         u"화질과 부드러움, HD 질감, 효과, 주변광 음영, 비등방성 필터링, 모션 블러",
         u"창 모드",
         u"창",
@@ -740,9 +729,9 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"로컬 네트워크(LAN) 또는 VPN으로 다른 플레이어와 대전합니다.",
         u"화면 분할 또는 네트워크(LAN 또는 VPN)로 다른 플레이어와 함께 플레이합니다.",
         u"화면 해상도",
-        u"GAMMA",
-        u"PLAYER 2",
-        u"Sign player 2 out and go back to one player?",
+        u"밝기",
+        u"플레이어 2",
+        u"플레이어 2를 로그아웃하고 1인 플레이로 돌아가시겠습니까?",
         u"플레이어 2: BACK + START로 로그인/로그아웃",
         u"플레이어 2: SHARE + OPTIONS로 로그인/로그아웃",
         u"선명도",
@@ -755,10 +744,8 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"화질과 부드러움 (~~{A}~~로 설정 )",
         u"게임 다시 시작",
         u"이 설정을 적용하려면 게임을 다시 시작해야 합니다. 진행 중인 레이스는 사라집니다. 지금 다시 시작하시겠습니까?",
-        u"환영합니다",
-        u"Project Gotham Racing 4 에디션 2026은 새로운 시각 효과와 그래픽 옵션을 더한 향상된 버전입니다. 이 버전은 다음 분들의 작업이 없었다면 존재하지 않았을 것입니다. ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~두 분께 감사드립니다.",
         u"화면비",
-        u"볼류메트릭 효과",
+        u"체적 효과",
     },
     {  // pl
         u"GRAFIKA",
@@ -768,7 +755,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"AUTO",
         u"NATYWNA (100 %)",
         u"JAKOŚĆ",
-        u"ZRÓWNOWAŻONY",
+        u"ZRÓWNOWAŻONA",
         u"WYDAJNOŚĆ",
         u"ULTRA WYDAJNOŚĆ",
         u"GENEROWANIE KLATEK",
@@ -779,7 +766,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ANIZOTROPIA",
         u"GRA",
         u"EKRAN",
-        u"Tryb okna i rozdzielczość renderowania",
+        u"Tryb okna, rozdzielczość, limit klatek/s i jasność",
         u"Obraz i płynność, tekstury HD, efekty, anizotropia i rozmycie ruchu",
         u"TRYB OKNA",
         u"OKNO",
@@ -810,8 +797,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"OBRAZ I PŁYNNOŚĆ (~~{A}~~, ABY USTAWIĆ )",
         u"URUCHOM GRĘ PONOWNIE",
         u"To ustawienie wymaga ponownego uruchomienia gry. Trwający wyścig zostanie utracony. Uruchomić ponownie teraz?",
-        u"WITAJ",
-        u"Project Gotham Racing 4 Edycja 2026 to ulepszona wersja gry z nowymi efektami wizualnymi i nowymi opcjami graficznymi. Ta wersja nie powstałaby bez pracy: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Wielkie dzięki dla nich.",
         u"PROPORCJE OBRAZU",
         u"EFEKTY WOLUMETRYCZNE",
     },
@@ -825,7 +810,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"КАЧЕСТВО",
         u"БАЛАНС",
         u"ПРОИЗВОДИТЕЛЬНОСТЬ",
-        u"УЛЬТРА ПРОИЗВОДИТЕЛЬНОСТЬ",
+        u"УЛЬТРАПРОИЗВОДИТЕЛЬНОСТЬ",
         u"ГЕНЕРАЦИЯ КАДРОВ",
         u"ВЫКЛ.",
         u"ВКЛ.",
@@ -834,7 +819,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"АНИЗОТРОПИЯ",
         u"ИГРА",
         u"ЭКРАН",
-        u"Режим окна и разрешение рендера",
+        u"Режим окна, разрешение, ограничение FPS и яркость",
         u"Изображение и плавность, HD-текстуры, эффекты, анизотропия и размытие в движении",
         u"РЕЖИМ ОКНА",
         u"В ОКНЕ",
@@ -865,8 +850,6 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"ИЗОБРАЖЕНИЕ И ПЛАВНОСТЬ (~~{A}~~: НАСТРОЙКА )",
         u"ПЕРЕЗАПУСК ИГРЫ",
         u"Для этого параметра нужно перезапустить игру. Текущая гонка будет потеряна. Перезапустить сейчас?",
-        u"ДОБРО ПОЖАЛОВАТЬ",
-        u"Project Gotham Racing 4 Издание 2026 — это улучшенная версия игры с новыми визуальными эффектами и новыми настройками графики. Эта версия не появилась бы без работы: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~Большое им спасибо.",
         u"ФОРМАТ ЭКРАНА",
         u"ОБЪЕМНЫЕ ЭФФЕКТЫ",
     },
@@ -889,8 +872,8 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"各向异性过滤",
         u"游戏",
         u"显示",
-        u"窗口模式与图像尺寸",
-        u"画质与速度、高清材质、效果、各向异性过滤与动态模糊",
+        u"窗口模式、显示尺寸、每秒图像上限与亮度",
+        u"图像与顺滑度、高清材质、效果、各向异性过滤与动态模糊",
         u"窗口模式",
         u"窗口",
         u"无边框",
@@ -905,23 +888,21 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"通过局域网 (LAN) 或 VPN 与其他玩家对战",
         u"通过分屏或网络 (LAN 或 VPN) 与其他玩家对战",
         u"显示尺寸",
-        u"GAMMA",
-        u"PLAYER 2",
-        u"Sign player 2 out and go back to one player?",
+        u"亮度",
+        u"玩家 2",
+        u"要注销玩家 2 并返回单人游戏吗?",
         u"玩家 2：按 BACK + START 登录或注销",
         u"玩家 2：按 SHARE + OPTIONS 登录或注销",
         u"锐化",
-        u"截图 ~~{S}~~",
+        u"屏幕快照 ~~{S}~~",
         u"高清材质",
         u"增强效果",
         u"增强细节",
         u"环境光阴影",
-        u"画质与速度",
-        u"画质与速度 (~~{A}~~ 设置 )",
+        u"图像与顺滑度",
+        u"图像与顺滑度 (~~{A}~~ 设置 )",
         u"重新启动游戏",
         u"此设置需要重新启动游戏。正在进行的比赛将会丢失。现在重新启动吗?",
-        u"欢迎",
-        u"Project Gotham Racing 4 2026 版是游戏的增强版本,加入了新的视觉效果和新的图形选项。没有以下人员的工作,就没有这个版本: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~非常感谢他们。",
         u"屏幕比例",
         u"体积效果",
     },
@@ -944,7 +925,7 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"非等向性過濾",
         u"遊戲",
         u"顯示",
-        u"視窗模式與影像大小",
+        u"視窗模式、顯示大小、畫格率上限與亮度",
         u"畫質與流暢度、高畫質材質、效果、非等向性過濾與動態模糊",
         u"視窗模式",
         u"視窗",
@@ -960,23 +941,21 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"透過區域網路 (LAN) 或 VPN 與其他車手競速",
         u"透過分割畫面或網路 (LAN 或 VPN) 與其他車手競速",
         u"顯示大小",
-        u"GAMMA",
-        u"PLAYER 2",
-        u"Sign player 2 out and go back to one player?",
+        u"亮度",
+        u"玩家 2",
+        u"要登出玩家 2 並返回單人遊戲嗎？",
         u"玩家 2：按 BACK + START 登入或登出",
         u"玩家 2：按 SHARE + OPTIONS 登入或登出",
         u"銳化",
-        u"截圖 ~~{S}~~",
+        u"螢幕快照 ~~{S}~~",
         u"高畫質材質",
         u"增強效果",
         u"增強細節",
-        u"環境遮光",
+        u"環境光阻隔",
         u"畫質與流暢度",
         u"畫質與流暢度 (~~{A}~~ 設定 )",
         u"重新啟動遊戲",
-        u"此設定需要重新啟動遊戲。進行中的比賽將會遺失。現在重新啟動嗎?",
-        u"歡迎",
-        u"Project Gotham Racing 4 2026 版是遊戲的增強版本,加入了新的視覺效果和新的圖形選項。沒有以下人員的工作,就沒有這個版本: ~~/n~~Beatrixzy ~~/n~~github.com/beatrixzy/PGR4-Recomp ~~/n~~~~/n~~Shaunsingh ~~/n~~github.com/shaunsingh/pgr4-native ~~/n~~~~/n~~非常感謝他們。",
+        u"此設定需要重新啟動遊戲。進行中的比賽將會遺失。現在重新啟動嗎？",
         u"畫面比例",
         u"體積效果",
     },
@@ -1154,6 +1133,20 @@ const char16_t* TextIn(Lang lang, Text t) {
     text.assign(fps.begin(), fps.end());
     return text.c_str();
   }
+  // Off / on agreeing with their row: French's, Spanish's and Italian's own, kOff and kOn in the
+  // others.
+  if (t >= kOffFemPlural && t <= kOnMascPlural) {
+    static constexpr const char16_t* kFrench[] = {u"DÉSACTIVÉES", u"ACTIVÉES", u"DÉSACTIVÉS",
+                                                  u"ACTIVÉS"};
+    static constexpr const char16_t* kSpanish[] = {u"DESACTIVADAS", u"ACTIVADAS", u"DESACTIVADOS",
+                                                   u"ACTIVADOS"};
+    static constexpr const char16_t* kItalian[] = {u"DISATTIVATE", u"ATTIVATE", u"DISATTIVATI",
+                                                   u"ATTIVATI"};
+    if (lang == kFr) return kFrench[t - kOffFemPlural];
+    if (lang == kEs) return kSpanish[t - kOffFemPlural];
+    if (lang == kIt) return kItalian[t - kOffFemPlural];
+    return TextIn(lang, (t - kOffFemPlural) % 2 == 0 ? kOff : kOn);
+  }
   if (t == kGtaoRow) return u"GTAO";
   if (t == kVsyncRow) return u"VSYNC";
   if (t == kDetailOriginal) return u"ORIGINAL";
@@ -1257,9 +1250,6 @@ Values CurrentValues() {
   v.aniso = IndexOf(kAniso, int(REXCVAR_GET(pgr4_native_anisotropy)), 0);
   v.window = !REXCVAR_GET(fullscreen) ? 0 : (REXCVAR_GET(fullscreen_exclusive) ? 2 : 1);
   v.blur = REXCVAR_GET(pgr4_disable_motion_blur) ? 0 : 1;
-  // Local change (18/11/2026): the blur is off while DLSS runs (NativeRenderer::
-  // ApplyMotionBlurRule): the row says so.
-  if (r && r->dlss_running() && REXCVAR_GET(pgr4_native_dlss_no_motion_blur)) v.blur = 0;
   const std::string vsync = rex::cvar::GetFlagByName("d3d12_present_vsync");
   v.vsync = vsync == "true" || vsync == "1" ? 1 : 0;
   v.gtao = REXCVAR_GET(pgr4_native_gtao) ? 1 : 0;
@@ -1336,14 +1326,14 @@ std::vector<Row> RowsFor(Page page, const Values& v) {
   if (page == kGraphicsPage) {
     // IMAGE AND SMOOTHNESS: the upscaler, its page on A (PN_open).
     rows.push_back({"image", kImageOpen, upscalers, upscaler});
-    rows.push_back({"hd", kHdRow, {kOff, kOn}, v.hd});
-    rows.push_back({"reflect", kReflectRow, {kOff, kOn}, v.reflect});
+    rows.push_back({"hd", kHdRow, {kOffFemPlural, kOnFemPlural}, v.hd});
+    rows.push_back({"reflect", kReflectRow, {kOffMascPlural, kOnMascPlural}, v.reflect});
     rows.push_back({"details", kDetailsRow, {kDetailOriginal, kDetailHigh, kDetailUltra}, v.details});
     // Local change (21/11/2026, Tazz): the volumetric fog and lights, the overlay's checkbox
     // (pgr4_native_volumetric, read at each frame), off by default.
     // Local change (22/11/2026): only with the launcher's VOLUMETRIC EFFECTS on.
     if (REXCVAR_GET(pgr4_native_volumetric_effects))
-      rows.push_back({"volumetric", kVolumetricRow, {kOff, kOn}, v.volumetric});
+      rows.push_back({"volumetric", kVolumetricRow, {kOffMascPlural, kOnMascPlural}, v.volumetric});
     // GTAO (in races, the garage, replays and the photo mode): hidden on 03/11/2026 (1.3 ms a frame at
     // scale 3 for little to see), back on 14/11/2026 at Tazz's request; off by default (pgr4_native_gtao).
     // One choice for both of the renderer's occlusions (16/11/2026): ours with MSAA, Intel's
@@ -1852,7 +1842,7 @@ void ApplyPage(const Values& want, const Values& opened, bool restart = false) {
     REXCVAR_SET(pgr4_native_details, std::clamp(want.details, 0, 2));
   if (want.volumetric != opened.volumetric)
     REXCVAR_SET(pgr4_native_volumetric, want.volumetric != 0);
-  // Read where the game's motion blur is set up (src/pgr4_hooks.cpp).
+  // Read at each frame (pgr4-native renderer.cpp ApplyMotionBlurRule: a race and its replay).
   if (want.blur != opened.blur) REXCVAR_SET(pgr4_disable_motion_blur, want.blur == 0);
   // Read at each upscale: each upscaler's own sharpening.
   if (want.sharp[1] != opened.sharp[1])
@@ -2066,10 +2056,6 @@ std::string WrapGameScript(PPCContext& ctx, uint8_t* base, const std::string& na
 
 std::string StartScreenQuit(PPCContext& ctx, uint8_t* base, const std::string& name) {
   std::string s = WrapGameScript(ctx, base, name, R"lua(
-if PGR4_warning ~= nil then
-  UIText.IDS_WARNING, UIText.IDS_DISCLAIMER = PGR4_warning, PGR4_disclaimer
-  PGR4_warning = nil
-end
 CustomPopup.Data["PGR4_QUIT_GAME"] = {
   darken = true,
   title_text_ID = )lua" + Id(kQuitTitle) + R"lua(,
@@ -2100,20 +2086,6 @@ end
 // The multiplayer menu (Intro\MultiPlayerMenu.lua): its help line, which GUIBank's SetupSlideMenu
 // draws dark grey ("255 45 45 45") for every slide menu, white over this one's dark picture. The
 // menu's table goes through UIButtons.AddButton during Init: its help_colour changed there.
-// The first screen (Intro\TitleMovies.lua): our welcome in place of the game's warning. Set before
-// its script runs (it reads IDS_DISCLAIMER into a table as it loads, and hands its Init to the game
-// itself, SetInitFunction: a wrapped Init would not run). The next screen, the title screen, gives the two texts back (StartScreenQuit): other screens
-// use IDS_WARNING too.
-std::string TitleMoviesWelcome(PPCContext& ctx, uint8_t* base, const std::string& name) {
-  return WrapGameScript(ctx, base, name, {}, R"lua(
-if PGR4_warning == nil then
-  PGR4_warning, PGR4_disclaimer = UIText.IDS_WARNING, UIText.IDS_DISCLAIMER
-end
-UIText.IDS_WARNING = )lua" + Id(kWelcomeTitle) + R"lua(
-UIText.IDS_DISCLAIMER = )lua" + Id(kWelcomeText) + R"lua(
-)lua");
-}
-
 // The controls screen (Options\Controllers.lua) with a PlayStation controller: its labels sit
 // around the controller's picture at GUI.button_positions (1 left stick, 7 d-pad, ...), set for
 // the Xbox 360 controller, whose left stick is above its d-pad. The DualSense's d-pad is above
@@ -2423,12 +2395,6 @@ REX_HOOK_RAW(sub_82883CC0) {
   // The title screen: B asks to quit (StartScreenQuit). Its confirmation, once given.
   if (EndsWithNoCase(name, "Intro\\StartScreen.lua")) {
     if (std::string script = StartScreenQuit(ctx, base, name); !script.empty()) {
-      g_script = std::move(script);
-      return;
-    }
-  }
-  if (EndsWithNoCase(name, "Intro\\TitleMovies.lua")) {
-    if (std::string script = TitleMoviesWelcome(ctx, base, name); !script.empty()) {
       g_script = std::move(script);
       return;
     }
