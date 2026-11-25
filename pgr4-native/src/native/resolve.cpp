@@ -1253,7 +1253,7 @@ bool Resolver::Resolve(ID3D12GraphicsCommandList* list, const ResolveParams& p, 
       if (volumetrics_) {
         const Volumetrics::Share& sh = volumetrics_->share();
         fv.on = Volumetrics::Enabled() && Volumetrics::InShader() && sh.volume &&
-                sh.frame == frame_ && sh.shader[15] > 0.5f;
+                sh.frame == Pgr4ViewKey(frame_) && sh.shader[15] > 0.5f;  // (25/11/2026: the view's)
         fv.volume = sh.volume;
         fv.range = sh.shader[0];
         fv.ln2_growth = sh.shader[1];

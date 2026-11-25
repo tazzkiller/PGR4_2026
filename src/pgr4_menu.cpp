@@ -56,6 +56,7 @@ REXCVAR_DECLARE(int32_t, pgr4_native_dlss_fg_frames);
 REXCVAR_DECLARE(bool, pgr4_native_frame_generation);
 REXCVAR_DECLARE(int32_t, pgr4_native_resolution_scale);
 REXCVAR_DECLARE(int32_t, pgr4_render_height);  // pgr4-native renderer.cpp
+REXCVAR_DECLARE(bool, pgr4_split_side_by_side);  // src/pgr4_hooks.cpp (DISPLAY's split screen)
 REXCVAR_DECLARE(int32_t, pgr4_native_msaa);
 REXCVAR_DECLARE(int32_t, pgr4_native_anisotropy);
 REXCVAR_DECLARE(bool, fullscreen);
@@ -84,6 +85,7 @@ REXCVAR_DECLARE(double, pgr4_native_sharpen_fsr);
 // pgr4_profile.cpp: Back + Start asked for player 2's sign-out (once), and the sign-out.
 bool Pgr4SignOutAsked();
 void Pgr4SignOutSecondPlayer();
+bool Pgr4P2Probe();  // development: player 2's sign-in and sign-out probe (pgr4_native_capture_dir)
 
 namespace {
 
@@ -220,6 +222,12 @@ enum Text : uint32_t {
   kAspect219,
   kAspect329,
   kVolumetricRow,  // GRAPHICS's volumetric effects (pgr4_native_volumetric), off / on
+  // Local change (25/11/2026, Tazz): DISPLAY's split screen (pgr4_split_side_by_side): horizontal
+  // (the game's top and bottom halves, the default) / vertical (its hidden left and right ones).
+  kSplitRow,
+  kSplitHorizontal,
+  kSplitVertical,
+  kSplitNextRace,  // changed from the pause: it applies from the next race (PN_TellNextRace)
   // Local change (23/11/2026): off / on agreeing with their row in French, Spanish and Italian
   // (kOff and kOn are feminine singular there, la génération d'images, la generación, la
   // generazione): the HD textures feminine plural, the enhanced and volumetric effects masculine
@@ -249,7 +257,7 @@ const char16_t* const kTexts[kTextCount] = {
     nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr,  nullptr, nullptr,
     nullptr,  u"X2",    u"X3",    u"X4",    u"X5",    u"X6",    u"MSAA",
     u"DLSS FRAME GENERATION", u"FSR FRAME GENERATION", nullptr, u"60%", u"70%", u"80%", u"90%",
-    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.6 (TAZZ)",
+    u"100%", u"110%", u"120%", u"130%", u"140%", u"150%", u"V1.65 (TAZZ)",
 };
 
 // The others, in each of the game's languages (the loc folders' order), every glyph one the game's
@@ -267,7 +275,8 @@ constexpr Text kLocalized[] = {kTitle,     kUpscaler,     kUpscalerOff, kQuality
                                kLocalXenonHelpPs, kSharpRow, kShotHint,
                                kHdRow, kReflectRow, kDetailsRow, kAoRow, kImageRow, kImageOpen,
                                kRestartTitle, kRestartMessage,
-                               kAspectRow, kVolumetricRow};
+                               kAspectRow, kVolumetricRow, kSplitRow, kSplitHorizontal,
+                               kSplitVertical, kSplitNextRace};
 constexpr size_t kLocalizedCount = std::size(kLocalized);
 const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
     {  // cz
@@ -322,6 +331,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Toto nastavení vyžaduje restart hry. Probíhající závod bude ztracen. Restartovat nyní?",
         u"POMĚR STRAN",
         u"OBJEMOVÉ EFEKTY",
+        u"ROZDĚLENÁ OBRAZOVKA",
+        u"VODOROVNĚ",
+        u"SVISLE",
+        u"Změna se projeví v příštím závodě.",
     },
     {  // de
         u"GRAFIK",
@@ -375,6 +388,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Diese Einstellung erfordert einen Neustart des Spiels. Ein laufendes Rennen geht verloren. Jetzt neu starten?",
         u"BILDFORMAT",
         u"VOLUMETRISCHE EFFEKTE",
+        u"GETEILTER BILDSCHIRM",
+        u"HORIZONTAL",
+        u"VERTIKAL",
+        u"Die Änderung wird ab dem nächsten Rennen wirksam.",
     },
     {  // en
         u"GRAPHICS",
@@ -428,6 +445,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"This setting requires restarting the game. A race in progress will be lost. Restart now?",
         u"ASPECT RATIO",
         u"VOLUMETRIC EFFECTS",
+        u"SPLIT SCREEN",
+        u"HORIZONTAL",
+        u"VERTICAL",
+        u"The change will apply from the next race.",
     },
     {  // es
         u"GRÁFICOS",
@@ -481,6 +502,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Este ajuste requiere reiniciar el juego. Se perderá la carrera en curso. ¿Reiniciar ahora?",
         u"FORMATO DE IMAGEN",
         u"EFECTOS VOLUMÉTRICOS",
+        u"PANTALLA DIVIDIDA",
+        u"HORIZONTAL",
+        u"VERTICAL",
+        u"El cambio se aplicará en la próxima carrera.",
     },
     {  // fr
         u"GRAPHISMES",
@@ -534,6 +559,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Ce réglage nécessite de redémarrer le jeu. Une course en cours sera perdue. Redémarrer maintenant ?",
         u"FORMAT D'IMAGE",
         u"EFFETS VOLUMÉTRIQUES",
+        u"ÉCRAN PARTAGÉ",
+        u"HORIZONTAL",
+        u"VERTICAL",
+        u"Le changement s'appliquera à la prochaine course.",
     },
     {  // hu
         u"GRAFIKA",
@@ -587,6 +616,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Ehhez a beállításhoz újra kell indítani a játékot. A folyamatban lévő verseny elvész. Újraindítás most?",
         u"KÉPARÁNY",
         u"VOLUMETRIKUS EFFEKTEK",
+        u"OSZTOTT KÉPERNYŐ",
+        u"VÍZSZINTES",
+        u"FÜGGŐLEGES",
+        u"A változás a következő versenytől lép életbe.",
     },
     {  // it
         u"GRAFICA",
@@ -640,6 +673,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Questa impostazione richiede il riavvio del gioco. Una gara in corso andrà persa. Riavviare ora?",
         u"FORMATO IMMAGINE",
         u"EFFETTI VOLUMETRICI",
+        u"SCHERMO CONDIVISO",
+        u"ORIZZONTALE",
+        u"VERTICALE",
+        u"La modifica verrà applicata dalla prossima gara.",
     },
     {  // ja
         u"グラフィック",
@@ -693,6 +730,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"この設定にはゲームの再起動が必要です。進行中のレースは失われます。再起動しますか?",
         u"画面比率",
         u"ボリューメトリックエフェクト",
+        u"画面分割",
+        u"上下",
+        u"左右",
+        u"変更は次のレースから適用されます。",
     },
     {  // ko
         u"그래픽",
@@ -746,6 +787,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"이 설정을 적용하려면 게임을 다시 시작해야 합니다. 진행 중인 레이스는 사라집니다. 지금 다시 시작하시겠습니까?",
         u"화면비",
         u"체적 효과",
+        u"화면 분할",
+        u"상하",
+        u"좌우",
+        u"변경 사항은 다음 레이스부터 적용됩니다.",
     },
     {  // pl
         u"GRAFIKA",
@@ -799,6 +844,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"To ustawienie wymaga ponownego uruchomienia gry. Trwający wyścig zostanie utracony. Uruchomić ponownie teraz?",
         u"PROPORCJE OBRAZU",
         u"EFEKTY WOLUMETRYCZNE",
+        u"PODZIELONY EKRAN",
+        u"POZIOMO",
+        u"PIONOWO",
+        u"Zmiana zostanie zastosowana od następnego wyścigu.",
     },
     {  // ru
         u"ГРАФИКА",
@@ -852,6 +901,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"Для этого параметра нужно перезапустить игру. Текущая гонка будет потеряна. Перезапустить сейчас?",
         u"ФОРМАТ ЭКРАНА",
         u"ОБЪЕМНЫЕ ЭФФЕКТЫ",
+        u"РАЗДЕЛЕННЫЙ ЭКРАН",
+        u"ГОРИЗОНТАЛЬНО",
+        u"ВЕРТИКАЛЬНО",
+        u"Изменение вступит в силу со следующей гонки.",
     },
     {  // sc
         u"图形",
@@ -905,6 +958,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"此设置需要重新启动游戏。正在进行的比赛将会丢失。现在重新启动吗?",
         u"屏幕比例",
         u"体积效果",
+        u"分屏",
+        u"上下",
+        u"左右",
+        u"更改将从下一场比赛开始生效。",
     },
     {  // tc
         u"視訊",
@@ -958,6 +1015,10 @@ const char16_t* const kTranslations[kLangCount][kLocalizedCount] = {
         u"此設定需要重新啟動遊戲。進行中的比賽將會遺失。現在重新啟動嗎？",
         u"畫面比例",
         u"體積效果",
+        u"分割畫面",
+        u"上下",
+        u"左右",
+        u"變更將從下一場比賽開始生效。",
     },
 };
 
@@ -1216,6 +1277,7 @@ struct Values {
   int details = 0;  // enhanced details: original, high, ultra (pgr4_native_details)
   int volumetric = 0;  // volumetric effects off / on (pgr4_native_volumetric)
   int aspect = 0;  // index in kAspects (pgr4_render_height): auto, 16:9, 16:10, 21:9, 32:9
+  int split = 0;   // split screen: horizontal / vertical (pgr4_split_side_by_side)
 };
 
 // The pages: DISPLAY (window mode, definition, frame rate limit, brightness), GRAPHICS (image and
@@ -1241,6 +1303,7 @@ Values CurrentValues() {
                  : 0;
   v.scale = std::clamp(REXCVAR_GET(pgr4_native_resolution_scale), 1, 4) - 1;
   v.aspect = IndexOf(kAspects, int(REXCVAR_GET(pgr4_render_height)), 0);
+  v.split = REXCVAR_GET(pgr4_split_side_by_side) ? 1 : 0;
   // The level nearest the setting.
   for (int i = 0; i < int(std::size(kBrightLevels)); ++i)
     if (std::abs(kBrightLevels[i] - REXCVAR_GET(pgr4_native_brightness)) <
@@ -1310,6 +1373,7 @@ std::vector<Row> RowsFor(Page page, const Values& v) {
     rows.push_back({"scale", kScale, {kScale1, kScale2, kScale3, kScale4}, v.scale});
     rows.push_back({"aspect", kAspectRow, {kModeAuto, kAspect169, kAspect1610, kAspect219, kAspect329},
                     v.aspect});
+    rows.push_back({"split", kSplitRow, {kSplitHorizontal, kSplitVertical}, v.split});
     std::vector<Text> fps;
     for (const FpsChoice& c : FpsChoices()) fps.push_back(FpsText(c));
     rows.push_back({"fps", kFpsRow, fps, v.fps});
@@ -1408,6 +1472,7 @@ Values DecodePage(const std::string& digits) {
     else if (name == "dlssfg") v.dlssfg = d;
     else if (name == "scale") v.scale = d;
     else if (name == "aspect") v.aspect = d;
+    else if (name == "split") v.split = d;
     else if (name == "msaa") v.msaa = d;
     else if (name == "aniso") v.aniso = d;
     else if (name == "window") v.window = d;
@@ -1550,6 +1615,13 @@ std::string PageScript(Page page, const Values& values) {
   if (page == kDisplayPage) {
     s += "  GUI.scale_start = UIButtons.GetSelection(GUI.scale_ID)\n";
     s += "  GUI.aspect_start = UIButtons.GetSelection(GUI.aspect_ID)\n";
+    // Local change (25/11/2026, Tazz): the split screen changed from the pause (a race) applies
+    // from the next race's load: told on leaving (PN_TellNextRace).
+    if (g_from_pause) {
+      s += "  GUI.split_start = UIButtons.GetSelection(GUI.split_ID)\n";
+      s += "  GUI.split_title = " + Id(kSplitRow) + "\n";
+      s += "  GUI.split_message = " + Id(kSplitNextRace) + "\n";
+    }
     s += "  GUI.restart_title = " + Id(kRestartTitle) + "\n";
     s += "  GUI.restart_message = " + Id(kRestartMessage) + "\n";
   }
@@ -1618,6 +1690,7 @@ function StartLoop(a) return true end
 function MessageUpdate(msg, a, b, c, d)
   if GUI.finished == true then return end
   if (msg == "BUTTON_BACK" or msg == "BUTTON_NEXT") and PN_AskRestart() then return end
+  if (msg == "BUTTON_BACK" or msg == "BUTTON_NEXT") and PN_TellNextRace() then return end
   if msg == "BUTTON_BACK" then
     GUI.finished = true
     PlayMenuBack()
@@ -1665,6 +1738,23 @@ function PN_AskRestart()
     end,
   }
   SetupCustomPopup("PGR4_RESTART")
+  return true
+end
+-- The split screen changed from the pause: it applies from the next race (the game lays the views
+-- out at a race's load); told by the game's popup, A only, then the page saved as it would be.
+function PN_TellNextRace()
+  if GUI.split_start == nil or CustomPopup == nil or SetupCustomPopup == nil then return false end
+  if UIButtons.GetSelection(GUI.split_ID) == GUI.split_start then return false end
+  GUI.split_start = nil
+  CustomPopup.Data["PGR4_SPLIT_NEXT_RACE"] = {
+    darken = true,
+    title_text_ID = GUI.split_title,
+    message_text_ID = GUI.split_message,
+    next_text_ID = UIText.IDS_CONTINUE_A,
+    no_back = true,
+    next_screen = "Intro\\" .. PN_save .. PN_Digits() .. ".lua",
+  }
+  SetupCustomPopup("PGR4_SPLIT_NEXT_RACE")
   return true
 end
 -- One character per row: 0-9, then a, b, c... from 10 (the sharpening's 21 steps).
@@ -1769,6 +1859,7 @@ std::string PageChanges(const Values& opened, const Values& want) {
   note("dlss-g frames", opened.dlssfg, want.dlssfg);
   note("scale", opened.scale, want.scale);
   note("aspect", opened.aspect, want.aspect);
+  note("split screen", opened.split, want.split);
   note("msaa", opened.msaa, want.msaa);
   note("aniso", opened.aniso, want.aniso);
   note("window", opened.window, want.window);
@@ -1896,6 +1987,13 @@ void ApplyPage(const Values& want, const Values& opened, bool restart = false) {
     if (want.aspect != opened.aspect)
       REXCVAR_SET(pgr4_render_height,
                   kAspects[std::clamp(want.aspect, 0, int(std::size(kAspects)) - 1)]);
+    // Local change (25/11/2026): the split screen's layout, read at each race's load (src/pgr4_hooks.cpp
+    // Pgr4SideBySideHook), and our renderer's side by side views (renderer.cpp SwitchUpscaler, again
+    // through the MSAA's request, the same samples).
+    if (want.split != opened.split) {
+      REXCVAR_SET(pgr4_split_side_by_side, want.split == 1);
+      msaa = true;
+    }
     if (want.aniso != opened.aniso) {
       REXCVAR_SET(pgr4_native_anisotropy, kAniso[want.aniso]);
       rebuild = true;
@@ -2254,7 +2352,30 @@ local function pgr4_signout_popup()
   }
   SetupCustomPopup("PGR4_SIGNOUT_P2")
 end
+-- Player 2 signed out (Intro\PGR4_SignOut2.lua's Init, pgr4_signout_title_from_update): the title
+-- screen next, as this update does on a profile change (CleanUpGoingBackToStartScreen, from a race
+-- through UILoad, then false). From a screen's Init the request is lost: the screen update sets
+-- its state to 1 after Init (sub_82882AC8), which left the screen empty.
+local function pgr4_signout_to_title()
+  if pgr4_signout_go_title ~= true or UIGlobals.IsLoading == true or
+     UIGlobals.CriticalUISection == true then
+    return false
+  end
+  pgr4_signout_go_title = false
+  CleanUpGoingBackToStartScreen()
+  if UIGlobals.IsInGame == true then
+    UIScreen.StoreScreen(UIEnums.ScreenStorage.FE_QUIT, "Intro\\StartScreen.lua")
+    UIScreen.StoreScreen(UIEnums.ScreenStorage.FE_RETURN, "Intro\\StartScreen.lua")
+    UIGlobals.QuitRaceSelected = false
+    GothamSystem.QuitDebugEvent()
+    UIScreen.SetNextScreen("Loading\\UILoad.lua")
+  else
+    UIScreen.SetNextScreen("Intro\\StartScreen.lua")
+  end
+  return true
+end
 function GlobalUpdate(...)
+  if pgr4_signout_to_title() then return false end
   pgr4_signout_popup()
   if pgr4_rewatch_cable == true and pgr4_cable() == true then
     pgr4_rewatch_cable = false
@@ -2289,6 +2410,95 @@ function GlobalUpdate(...)
 end
 )lua");
 }
+// Local change (25/11/2026, the side by side split screen's HUD, src/pgr4_hooks.cpp
+// pgr4_split_side_by_side_hud): run after Screens\GUIBank.lua (after GuiBankLostHost's Lua).
+// GetViewportDetails (GUIBank main/131: with 2 viewports the top and bottom bands, left, top or
+// cy - 25, width, height / 2 + 25) gives each player the left or right half of the interface's
+// screen (UIGlobals.screen, 640x480 units) while the game's scripts see VerticalSplitScreen set in
+// player 1's options (Pgr4SideBySideLuaHook, only with the side by side HUD), as its 3-4 viewport
+// branch gives its quarters (topLeftX left or cx, sizeX width / 2). Everything placed from it
+// follows: the 2D items (HudHelper's AdjustPositionAndSizeForViewports, from HUD.lua's Init) and
+// the 3D gauges' rectangle (SendViewportDetails, at the race's load). pgr4_side_by_side() is read
+// by HudHelper's wrapper too (below).
+std::string HudSideBySideLua() {
+  return R"lua(
+function pgr4_side_by_side()
+  if GothamSystem == nil or GothamSystem.GetNumberOfViewports == nil or
+     GothamSystem.GetNumberOfViewports() ~= 2 or Profile == nil then
+    return false
+  end
+  local ok, o = pcall(function()
+    return Profile.GetOptionsVars(GothamSystem.GetProfileIdInViewport(0))
+  end)
+  if not ok or o == nil then return false end
+  local v = o.VerticalSplitScreen
+  return v == 1 or v == true
+end
+-- No slide at the start in the halves (25/11/2026, Tazz: « qu'elles se positionnent direct »): at
+-- the GO (UIGlobals.HUD_Show_GO), HUD.lua's Init (pc 262-327) starts each scroll group 150 units
+-- out (x, y = +-150), copies that into its effects (the first holding it out, the second moving
+-- it to its own tox, toy), then UIButtons.AddButton; in a 428-wide half they crossed into the
+-- other player's. Such a group starts where its second effect ends, every point of its effects
+-- there: placed at once, at the same place. Installed at the first side by side
+-- GetViewportDetails (HUD.lua calls it before adding its items).
+local function pgr4_install_no_slide()
+  if pgr4_add_button ~= nil or UIButtons == nil or UIButtons.AddButton == nil then return end
+  pgr4_add_button = UIButtons.AddButton
+  UIButtons.AddButton = function(t, ...)
+    if type(t) == "table" and type(t.effects) == "table" and pgr4_side_by_side() and
+       (t.x == 150 or t.x == -150 or t.y == 150 or t.y == -150) then
+      local last = t.effects[2]
+      local fx, fy = 0, 0
+      if type(last) == "table" then fx, fy = last.tox or 0, last.toy or 0 end
+      t.x, t.y = fx, fy
+      for _, e in pairs(t.effects) do
+        if type(e) == "table" then
+          if e.fromx ~= nil then e.fromx = fx end
+          if e.fromy ~= nil then e.fromy = fy end
+          if e.tox ~= nil then e.tox = fx end
+          if e.toy ~= nil then e.toy = fy end
+        end
+      end
+    end
+    return pgr4_add_button(t, ...)
+  end
+end
+local pgr4_viewport_details = GetViewportDetails
+if pgr4_viewport_details ~= nil then
+  function GetViewportDetails(n, ...)
+    local d = pgr4_viewport_details(n, ...)
+    if d ~= nil and pgr4_side_by_side() then
+      pgr4_install_no_slide()
+      local s = UIGlobals.screen
+      if n == 0 then d.topLeftX = s.left else d.topLeftX = s.cx end
+      d.topLeftY = s.top
+      d.sizeX = s.width / 2
+      d.sizeY = s.height
+    end
+    return d
+  end
+end
+)lua";
+}
+// Screens\HudHelper.lua: its AdjustPositionAndSizeForViewports puts the kudos stars' bank (bank_x)
+// at SCREEN_RIGHT - 64 for every viewport (HudHelper pc 448-450), bank_y at the view's top + 32;
+// with the side by side HUD, the bank at its half's right edge - 66 (the same 682 for player 2).
+std::string HudHelperSideBySide(PPCContext& ctx, uint8_t* base, const std::string& name) {
+  return WrapGameScript(ctx, base, name, R"lua(
+local pgr4_adjust = AdjustPositionAndSizeForViewports
+if pgr4_adjust ~= nil then
+  function AdjustPositionAndSizeForViewports(vd, item, ...)
+    local result = pgr4_adjust(vd, item, ...)
+    if pgr4_side_by_side ~= nil and pgr4_side_by_side() and vd ~= nil and item ~= nil and
+       UIEnums ~= nil and UIEnums.ButtonTypes ~= nil and
+       item.type == UIEnums.ButtonTypes.KUDOS_STAR_DISPLAY then
+      item.bank_x = vd.topLeftX + vd.sizeX - 66
+    end
+    return result
+  end
+end
+)lua");
+}
 // The game's window: its process's visible top-level window, else null.
 HWND GameWindow() {
   HWND found = nullptr;
@@ -2319,6 +2529,11 @@ void Pgr4BringWindowToFront() {
   SetActiveWindow(hwnd);
 }
 
+REXCVAR_DEFINE_BOOL(pgr4_signout_title_from_update, true, "PGR4",
+                    "Player 2's sign-out goes on to the title screen from GUIBank's GlobalUpdate, "
+                    "as the game does on a profile change (off: from Intro\\PGR4_SignOut2.lua's "
+                    "Init, where the request is lost and the screen stays empty); read at each "
+                    "sign-out");
 REXCVAR_DEFINE_BOOL(pgr4_menu_pages_keep_screen, true, "PGR4",
                     "Our options pages' screens (Intro\\P?_) leave the race screen as it was (off: "
                     "classed as menu screens, the race's effects off after a setting changed from "
@@ -2330,6 +2545,9 @@ REX_HOOK_RAW(sub_82883CC0) {
   if (g_names_logged < 40) {
     ++g_names_logged;
     REXLOG_INFO("PGR4 menu: script {}", name);
+  } else if (Pgr4P2Probe()) {
+    // Development: player 2's probe has every script (the names above stop after 40).
+    REXLOG_INFO("PGR4 p2 probe: script {}", name);
   }
   g_script.clear();
   g_script_pos = 0;
@@ -2434,12 +2652,35 @@ REX_HOOK_RAW(sub_82883CC0) {
   }
   if (EndsWithNoCase(name, "Screens\\GUIBank.lua")) {
     if (std::string script = GuiBankLostHost(ctx, base, name); !script.empty()) {
+      g_script = std::move(script) + HudSideBySideLua();  // local change (25/11/2026)
+      return;
+    }
+  }
+  // Local change (25/11/2026): the side by side HUD's kudos stars (HudHelperSideBySide).
+  if (EndsWithNoCase(name, "Screens\\HudHelper.lua")) {
+    if (std::string script = HudHelperSideBySide(ctx, base, name); !script.empty()) {
       g_script = std::move(script);
       return;
     }
   }
   if (EndsWith(name, "Intro\\PGR4_SignOut2.lua")) {
     Pgr4SignOutSecondPlayer();
+    // pgr4_signout_title_from_update (read at each sign-out): the title screen from GUIBank's
+    // GlobalUpdate (GuiBankLostHost's pgr4_signout_to_title), as the game does on a profile
+    // change; off, from this Init as before (lost: sub_82882AC8 sets state 1 after Init, the
+    // screen left empty).
+    if (REXCVAR_GET(pgr4_signout_title_from_update)) {
+      g_script = R"lua(
+function Init() pgr4_signout_go_title = true end
+function StartLoop(a) return true end
+function MessageUpdate(m, a, b, c, d) end
+function FrameUpdate(t) end
+function Render() end
+function End() end
+function EndLoop(a) return true end
+)lua";
+      return;
+    }
     g_script = R"lua(
 function Init()
   CleanUpGoingBackToStartScreen()
@@ -2779,7 +3020,70 @@ REX_HOOK_RAW(sub_82882AC8) {
                   count, names, skip, ms, g_last_screen);
     }
   }
+  // Development: player 2's probe (Pgr4P2Probe). The update's state at +136 (0 Init, 1 StartLoop
+  // until the start time at +10512, 2 FrameUpdate / MessageUpdate / Render, 4 EndLoop until the
+  // end time at +10516, 3 End then the next screen, named at +0, loaded: state 0 and this update
+  // again), its timer at +128: every change, in values, within an update or between two (set by
+  // SetNextScreen_CB from native code). FAULT by itself: Intro\PGR4_SignOut2.lua still the screen
+  // 2 s after it came (the title screen never asked: the screen stays empty).
+  if (!Pgr4P2Probe()) {
+    __imp__sub_82882AC8(ctx, base);
+    return;
+  }
+  const uint32_t ui = ctx.r3.u32;
+  auto state_of = [&] { return LoadBe32(base, ui + 136); };
+  auto float_at = [&](uint32_t a) {
+    const uint32_t bits = LoadBe32(base, ui + a);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  };
+  auto next_of = [&] {
+    const char* next = reinterpret_cast<const char*>(base + ui);
+    return std::string(next, strnlen(next, 64));
+  };
+  // Each update object's last state (a few: the screens', maybe the popups'); depth > 0: called
+  // again from within (state 3 loads the next screen, then updates it).
+  static uint32_t uis[8], last_state[8];
+  static int depth = 0;
+  size_t slot = 0;
+  while (slot < 8 && uis[slot] && uis[slot] != ui) ++slot;
+  const bool known = slot < 8 && uis[slot] == ui;
+  if (slot < 8 && !uis[slot]) {
+    uis[slot] = ui;
+    REXLOG_INFO("PGR4 p2 probe: screen update object {:08X}", ui);
+  }
+  const uint32_t before = state_of();
+  if (known && depth == 0 && before != last_state[slot])
+    REXLOG_INFO("PGR4 p2 probe: screen update {:08X} state {} -> {} between updates (next \"{}\", "
+                "timer {:.3f}) on {}",
+                ui, last_state[slot], before, next_of(), float_at(128), g_last_screen);
+  ++depth;
   __imp__sub_82882AC8(ctx, base);
+  --depth;
+  const uint32_t after = state_of();
+  if (after != before || !known)
+    REXLOG_INFO("PGR4 p2 probe: screen update {:08X}{} state {} -> {} (next \"{}\", timer {:.3f}, "
+                "start {:.3f}, end {:.3f}, skip {}) on {}",
+                ui, depth ? " (within)" : "", before, after, next_of(), float_at(128),
+                float_at(10512), float_at(10516), base[ui + 10520], g_last_screen);
+  if (slot < 8) last_state[slot] = after;
+  if (depth) return;
+  static std::string shown;
+  static auto shown_at = std::chrono::steady_clock::now();
+  static bool reported = false;
+  if (shown != g_last_screen) {
+    shown = g_last_screen;
+    shown_at = std::chrono::steady_clock::now();
+    reported = false;
+  }
+  if (!reported && EndsWith(shown, "Intro\\PGR4_SignOut2.lua") &&
+      std::chrono::steady_clock::now() - shown_at > std::chrono::seconds(2)) {
+    reported = true;
+    REXLOG_INFO("PGR4 p2 probe: FAULT, Intro\\PGR4_SignOut2.lua still the screen 2 s after it "
+                "came (state {}, next \"{}\"): the title screen never asked, the screen empty",
+                after, next_of());
+  }
 }
 
 // UIButtons.GetSelection(button) (sub_82894880): its value pushed. One of the pause menu's entries

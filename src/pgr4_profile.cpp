@@ -4,6 +4,7 @@
 // (no save yet) the account is made as "PGR4 PLAYER", with player 2's ("PGR4 PLAYER 2"). It is
 // given to the profile at every launch, so the game creates its save with it.
 
+#include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
@@ -17,6 +18,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -35,6 +37,7 @@ REXCVAR_DEFINE_BOOL(pgr4_first_launch_done, false, "PGR4",
                     "The first launch's settings were made (definition from the screen, no "
                     "upscaler, no frame generation); false: made again at the next launch");
 REXCVAR_DECLARE(int32_t, pgr4_native_resolution_scale);
+REXCVAR_DECLARE(std::string, pgr4_native_capture_dir);  // pgr4-native present.cpp: development
 namespace pgr4::native {
 uint32_t FfxSceneHeight();  // pgr4-native fidelityfx.cpp: the render height
 }
@@ -133,6 +136,30 @@ void SaveName(const std::string& key, const std::string& name) {
 
 }  // namespace
 
+// Development (25/11/2026): player 2's sign-in and sign-out path in the log ("PGR4 p2 probe"),
+// only with pgr4_native_capture_dir set (never in the release): controllers 1 and 2's Back, Start
+// and Guide (every change, in values, with what the hook made of it), the sign-in asked and done,
+// the sign-out asked (with the time since the sign-in and whether the combination was let go in
+// between: a press read twice is flagged FAULT by itself), taken by GUIBank's GlobalUpdate, done.
+// pgr4_menu.cpp adds the screens (every script, the screen update's states, a screen left empty).
+bool Pgr4P2Probe() { return !REXCVAR_GET(pgr4_native_capture_dir).empty(); }
+namespace {
+using ProbeClock = std::chrono::steady_clock;
+// A time as steady_clock ticks, read and written from the input and the sign-in threads.
+using ProbeTime = std::atomic<ProbeClock::rep>;
+ProbeClock::rep ProbeNow() { return ProbeClock::now().time_since_epoch().count(); }
+double ProbeGapMs(ProbeClock::rep from, ProbeClock::rep to) {
+  return std::chrono::duration<double, std::milli>(ProbeClock::duration(to - from)).count();
+}
+double ProbeMs(const ProbeTime& since) { return ProbeGapMs(since.load(), ProbeNow()); }
+// The sign-in's press: its controller, when, and whether its combination was let go since.
+std::atomic<int> g_probe_signin_user{-1};
+ProbeTime g_probe_signin_at{0};
+std::atomic<bool> g_probe_signin_released{true};
+ProbeTime g_probe_signin_released_at{0};
+ProbeTime g_probe_signed_in_at{0};
+}  // namespace
+
 bool Pgr4SignInSecondPlayer(HWND owner);
 
 namespace {
@@ -206,6 +233,13 @@ bool Pgr4SignInSecondPlayer(HWND owner) {
   }
   kernel->SignInUser(1, name);
   REXLOG_INFO("PGR4 profile: player 2 \"{}\" signed in", name);
+  if (Pgr4P2Probe()) {
+    g_probe_signed_in_at = ProbeNow();
+    REXLOG_INFO("PGR4 p2 probe: sign-in done {:.1f} ms after its press on controller {}, the "
+                "combination {} (signed-in mask {:X})",
+                ProbeMs(g_probe_signin_at), g_probe_signin_user.load() + 1,
+                g_probe_signin_released ? "let go" : "still held", kernel->signed_in_mask());
+  }
   return true;
 }
 
@@ -215,7 +249,12 @@ namespace {
 std::atomic<bool> g_signout_asked{false};
 }  // namespace
 
-bool Pgr4SignOutAsked() { return g_signout_asked.exchange(false); }
+bool Pgr4SignOutAsked() {
+  const bool asked = g_signout_asked.exchange(false);
+  if (asked && Pgr4P2Probe())
+    REXLOG_INFO("PGR4 p2 probe: GUIBank's GlobalUpdate took the sign-out request");
+  return asked;
+}
 bool Pgr4InGameScreen();  // pgr4_menu.cpp: the last screen was a race's
 
 // The popup's yes (Intro\PGR4_SignOut2.lua): player 2 signed out, the game told
@@ -224,6 +263,10 @@ void Pgr4SignOutSecondPlayer() {
   rex::Runtime* runtime = rex::Runtime::instance();
   rex::system::KernelState* kernel = runtime ? runtime->kernel_state() : nullptr;
   if (kernel && kernel->SignOutUser(1)) REXLOG_INFO("PGR4 profile: player 2 signed out");
+  if (Pgr4P2Probe())
+    REXLOG_INFO("PGR4 p2 probe: sign-out done, player 2 {} (signed-in mask {:X})",
+                kernel && kernel->user_profile(1) ? "still in: FAULT" : "out",
+                kernel ? kernel->signed_in_mask() : 0);
 }
 
 // The console's Guide on controllers 1 and 2 (user indexes 0 and 1), as Back + Start held (or
@@ -251,13 +294,69 @@ REX_HOOK_RAW(sub_826A8F00) {
     return;
   }
   static bool held[4], swallow[4];
+  // Development: player 2's probe (Pgr4P2Probe), controllers 1 and 2.
+  const bool probe = user < 2 && Pgr4P2Probe();
+  static uint32_t probe_polls[2], probe_errors[2];
+  static int probe_answer[2] = {-1, -1};
+  if (probe) {
+    ++probe_polls[user];
+    const int answer = ctx.r3.u32 != 0 || !state ? 1 : 0;
+    if (answer != probe_answer[user])
+      REXLOG_INFO("PGR4 p2 probe: controller {} {} (result {:X}) at poll {}", user + 1,
+                  answer ? "not read" : "read", ctx.r3.u32, probe_polls[user]);
+    probe_answer[user] = answer;
+    if (answer) ++probe_errors[user];
+  }
   if (user >= 4 || ctx.r3.u32 != 0 || !state) return;
   // X_INPUT_STATE: packet number, then XINPUT_GAMEPAD (big-endian buttons first, 12 bytes).
   const uint16_t buttons = uint16_t(base[state + 4] << 8 | base[state + 5]);
   constexpr uint16_t kStart = 0x0010, kBack = 0x0020, kGuide = 0x0400;
   const bool pressed = (buttons & kGuide) || (buttons & (kStart | kBack)) == (kStart | kBack);
   const bool fresh = pressed && !held[user];
+  const bool was_held = held[user];
   held[user] = pressed;
+  if (probe) {
+    // Every change of Back, Start or Guide in values, with the whole pad (triggers, sticks: all 0
+    // when the SDK blanks a pad, as without the window's focus) and the window in front.
+    static uint16_t last[2];
+    static ProbeClock::rep let_go_at[2];
+    static uint32_t let_go_poll[2];
+    constexpr uint16_t kWatch = kStart | kBack | kGuide;
+    if ((buttons ^ last[user]) & kWatch) {
+      DWORD front_pid = 0;
+      GetWindowThreadProcessId(GetForegroundWindow(), &front_pid);
+      const uint8_t* pad = base + state + 4;
+      const bool blank = std::all_of(pad + 2, pad + 12, [](uint8_t b) { return b == 0; });
+      std::string combo = "";
+      if (was_held && !pressed) {
+        let_go_at[user] = ProbeNow();
+        let_go_poll[user] = probe_polls[user];
+        combo = ", the combination let go";
+      } else if (fresh) {
+        // Both buttons let go and pressed again in under 50 ms: not a player's hands.
+        const double gap = ProbeGapMs(let_go_at[user], ProbeNow());
+        combo = fmt::format(", the combination pressed again after {:.1f} ms let go ({} polls){}",
+                            gap, probe_polls[user] - let_go_poll[user],
+                            gap < 50.0 ? ": FAULT, too short for a player's press" : "");
+      }
+      REXLOG_INFO("PGR4 p2 probe: controller {} buttons {:04X} -> {:04X} at poll {} ({} not read "
+                  "so far), triggers {} {}, triggers and sticks {}, the game's window {}, player "
+                  "2 {}, race screen {}, swallowed {}{}",
+                  user + 1, last[user], buttons, probe_polls[user], probe_errors[user], pad[2],
+                  pad[3], blank ? "all 0 (pad blank)" : "not 0",
+                  front_pid == GetCurrentProcessId() ? "in front" : "NOT in front",
+                  rex::Runtime::instance() && rex::Runtime::instance()->kernel_state() &&
+                          rex::Runtime::instance()->kernel_state()->user_profile(1)
+                      ? "in"
+                      : "out",
+                  Pgr4InGameScreen(), swallow[user], combo);
+      last[user] = buttons;
+    }
+    if (user == g_probe_signin_user && !pressed && !g_probe_signin_released) {
+      g_probe_signin_released = true;
+      g_probe_signin_released_at = ProbeNow();
+    }
+  }
   if (user == 1 && (buttons & (kStart | kBack)) && !Pgr4InGameScreen()) {
     const uint16_t kept = buttons & ~(kStart | kBack);
     base[state + 4] = uint8_t(kept >> 8);
@@ -277,7 +376,26 @@ REX_HOOK_RAW(sub_826A8F00) {
     swallow[user] = true;
     std::memset(base + state + 4, 0, 12);
     REXLOG_INFO("PGR4 profile: sign player 2 out? (asked on controller {})", user + 1);
+    if (probe)
+      REXLOG_INFO(
+          "PGR4 p2 probe: sign-out asked on controller {}, {:.1f} ms after player 2's sign-in "
+          "(pressed on controller {}): {}",
+          user + 1, ProbeMs(g_probe_signed_in_at), g_probe_signin_user.load() + 1,
+          int(user) != g_probe_signin_user ? std::string("another controller than the sign-in's")
+          : g_probe_signin_released
+              ? fmt::format("a new press, the sign-in's combination let go {:.1f} ms after the "
+                            "sign-in",
+                            ProbeGapMs(g_probe_signed_in_at, g_probe_signin_released_at))
+              : std::string("FAULT, the sign-in's combination never let go since: one press "
+                            "read twice"));
   } else if (user == 1) {
+    if (probe) {
+      g_probe_signin_user = int(user);
+      g_probe_signin_at = ProbeNow();
+      g_probe_signin_released = false;
+      REXLOG_INFO("PGR4 p2 probe: sign-in asked on controller {} at poll {} (the sign-in UI {})",
+                  user + 1, probe_polls[user], g_signin_open ? "already open" : "opened now");
+    }
     OpenSignin(kernel, true);
   }
 }

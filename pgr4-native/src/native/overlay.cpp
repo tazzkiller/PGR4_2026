@@ -245,6 +245,12 @@ std::string SaveRendererSettings(bool upscaler_on) {
       {"pgr4_native_upscaler_height", std::to_string(REXCVAR_GET(pgr4_native_upscaler_height))},
       {"pgr4_native_resolution_scale", std::to_string(REXCVAR_GET(pgr4_native_resolution_scale))},
       {"pgr4_render_height", std::to_string(REXCVAR_GET(pgr4_render_height))},
+      // Local change (25/11/2026): DISPLAY's split screen (src/pgr4_hooks.cpp, by its name).
+      {"pgr4_split_side_by_side",
+       [] {
+         const std::string v = rex::cvar::GetFlagByName("pgr4_split_side_by_side");
+         return std::string(v == "true" || v == "1" ? "true" : "false");
+       }()},
       // The SDK's (d3d12_presenter.cpp), the DISPLAY page's VSYNC row: set there by its name, it
       // was applied but never saved, back to the file's value at the next start.
       {"d3d12_present_vsync",

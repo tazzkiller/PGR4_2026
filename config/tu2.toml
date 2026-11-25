@@ -403,6 +403,68 @@ address = 0x826CBEE0
 name = "Pgr4ResolveRectHook"
 registers = ["r5"]
 
+# The game's side by side split screen (pgr4_split_side_by_side, src/pgr4_hooks.cpp): player 1's
+# VerticalSplitScreen byte as the views' layout (sub_824C4B80) and the players' messages
+# (sub_8261BDA8) read it, each lbzx's result.
+[[midasm_hook]]
+address = 0x824C535C
+name = "Pgr4SideBySideHook"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8261C0D4
+name = "Pgr4SideBySideTextHook"
+registers = ["r11"]
+after_instruction = true
+
+# ... without the side by side views' rear-view mirrors (pgr4_split_side_by_side_no_mirror):
+# each view's descriptor's mirror byte (r1+100) cleared after the branch stores it.
+[[midasm_hook]]
+address = 0x824C53C0
+name = "Pgr4SideBySideMirrorHook"
+registers = ["r1"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x824C547C
+name = "Pgr4SideBySideMirrorHook"
+registers = ["r1"]
+after_instruction = true
+
+# ... and the scripts': GetOptionsVars' read of it (to Lua), SetOptionsVars' store (from Lua,
+# the profile's own value kept).
+[[midasm_hook]]
+address = 0x825E5F24
+name = "Pgr4SideBySideLuaHook"
+registers = ["r11"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x825E296C
+name = "Pgr4SideBySideStoreHook"
+registers = ["r11", "r29", "r10"]
+
+# The side by side HUD (pgr4_split_side_by_side_hud): the 3D gauges' x (sub_8245E7E0's split
+# screen branch, f1 = HorizSplitLayoutX just loaded), and the probe of the views' rectangles
+# SendViewportDetailVariables stores (sub_825CE0E0, before its first stfsx).
+[[midasm_hook]]
+address = 0x8245E96C
+name = "Pgr4SideBySideGaugeXHook"
+registers = ["f1"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8245E980
+name = "Pgr4SideBySideGaugeXHook"
+registers = ["f1"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x825CE1D8
+name = "Pgr4ViewportDetailProbeHook"
+registers = ["r10", "f29", "f28", "f31", "f30", "f1"]
+
 # And the HUD's orthographic projection: c45 of the vertex block the state apply
 # (sub_82871A20) uploads, whose y scale and offset still map the 720-tall frame, stretching
 # every HUD draw by render_height/720. The hook rewrites the game's own value for the render

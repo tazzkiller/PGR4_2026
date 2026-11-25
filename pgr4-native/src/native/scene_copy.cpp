@@ -2,6 +2,7 @@
 #include "scene_copy.h"
 
 #include "d3d12_device.h"
+#include "volumetrics.h"  // local change (25/11/2026): Pgr4ViewKey, the split screen's views
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -173,13 +174,16 @@ bool SceneCopy::Initialize(ID3D12Device* device) {
   }
   D3D12_DESCRIPTOR_HEAP_DESC hd = {};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight;
+  // Local change (25/11/2026): a slot per view and frame in flight (Pgr4ViewSlot).
+  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight * kPgr4MaxViews;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "scene copy heap"))
     return false;
   stride_ = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   return true;
 }
+
+bool SceneCopy::taken(uint64_t frame) const { return taken_frame_ == Pgr4ViewKey(frame); }
 
 bool SceneCopy::EnsureTargets(uint32_t width, uint32_t height, uint64_t frame) {
   // The frames in flight are done with the copies they read.
@@ -246,7 +250,13 @@ bool SceneCopy::EnsureTargets(uint32_t width, uint32_t height, uint64_t frame) {
 
 bool SceneCopy::Take(ID3D12GraphicsCommandList* list, RenderTargets& targets,
                      const SurfaceRegs& regs, uint32_t height, uint64_t frame) {
-  if (!signature_ || taken_frame_ == frame) return false;
+  // Local change (25/11/2026, issue 29, split screen): once a view of the frame (Pgr4ViewKey: the
+  // frame alone with one view), player 2's reflections from its own scene, not player 1's; over a
+  // view's rows (g_pgr4_split_rows, 360: the rays leaving the view's bottom found nothing there,
+  // not the target's rows no view draws).
+  const uint64_t key = Pgr4ViewKey(frame);
+  if (!signature_ || taken_frame_ == key) return false;
+  if (g_pgr4_split_rows) height = std::min(height, g_pgr4_split_rows);
   RenderTarget* color = targets.GetColor(regs, 0, height);
   RenderTarget* depth = targets.GetDepth(regs, height);
   if (!color || !depth || color->samples != depth->samples || !(color->scale == depth->scale))
@@ -257,13 +267,13 @@ bool SceneCopy::Take(ID3D12GraphicsCommandList* list, RenderTargets& targets,
                  h = color->scale.Extent(std::min(color->height, height), 1);
   const uint32_t hw = (w + 1) / 2, hh = (h + 1) / 2;
   if (!w || !h || !EnsureTargets(hw, hh, frame)) return false;
-  taken_frame_ = frame;
+  taken_frame_ = key;
   const D3D12_RECT all = {0, 0, LONG(color->width), LONG(color->height)};
   targets.PrepareRead(list, color, all);
   targets.PrepareRead(list, depth, all);
   const bool ms = color->samples > 1;
 
-  const uint32_t first = uint32_t(frame % D3D12Device::kFramesInFlight) * kViewsPerSlot;
+  const uint32_t first = Pgr4ViewSlot(frame, D3D12Device::kFramesInFlight) * kViewsPerSlot;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_->GetCPUDescriptorHandleForHeapStart();
   cpu.ptr += size_t(first) * stride_;
   D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_->GetGPUDescriptorHandleForHeapStart();

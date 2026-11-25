@@ -28,6 +28,7 @@
 #include "render_targets.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <utility>
@@ -46,16 +47,27 @@ class Upscaler {
   // host targets' sample count).
   static constexpr uint32_t kSceneSurfaceMask = 0x33FFF;
   static constexpr uint32_t kSceneSurface = 0x10500;  // pitch 1280, 2x MSAA
-  static constexpr bool IsScene(uint32_t surface_info) {
-    return (surface_info & kSceneSurfaceMask) == kSceneSurface;
+  // Local change (25/11/2026, pgr4_native_side_by_side_views): the game's side by side split
+  // screen draws each view (640x720) on a surface of its own width: pitch 640, 2x MSAA. Taken as
+  // the scene's while that layout is chosen (renderer.cpp SwitchUpscaler sets it); 0 otherwise.
+  static constexpr uint32_t kSideSceneSurface = 0x10280;
+  static inline std::atomic<uint32_t> side_scene_surface{0};
+  static uint32_t SideSceneSurface() { return side_scene_surface.load(std::memory_order_relaxed); }
+  static bool IsScene(uint32_t surface_info) {
+    const uint32_t v = surface_info & kSceneSurfaceMask;
+    return v == kSceneSurface || (v == SideSceneSurface() && v != 0);
   }
+  // The least viewport half width of a main view's draws (not the rear-view mirror's, 212): 400,
+  // or 300 with the side by side views (320).
+  static float MainViewHalfWidth() { return SideSceneSurface() ? 300.0f : 400.0f; }
   static constexpr uint32_t kSceneWidth = kFfxSceneWidth;
   static uint32_t SceneHeight() { return FfxSceneHeight(); }
   // Whether a span of the scene surface (a resolve's, a viewport's) is the scene's width: the
   // scene resolves in tiles of its whole width, while the rear-view mirror renders into a corner
   // of the scene surface and resolves that corner on its own (neither upscaled nor jittered).
-  static constexpr bool IsSceneWidth(int32_t x0, int32_t x1) {
-    return x0 <= 0 && x1 >= int32_t(kSceneWidth);
+  // Local change (25/11/2026): a side by side view's whole width, 640, with those views.
+  static bool IsSceneWidth(int32_t x0, int32_t x1) {
+    return x0 <= 0 && x1 >= int32_t(SideSceneSurface() ? kSceneWidth / 2 : kSceneWidth);
   }
 
   Upscaler() = default;

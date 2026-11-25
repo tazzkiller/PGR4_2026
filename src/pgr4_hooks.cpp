@@ -150,6 +150,112 @@ void Pgr4RenderHeightHook(PPCRegister& r) {
   if (r.u32 == 720) r.u64 = pgr4::native::FfxSceneHeight();
 }
 
+// Local change (25/11/2026, test: Tazz, « on peux ajouter le vertical ? »): the game's own side by
+// side split screen (docs/audit_ecran_partage.md). With two viewports, sub_824C4B80 lays the views
+// out at a race's load from player 1's profile option VerticalSplitScreen (profile + 8 + 0x2054B,
+// read by the lbzx at 0x824C535C: 0 the top and bottom halves, else the left and right halves,
+// 640x720 each, a rear-view mirror each), and sub_8261BDA8 places each player's messages from the
+// same byte (its lbzx at 0x8261C0D4). No menu shows the option. On: both reads see it set, the
+// profile itself left as it is (nothing saved); off: the profile's value, the game as it was. A
+// choice of layout, the player's: off by default (on in the development pgr4.toml for the test).
+// Read at each race's load (the layout) and at each message.
+REXCVAR_DEFINE_BOOL(pgr4_split_side_by_side, false, "PGR4",
+                    "Two players' split screen side by side (left and right halves), the game's "
+                    "own layout behind its hidden VerticalSplitScreen option; off: top and bottom");
+void Pgr4SideBySideHook(PPCRegister& r) {
+  // The layout's read, logged with the profile's own value (the views' layout is made once a race).
+  static uint32_t logged = 0;
+  if (logged < 8) {
+    ++logged;
+    REXLOG_INFO("PGR4 split screen: the layout's VerticalSplitScreen read {} in the profile, {}",
+                r.u32 & 0xFF, REXCVAR_GET(pgr4_split_side_by_side) ? "side by side forced" : "kept");
+  }
+  if (REXCVAR_GET(pgr4_split_side_by_side)) r.u64 = 1;
+}
+void Pgr4SideBySideTextHook(PPCRegister& r) {
+  if (REXCVAR_GET(pgr4_split_side_by_side)) r.u64 = 1;
+}
+// ... and the scripts': GetOptionsVars (sub_825E59E8, its lbzx at 0x825E5F24) hands the option to
+// Lua as set (25/11/2026, the test's HUD kept the top and bottom layout: whether the scripts lay
+// it out from the option); SetOptionsVars (sub_825E2388, its stbx r11,r29,r10 at 0x825E296C) then
+// writes back the profile's own value, not Lua's (the profile and the save as they were).
+// ... without the rear-view mirrors, as the game's top and bottom layout (25/11/2026, Tazz: « on
+// suit ce que le jeu faisait d'origine »): its branch (loc_824C54F0) stores 0 in each view's
+// descriptor's mirror byte (+20: stb r24,100(r1), r24 0); the side by side branch stores 1
+// (stb r19,100(r1) at 0x824C53C0 for view 0, 0x824C547C for view 1), and its two mirrors, never
+// finished, share one texture (0x82A94708) and render player 1's car as the focus (their view
+// number +32 left 0): player 2's driver in both mirrors. The byte set to 0 after each store, in
+// memory (r19 stays: the branch uses it afterwards). Read at each race's load.
+REXCVAR_DEFINE_BOOL(pgr4_split_side_by_side_no_mirror, true, "PGR4",
+                    "Side by side split screen: no rear-view mirrors, as the game's top and bottom "
+                    "layout; off: the side by side layout's own mirrors");
+void Pgr4SideBySideMirrorHook(PPCRegister& r1) {
+  if (!REXCVAR_GET(pgr4_split_side_by_side) || !REXCVAR_GET(pgr4_split_side_by_side_no_mirror)) return;
+  *rex::system::kernel_memory()->TranslateVirtual<uint8_t*>(r1.u32 + 100) = 0;
+  static uint32_t logged = 0;
+  if (logged < 4) {
+    ++logged;
+    REXLOG_INFO("PGR4 split screen: side by side view without its rear-view mirror");
+  }
+}
+// Local change (25/11/2026, Tazz: « Oui, le HUD »): the HUD in the side by side views. No game
+// script reads VerticalSplitScreen (work/hud_audit: the 247 scripts' constants): the HUD keeps its
+// top and bottom bands. With this on, the scripts see the option set (GetOptionsVars, below) and
+// our Lua after Screens\GUIBank.lua (src/pgr4_menu.cpp HudSideBySideLua) gives each player the left
+// or right half in GetViewportDetails (the 2D items through AdjustPositionAndSizeForViewports, the
+// 3D gauges through SendViewportDetails), as the game's 3-4 viewport branch does its quarters;
+// Screens\HudHelper.lua's kudos stars' bank_x follows the half; the 3D gauges' x within their
+// rectangle is pgr4_split_side_by_side_gauge_x (Pgr4SideBySideGaugeXHook). Read at each call.
+REXCVAR_DEFINE_BOOL(pgr4_split_side_by_side_hud, true, "PGR4",
+                    "Side by side split screen: each player's HUD in their half; off: the game's "
+                    "top and bottom bands");
+// The 3D gauges' x in their rectangle (sub_8245E7E0's split screen branch: the engine variable
+// Vehicle.HUD.Setup.HorizSplitLayoutX, 0.825, made for a wide band): 0.65 keeps their right margin
+// in a 640-wide half as it is in the band (work/hud_audit/layout_calc_out.txt).
+REXCVAR_DEFINE_DOUBLE(pgr4_split_side_by_side_gauge_x, 0.65, "PGR4",
+                      "Side by side split screen: the speed and rev gauges' x in their half (the "
+                      "game's 0.825 for its wide bands)");
+bool Pgr4SideBySideHud() {
+  return REXCVAR_GET(pgr4_split_side_by_side) && REXCVAR_GET(pgr4_split_side_by_side_hud);
+}
+void Pgr4SideBySideLuaHook(PPCRegister& r) {
+  // The scripts see the side by side layout only for its HUD (the views' layout is the engine's,
+  // Pgr4SideBySideHook; no script read it before).
+  if (Pgr4SideBySideHud()) r.u64 = 1;
+}
+// sub_8245E7E0's split screen branch: f1 = HorizSplitLayoutX loaded (lfs f1,32(r29) at 0x8245E96C
+// before bl sub_8245C2A8, at 0x8245E980 before sub_8245C310), the solo branch's own (0x8245E9B4,
+// 0x8245E9E8) left as they are.
+void Pgr4SideBySideGaugeXHook(PPCRegister& f1) {
+  if (!Pgr4SideBySideHud()) return;
+  f1.f64 = REXCVAR_GET(pgr4_split_side_by_side_gauge_x);
+}
+// The probe: SendViewportDetailVariables' (sub_825CE0E0) store of a view's rectangle for the 3D
+// gauges (0x82AAD3EC + r10, stfsx at 0x825CE1D8..E8: sizeX f29, sizeY f28, topLeftX f31, topLeftY
+// f30, heightRatio f1), in the interface's 640x480 units; logged at each call (a race's load).
+// Development only (pgr4_native_capture_dir set, never in the release).
+void Pgr4ViewportDetailProbeHook(PPCRegister& r10, PPCRegister& f29, PPCRegister& f28,
+                                 PPCRegister& f31, PPCRegister& f30, PPCRegister& f1) {
+  static uint32_t logged = 0;
+  if (logged >= 64 || REXCVAR_GET(pgr4_native_capture_dir).empty()) return;
+  ++logged;
+  REXLOG_INFO("PGR4 split screen HUD: view {} rectangle x {:.2f} y {:.2f} size {:.2f} x {:.2f}, height "
+              "ratio {:.3f}{}",
+              r10.u32 / 20, f31.f64, f30.f64, f29.f64, f28.f64, f1.f64,
+              Pgr4SideBySideHud() ? " (side by side HUD)" : "");
+}
+void Pgr4SideBySideStoreHook(PPCRegister& r11, PPCRegister& r29, PPCRegister& r10) {
+  if (!REXCVAR_GET(pgr4_split_side_by_side)) return;
+  const uint8_t own = *rex::system::kernel_memory()->TranslateVirtual<const uint8_t*>(r29.u32 + r10.u32);
+  static uint32_t logged = 0;
+  if (logged < 8 && (r11.u32 & 0xFF) != own) {
+    ++logged;
+    REXLOG_INFO("PGR4 split screen: the scripts' VerticalSplitScreen {} not saved, the profile's {} kept",
+                r11.u32 & 0xFF, own);
+  }
+  r11.u64 = own;
+}
+
 // The scene's surface pair creators fn_826C8B18 and sub_822B3FC8 (r4: the height). A frame taller
 // than 720 needs taller surfaces: sub_826C6100 clamps every viewport to the bound target's packed
 // size, which would clamp it back to 720. A shorter frame (21:9) keeps the game's 720 surfaces,

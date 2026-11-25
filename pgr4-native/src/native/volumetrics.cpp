@@ -330,7 +330,7 @@ extern float g_pgr4_fog_clip[16];        // draw.cpp: the fog draws' camera (wor
 void Pgr4TakeFlareLights(std::vector<std::array<float, 11>>& out);  // draw.cpp: the flares, raw
 extern uint64_t g_pgr4_fog_order_frame[8], g_pgr4_fog_order_before[8],
     g_pgr4_fog_order_after[8];  // draw.cpp: the fog-laying draws before / after the volume
-extern uint64_t g_pgr4_fog_clip_frame;   // ... the frame it was seen in
+extern uint64_t g_pgr4_fog_clip_frame;   // ... the frame and view it was seen in (Pgr4ViewKey)
 extern uint64_t g_pgr4_fog_camera_stats[3];  // ... draws taken, not world to clip, mirrored
 // Development (21/11/2026): the passes drawn into the scene so far, for draw.cpp's count of what the
 // game draws after it.
@@ -1364,7 +1364,8 @@ bool Volumetrics::Initialize(ID3D12Device* device) {
       return false;
   D3D12_DESCRIPTOR_HEAP_DESC hd = {};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight;
+  // Local change (25/11/2026): a slot per view and frame in flight (Pgr4ViewSlot).
+  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight * kPgr4MaxViews;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "volumetrics heap"))
     return false;
@@ -1446,7 +1447,7 @@ bool Volumetrics::EnsureVolume(uint32_t columns_x, uint32_t columns_y) {
     up.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC b = {};
     b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    b.Width = uint64_t(kLightElements) * 16 * D3D12Device::kFramesInFlight;
+    b.Width = uint64_t(kLightElements) * 16 * D3D12Device::kFramesInFlight * kPgr4MaxViews;
     b.Height = b.DepthOrArraySize = b.MipLevels = 1;
     b.SampleDesc.Count = 1;
     b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -1518,52 +1519,89 @@ bool Volumetrics::EnsureVolume(uint32_t columns_x, uint32_t columns_y) {
       ground_state_[i] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
   }
-  if (volume_ && volume_columns_[0] == columns_x && volume_columns_[1] == columns_y) return true;
-  Retire(range_);
-  Retire(volume_);
-  Retire(media_[0]);
-  Retire(media_[1]);
-  media_valid_ = false;
   d.Width = columns_x;
   d.Height = columns_y;
   d.DepthOrArraySize = kSlices;
   d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-  if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
-                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                                              IID_PPV_ARGS(&volume_)),
-             "volumetrics volume"))
-    return false;
-  volume_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  {
-    D3D12_RESOURCE_DESC r = d;
-    r.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    r.DepthOrArraySize = 1;
-    r.Format = DXGI_FORMAT_R32_FLOAT;
-    if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r,
-                                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                                                IID_PPV_ARGS(&range_)),
-               "volumetrics range ratio")) {
-      volume_.Reset();
-      return false;
-    }
-    range_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-  }
-  // The cells' fog, this frame's and the previous (MEDIA), the same size.
-  for (int i = 0; i < 2; ++i) {
+  if (!volume_ || volume_columns_[0] != columns_x || volume_columns_[1] != columns_y) {
+    Retire(range_);
+    Retire(volume_);
+    volume_columns_[0] = volume_columns_[1] = 0;
     if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
                                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                                                IID_PPV_ARGS(&media_[i])),
-               "volumetrics cells' fog")) {
-      volume_.Reset();
+                                                IID_PPV_ARGS(&volume_)),
+               "volumetrics volume"))
       return false;
+    volume_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    {
+      D3D12_RESOURCE_DESC r = d;
+      r.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      r.DepthOrArraySize = 1;
+      r.Format = DXGI_FORMAT_R32_FLOAT;
+      if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &r,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                  IID_PPV_ARGS(&range_)),
+                 "volumetrics range ratio")) {
+        volume_.Reset();
+        return false;
+      }
+      range_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
-    media_state_[i] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    ++share_.generation;
+    volume_columns_[0] = columns_x;
+    volume_columns_[1] = columns_y;
+    REXLOG_INFO("PGR4 native volumetrics: volume {}x{}x{}", columns_x, columns_y, kSlices);
   }
-  ++share_.generation;
-  volume_columns_[0] = columns_x;
-  volume_columns_[1] = columns_y;
-  REXLOG_INFO("PGR4 native volumetrics: volume {}x{}x{}", columns_x, columns_y, kSlices);
+  // The cells' fog, this frame's and the previous (MEDIA), the same size. Local change
+  // (25/11/2026): the active view's own (SelectView), made again when its size is not the
+  // volume's (as when the volume was, before: one view).
+  if (!media_[0] || !media_[1] || media_columns_[0] != columns_x || media_columns_[1] != columns_y) {
+    Retire(media_[0]);
+    Retire(media_[1]);
+    media_valid_ = false;
+    media_columns_[0] = media_columns_[1] = 0;
+    for (int i = 0; i < 2; ++i) {
+      if (Failed(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                  IID_PPV_ARGS(&media_[i])),
+                 "volumetrics cells' fog")) {
+        media_[0].Reset();
+        media_[1].Reset();
+        return false;
+      }
+      media_state_[i] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    media_columns_[0] = columns_x;
+    media_columns_[1] = columns_y;
+  }
   return true;
+}
+
+// Local change (25/11/2026, split screen): the state a view keeps from frame to frame, swapped
+// between the members (the active view's) and `s`.
+void Volumetrics::SwapViewState(ViewState& s) {
+  for (int i = 0; i < 2; ++i) {
+    std::swap(media_[i], s.media[i]);
+    std::swap(media_state_[i], s.media_state[i]);
+    std::swap(media_columns_[i], s.media_columns[i]);
+    std::swap(ground_[i], s.ground[i]);
+    std::swap(ground_state_[i], s.ground_state[i]);
+    std::swap(ground_made_origin_[i], s.ground_made_origin[i]);
+  }
+  std::swap(media_now_, s.media_now);
+  std::swap(media_valid_, s.media_valid);
+  std::swap(temporal_header_, s.temporal_header);
+  std::swap(temporal_prev_, s.temporal_prev);
+  std::swap(temporal_last_s_, s.temporal_last_s);
+  std::swap(ground_made_, s.ground_made);
+}
+
+// The members become `view`'s: the active one's kept in its slot, `view`'s taken from its own.
+void Volumetrics::SelectView(uint32_t view) {
+  if (view >= kPgr4MaxViews || view == active_view_) return;
+  SwapViewState(views_[active_view_]);
+  SwapViewState(views_[view]);
+  active_view_ = view;
 }
 
 ID3D12PipelineState* Volumetrics::ApplyPipeline(DXGI_FORMAT format, uint32_t samples, bool debug) {
@@ -1623,17 +1661,22 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
     }
   } const vol_time{vol_t0, early ? 1 : 2};
   if (!ready_ || !Enabled() || !clip_rows_) return false;
-  if (early ? (early_tried_frame_ == frame || volume_frame_ == frame ||
+  // Local change (25/11/2026, split screen): once a view of the frame (Pgr4ViewKey: the frame
+  // alone with one view), each view with its own history (SelectView).
+  const uint64_t key = Pgr4ViewKey(frame);
+  const uint32_t view = g_pgr4_scene_view;
+  if (early ? (early_tried_frame_ == key || volume_frame_ == key ||
                !REXCVAR_GET(pgr4_native_volumetric_volume_early))
-            : applied_frame_ == frame)
+            : applied_frame_ == key)
     return false;
-  if (early) early_tried_frame_ = frame;
+  SelectView(view);
+  if (early) early_tried_frame_ = key;
   // Local change (22/11/2026): the freeze probe, the step reached (HangStep).
   HangMark hang_mark(HangWhat::kVolume, early ? 100 : 200);
   // The volume already made this frame by the early pass: not made again here.
-  const bool volume_done = !early && volume_frame_ == frame;
+  const bool volume_done = !early && volume_frame_ == key;
   if (!early) {
-    applied_frame_ = frame;
+    applied_frame_ = key;
     apply_frame_ = frame;
     std::erase_if(retired_, [&](const auto& x) {
       return x.first + D3D12Device::kFramesInFlight + 1 <= frame;
@@ -1662,8 +1705,11 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   // EDRAM's, 1024 guest rows, of which the scene draws the top SceneHeight (720); the rays mapped
   // over all of it stood 1024 / 720 = 1.42 times too low on the screen, the banks, the ground map and
   // the lamps with them). The switch off: the whole target, as it was.
+  // Local change (25/11/2026, split screen): a view's rows (g_pgr4_split_rows, 360), as its draws
+  // and the shaders' reading of the volume (by pixel) have them.
+  const uint32_t visible_rows = g_pgr4_split_rows ? g_pgr4_split_rows : Upscaler::SceneHeight();
   const uint32_t target_rows = REXCVAR_GET(pgr4_native_volumetric_visible_height)
-                                   ? std::min(color->height, Upscaler::SceneHeight())
+                                   ? std::min(color->height, visible_rows)
                                    : color->height;
   const uint32_t w = color->scale.Extent(color->width, 0), h = color->scale.Extent(target_rows, 1);
   const uint32_t hw = (w + 1) / 2, hh = (h + 1) / 2;
@@ -1681,7 +1727,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   // The frame's clip transform: the fog draws' own when one was seen this frame (draw.cpp), else
   // the scene camera's (FindCamera).
   const bool fog_camera =
-      REXCVAR_GET(pgr4_native_volumetric_fog_camera) && g_pgr4_fog_clip_frame == frame;
+      REXCVAR_GET(pgr4_native_volumetric_fog_camera) && g_pgr4_fog_clip_frame == key;
   float fog_rows[16];
   const float* rows = clip_rows_;
   if (fog_camera) {
@@ -1946,7 +1992,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   ID3D12Resource* depth_resource = depth->resource.Get();
   D3D12_RESOURCE_STATES* depth_state = &depth->state;
   const bool ms = depth->samples > 1;
-  const uint32_t first = uint32_t(frame % D3D12Device::kFramesInFlight) * kViewsPerSlot;
+  const uint32_t first = Pgr4ViewSlot(frame, D3D12Device::kFramesInFlight) * kViewsPerSlot;
   auto cpu = [&](uint32_t i) {
     D3D12_CPU_DESCRIPTOR_HANDLE hnd = heap_->GetCPUDescriptorHandleForHeapStart();
     hnd.ptr += size_t(first + i) * stride_;
@@ -2033,7 +2079,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       ls.Format = DXGI_FORMAT_UNKNOWN;
       ls.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
       ls.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      ls.Buffer.FirstElement = uint64_t(frame % D3D12Device::kFramesInFlight) * kLightElements;
+      ls.Buffer.FirstElement = uint64_t(Pgr4ViewSlot(frame, D3D12Device::kFramesInFlight)) * kLightElements;
       ls.Buffer.NumElements = kLightElements;
       ls.Buffer.StructureByteStride = 16;
       device_->CreateShaderResourceView(lights_.Get(), &ls, cpu(23));
@@ -2068,7 +2114,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       ls.Format = DXGI_FORMAT_UNKNOWN;
       ls.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
       ls.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      ls.Buffer.FirstElement = uint64_t(frame % D3D12Device::kFramesInFlight) * kLightElements;
+      ls.Buffer.FirstElement = uint64_t(Pgr4ViewSlot(frame, D3D12Device::kFramesInFlight)) * kLightElements;
       ls.Buffer.NumElements = kLightElements;
       ls.Buffer.StructureByteStride = 16;
       device_->CreateShaderResourceView(lights_.Get(), &ls, cpu(49));
@@ -2118,7 +2164,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       ls.Format = DXGI_FORMAT_UNKNOWN;
       ls.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
       ls.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      ls.Buffer.FirstElement = uint64_t(frame % D3D12Device::kFramesInFlight) * kLightElements;
+      ls.Buffer.FirstElement = uint64_t(Pgr4ViewSlot(frame, D3D12Device::kFramesInFlight)) * kLightElements;
       ls.Buffer.NumElements = kLightElements;
       ls.Buffer.StructureByteStride = 16;
       device_->CreateShaderResourceView(lights_.Get(), &ls, cpu(53));
@@ -2226,7 +2272,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       // cells seen or filled, the heights, the ground under the eye and the eye above it.
       static auto ground_last = std::chrono::steady_clock::now();
       if (const auto now = std::chrono::steady_clock::now();
-          g_pgr4_dev && now - ground_last >= std::chrono::seconds(2)) {  // never in the release
+          g_pgr4_dev && view == 0 && now - ground_last >= std::chrono::seconds(2)) {  // never in the release
         ground_last = now;
         if (!ground_readback_) {
           D3D12_HEAP_PROPERTIES rh = {};
@@ -2395,8 +2441,11 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
         float before_min = 1e9f, before_max = -1e9f, now_min = 1e9f, now_max = -1e9f;
         float before_step = 0.0f, now_step = 0.0f;
       };
-      static std::vector<Lamp> lamps;
-      static double lamps_last_s = 0.0;
+      // Local change (25/11/2026): each view's own (its eye's nearest).
+      static std::vector<Lamp> lamps_of_view[kPgr4MaxViews];
+      static double lamps_last_of_view[kPgr4MaxViews] = {};
+      std::vector<Lamp>& lamps = lamps_of_view[active_view_];
+      double& lamps_last_s = lamps_last_of_view[active_view_];
       const double now_s = std::chrono::duration<double>(
                                std::chrono::steady_clock::now().time_since_epoch()).count();
       const float dt = lamps_last_s > 0.0 ? float(std::clamp(now_s - lamps_last_s, 0.0, 0.25)) : 0.0f;
@@ -2593,7 +2642,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       lp.sent_max = std::max<uint32_t>(lp.sent_max, uint32_t(send.size()));
       lamps_sent_ = uint32_t(send.size());
       const float scale = fog_c12 > 0.0f && std::isfinite(fog_c12) ? fog_c12 : 1.0f;
-      float* out = reinterpret_cast<float*>(lights_mapped_ + size_t(frame % D3D12Device::kFramesInFlight) *
+      float* out = reinterpret_cast<float*>(lights_mapped_ + size_t(Pgr4ViewSlot(frame, D3D12Device::kFramesInFlight)) *
                                                                   kLightElements * 16);
       out[0] = float(send.size());
       out[1] = range;
@@ -2633,10 +2682,10 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       {
         float pu = 0.0f, pv = 0.0f;
         const bool on = std::sscanf(REXCVAR_GET(pgr4_native_volumetric_probe_uv).c_str(), "%f %f", &pu,
-                                    &pv) == 2 && probe_;
+                                    &pv) == 2 && probe_ && view == 0;  // (25/11/2026: player 1's)
         out[40] = std::floor(std::clamp(pu, 0.0f, 1.0f) * float(w - 1) + 0.5f);
         out[41] = std::floor(std::clamp(pv, 0.0f, 1.0f) * float(h - 1) + 0.5f);
-        grid_on_ = REXCVAR_GET(pgr4_native_volumetric_probe_grid) && probe_ && g_pgr4_dev;
+        grid_on_ = REXCVAR_GET(pgr4_native_volumetric_probe_grid) && probe_ && g_pgr4_dev && view == 0;
         out[42] = (on ? 1.0f : 0.0f) + (grid_on_ ? 2.0f : 0.0f);
         out[43] = 0.0f;  // (the fading scenery's mark: removed 21/11/2026)
         probe_pixel_[0] = out[40];
@@ -2819,8 +2868,37 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       for (int k = 0; k < 3; ++k) s[12 + k] = g_pgr4_fog_c10[k].load(std::memory_order_relaxed);
       s[15] = c.replace ? 1.0f : 0.0f;
     }
-    share_.frame = frame;
-    volume_frame_ = frame;
+    share_.frame = key;
+    volume_frame_ = key;
+    // Development (25/11/2026, split screen): each view's eye, the frames whose two views had the
+    // same ("SAME EYE": player 2's volume made from player 1's camera), every 2 s.
+    if (g_pgr4_dev && view < kPgr4MaxViews) {
+      for (int k = 0; k < 3; ++k) view_eye_[view][k] = c.eye[k];
+      view_eye_frame_[view] = frame;
+      static uint64_t two_views = 0, same_eye = 0;
+      static float gap_min = INFINITY, gap_max = 0.0f;
+      static auto views_last = std::chrono::steady_clock::now();
+      if (view == 1 && view_eye_frame_[0] == frame) {
+        float gap = 0.0f;
+        for (int k = 0; k < 3; ++k) gap = std::max(gap, std::abs(view_eye_[1][k] - view_eye_[0][k]));
+        ++two_views;
+        same_eye += gap < 1e-3f;
+        gap_min = std::min(gap_min, gap);
+        gap_max = std::max(gap_max, gap);
+      }
+      if (const auto now = std::chrono::steady_clock::now(); two_views && now - views_last >= std::chrono::seconds(2)) {
+        views_last = now;
+        REXLOG_INFO("PGR4 native volumetrics views: {} frames with two views' volumes, the eyes apart "
+                    "{:.2f}..{:.2f} m (player 1 {:.1f} {:.1f} {:.1f}, player 2 {:.1f} {:.1f} {:.1f}), {} "
+                    "rows of {} ({}x{} columns){}",
+                    two_views, gap_min, gap_max, view_eye_[0][0], view_eye_[0][1], view_eye_[0][2],
+                    view_eye_[1][0], view_eye_[1][1], view_eye_[1][2], h, color->height,
+                    columns_x, columns_y, same_eye ? fmt::format(" SAME EYE in {}", same_eye) : std::string());
+        two_views = same_eye = 0;
+        gap_min = INFINITY;
+        gap_max = 0.0f;
+      }
+    }
     }  // !volume_done
   }
   // The early pass: the volume only. Its probe: early or at the resolve, the eye then and at the
@@ -2829,7 +2907,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   if (early) {
     ++early_probe_.early;
     // The grid probe's record of this frame's volume inputs.
-    {
+    if (view == 0) {  // (25/11/2026: player 1's)
       static_assert(sizeof(Constants) == sizeof(VolumeInputs::constants));
       VolumeInputs& vi = volume_inputs_[frame % 8];
       vi.frame = frame;
@@ -2841,13 +2919,13 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       vi.ground_made = ground_made_;
     }
     for (int k = 0; k < 3; ++k) early_probe_.early_eye[k] = c.eye[k];
-    early_probe_.early_frame = frame;
+    early_probe_.early_frame = key;
     return true;  // its descriptor heap, root signature and pipelines set on the list
   }
   {
     EarlyProbe& ep = early_probe_;
     ++ep.frames;
-    if (volume_done && ep.early_frame == frame) {
+    if (volume_done && ep.early_frame == key) {
       float gap = 0.0f;
       for (int k = 0; k < 3; ++k) gap = std::max(gap, std::abs(c.eye[k] - ep.early_eye[k]));
       ep.eye_gap_max = std::max(ep.eye_gap_max, gap);
@@ -2897,7 +2975,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   list->SetGraphicsRootDescriptorTable(0, gpu(46));  // 46-50
   // The fog laid by the shaders this frame (InShader, the volume made): replace 2, the pass lays
   // only the lamps, the sun-lit air and the sky.
-  if (c.replace && InShader() && volume_frame_ == frame) c.replace = 2;
+  if (c.replace && InShader() && volume_frame_ == key) c.replace = 2;
   list->SetGraphicsRoot32BitConstants(1, sizeof(c) / 4, &c, 0);
   list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   list->DrawInstanced(3, 1, 0, 0);

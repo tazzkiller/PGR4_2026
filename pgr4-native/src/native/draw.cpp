@@ -445,12 +445,15 @@ struct Pgr4VolTimer {
     if (slot) *slot += pgr4::native::Ticks() - t0;
   }
 };
-std::vector<std::array<float, 11>> g_pgr4_flare_lights;
+// Local change (25/11/2026, split screen): each view's flares (g_pgr4_scene_view), taken by its
+// own volume.
+std::vector<std::array<float, 11>> g_pgr4_flare_lights_of_view[pgr4::native::kPgr4MaxViews];
 void Pgr4TakeFlareLights(std::vector<std::array<float, 11>>& out) {
-  out.swap(g_pgr4_flare_lights);
-  g_pgr4_flare_lights.clear();
+  auto& lights = g_pgr4_flare_lights_of_view[pgr4::native::g_pgr4_scene_view];
+  out.swap(lights);
+  lights.clear();
 }
-uint64_t g_pgr4_fog_clip_frame = UINT64_MAX;
+uint64_t g_pgr4_fog_clip_frame = UINT64_MAX;  // Pgr4ViewKey (25/11/2026)
 // Development (21/11/2026): the main view's fog-laying draws (fog_in_shader) before the volume was
 // made and after it, by frame (slot frame % 8, its frame in g_pgr4_fog_order_frame), for the
 // volumetric grid probe's flashes (volumetrics.cpp).
@@ -951,7 +954,12 @@ constexpr uint32_t kSamplerHeapSize = 2048;
 constexpr uint32_t kViewTableStart = 2;
 constexpr uint32_t kNull2DArray = 0, kNull3D = 1, kNullCube = 2, kSceneColor = 3, kSceneDepth = 4,
                    kHistoryColor = 5, kHistoryDepth = 6, kHistoryAccum = 7, kFogVolume = 8,
-                   kFogRange = 9, kFirstTexture = 10;
+                   kFogRange = 9, kFirstTexture = 13;
+// Local change (25/11/2026, issue 29, split screen): each view's copy at the scene's end for its
+// wet roads (Impl::history[view]), player 2's at 10-12.
+constexpr uint32_t kHistoryColorOf[] = {kHistoryColor, 10}, kHistoryDepthOf[] = {kHistoryDepth, 11},
+                   kHistoryAccumOf[] = {kHistoryAccum, 12};
+static_assert(std::size(kHistoryColorOf) == kPgr4MaxViews && kFogRange < 10 && kFirstTexture == 13);
 static_assert(kFogVolume == DxbcShaderTranslator::kFogVolumeDescriptor &&
               kFogRange == DxbcShaderTranslator::kFogRangeDescriptor);
 // Local change (pgr4 project): the sky's pixel shaders (psSky, psSkyFog), drawn without depth.
@@ -981,9 +989,48 @@ bool IsSkyShader(uint64_t ps_hash) {
 }
 // Local change (pgr4 project): the road shaders whose replacements reflect the scene on wet roads
 // (road_reflect_list.h, shaders/road_reflect_hooks.hlsli).
+// Development (25/11/2026, the wet roads missing in split screen: the road's debug views showed
+// nothing there, all of it in solo): each view's road draws' pipelines (SelectPipeline, its memo's
+// hits too), asked as replaced, made with our HLSL, ready, awaiting it, generic, a variant, from
+// the memo, by pixel shader and modification, every 2 s; "NOT OURS" when some were the game's.
+void RoadPipeNote(bool replaced, bool ours, bool ready, bool awaiting, bool generic, bool variant,
+                  bool memo, const DxbcShader::Translation* pst);
 bool IsRoadReflectShader(uint64_t ps_hash) {
   return std::binary_search(std::begin(kRoadReflectShaders), std::end(kRoadReflectShaders),
                             ps_hash);
+}
+void RoadPipeNote(bool replaced, bool ours, bool ready, bool awaiting, bool generic, bool variant,
+                  bool memo, const DxbcShader::Translation* pst) {
+  struct RoadPipe {
+    uint64_t draws = 0, replaced = 0, ours = 0, ready = 0, awaiting = 0, generic = 0, variant = 0, memo = 0;
+    std::map<std::pair<uint64_t, uint64_t>, uint64_t> shaders;  // (hash, modification): draws
+  };
+  static RoadPipe rp[kPgr4MaxViews];
+  static auto rp_last = std::chrono::steady_clock::now();
+  RoadPipe& r = rp[g_pgr4_scene_view];
+  ++r.draws;
+  r.replaced += replaced;
+  r.ours += ours;
+  r.ready += ready;
+  r.awaiting += awaiting;
+  r.generic += generic;
+  r.variant += variant;
+  r.memo += memo;
+  if (pst && r.shaders.size() < 32) ++r.shaders[{pst->shader().ucode_data_hash(), pst->modification()}];
+  if (const auto now = std::chrono::steady_clock::now(); now - rp_last >= std::chrono::seconds(2)) {
+    rp_last = now;
+    for (uint32_t v = 0; v < kPgr4MaxViews; ++v) {
+      RoadPipe& q = rp[v];
+      if (!q.draws) continue;
+      std::string list;
+      for (const auto& [hm, n] : q.shaders) list += fmt::format(" {:016X}/{:X} {}", hm.first, hm.second, n);
+      REXLOG_INFO("PGR4 native road pipelines, view {} over 2 s: {} draws ({} from the memo), asked replaced {}, "
+                  "made with ours {}, ready {}, awaiting our HLSL {}, generic {}, variant {}; shaders:{}{}",
+                  v, q.draws, q.memo, q.replaced, q.ours, q.ready, q.awaiting, q.generic, q.variant, list,
+                  q.ours < q.draws ? " NOT OURS" : "");
+      q = RoadPipe{};
+    }
+  }
 }
 // Local change (pgr4 project, 16/11/2026): the game's world scenery shaders (psSceneDiffuse and
 // its variants: scene_diffuse_list.h, tools/scene_diffuse_list.py), whose blended draws (the
@@ -1844,6 +1891,16 @@ struct DrawRenderer::Impl {
     uint32_t draws = 0, vertices = 0;
   };
   std::map<uint64_t, RainDraw> rain_draws;
+  // Development (25/11/2026): the wet roads' probe, over 2 s (EndFrame): the rain draws by vertex
+  // shader, and each view's road draws.
+  std::map<uint64_t, RainDraw> rain_draws_2s;
+  struct RoadProbe {
+    uint64_t draws = 0, with_copy = 0;
+    float time_lo[2] = {INFINITY, INFINITY}, time_hi[2] = {-INFINITY, -INFINITY};
+  };
+  RoadProbe road_probe[kPgr4MaxViews];
+  uint64_t road_probe_frames = 0, road_probe_sheltered = 0;
+  std::chrono::steady_clock::time_point road_probe_last = std::chrono::steady_clock::now();
   double rain_script_seen = -100.0;  // when the game last drew kRainScriptVs
   float rain_script[2] = {};  // development: its c209.x and c210.x
   uint32_t samplers_allocated = 0;
@@ -2213,6 +2270,7 @@ struct DrawRenderer::Impl {
   struct PsoMemo {
     uint64_t hash = 0;
     ID3D12PipelineState* pso = nullptr;
+    bool ours = false;  // local change (25/11/2026, the road pipelines' probe): made with our HLSL
   };
   PsoMemo pso_memo[1024];
 
@@ -2323,8 +2381,13 @@ struct DrawRenderer::Impl {
     float view[12] = {};
     bool valid = false;
   };
-  History history[1];
-  float road_clip[16] = {}, road_view[12] = {};  // this frame's, from its last road draw
+  // Local change (25/11/2026, split screen): one a view (g_pgr4_scene_view), each with its roads'
+  // transform and mapping.
+  History history[kPgr4MaxViews];
+  // Development (25/11/2026): each view's copies, the water's and the roads', counted for the log
+  // (OnSceneEnd, every 2 s).
+  uint64_t copy_probe[kPgr4MaxViews][2] = {};
+  float road_clip[kPgr4MaxViews][16] = {}, road_view[kPgr4MaxViews][12] = {};  // this frame's, from its last road draw
   // The photo mode's focus texel (g_pgr4_photo_focus_depth): readback buffers in flight.
   struct FocusReadback {
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
@@ -2755,7 +2818,7 @@ struct DrawRenderer::Impl {
       if (std::find(views.begin(), views.end(), mode) == views.end()) return false;
     }
     const Volumetrics* const v = r.volumetrics();
-    return v && v->share().volume && v->share().range && v->share().frame == r.frame_index() &&
+    return v && v->share().volume && v->share().range && v->share().frame == Pgr4ViewKey(r.frame_index()) &&
            v->share().values[15] > 0.5f;
   }
   bool FogVolumeOf(const DxbcShader* ps) {
@@ -3313,7 +3376,9 @@ bool DrawRenderer::Impl::Initialize() {
   // No running average: the road's swarming it hid was its textures read at their sharpest
   // (ucode2hlsl's register LOD), and it trailed the camera.
   history[0].copy.set_accumulate(false);
-  scene_copy_ready = scene_copy.Initialize(device) && history[0].copy.Initialize(device);
+  history[1].copy.set_accumulate(false);  // local change (25/11/2026): player 2's
+  scene_copy_ready = scene_copy.Initialize(device) && history[0].copy.Initialize(device) &&
+                     history[1].copy.Initialize(device);
   r.textures().SetEvictCallback(
       [this](const std::vector<ID3D12Resource*>& resources) { ReleaseViews(resources); });
   REXLOG_INFO(
@@ -6594,6 +6659,8 @@ ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
   PsoMemo& pso_slot = pso_memo[key_hash & 1023];
   if (pso_slot.pso && pso_slot.hash == key_hash) {
     ++diag.pso_hits;
+    if (g_pgr4_dev && ps_generic && IsRoadReflectShader(ps_generic->ucode_data_hash()))
+      RoadPipeNote(replaced != 0, pso_slot.ours, true, false, false, false, true, pst);  // development
     return pso_slot.pso;
   }
   const uint32_t variant = (vs != vs_generic ? 1u : 0u) | (ps && ps != ps_generic ? 2u : 0u) |
@@ -6669,6 +6736,10 @@ ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
     store.TouchEntry(use->store_entry);
     use->store_entry = PipelineStore::kNoEntry;
   }
+  // Development (25/11/2026): the road pipelines' probe (RoadPipeNote, the memo's hits too).
+  if (g_pgr4_dev && ps_generic && IsRoadReflectShader(ps_generic->ucode_data_hash()))
+    RoadPipeNote(replaced != 0, use->made_with_ours, use->state.load(std::memory_order_relaxed) == kReady,
+                 use->awaiting_hlsl, use->behind_generic, variant != 0, false, pst);
   if (use->awaiting_hlsl) ResumeAwaiting(use);
   const uint8_t state = use->state.load(std::memory_order_acquire);
   if (state == kCompiling) {
@@ -6739,7 +6810,7 @@ ID3D12PipelineState* DrawRenderer::Impl::SelectPipeline(
   }
   ID3D12PipelineState* const pso = use->pso.Get();
   if (use == p) {
-    pso_slot = {key_hash, pso};
+    pso_slot = {key_hash, pso, use->made_with_ours};
   } else {
     // Bindings and constants follow the shaders the pipeline was built from.
     vs = vs_generic;
@@ -7618,7 +7689,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
                               : REXCVAR_GET(pgr4_native_volumetric));
   if (mods.pixel_shader_used && ps && fog_where &&
       REXCVAR_GET(pgr4_native_volumetric_in_shader) && Upscaler::IsScene(sdr.rb_surface_info) &&
-      std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f &&
+      std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth() &&
       !(REXCVAR_GET(pgr4_native_volumetric_in_shader_no_sky) &&
         IsSkyShader(ps_generic->ucode_data_hash())) &&
       (!ReplacedOf(ps) || FogShaderOf(ps))) {  // local change (24/11/2026, T2): kept per shader
@@ -7841,8 +7912,10 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   if (ps && scene_copy_ready && EnhancedReflections() && Upscaler::IsScene(sdr.rb_surface_info) &&
       IsWaterShader(ps->ucode_data_hash())) {
     if (scene_copy.Take(list, r.render_targets(), SurfaceRegsFromRegisters(s.regs), height,
-                        frame_count))
+                        frame_count)) {
       ResetListState();
+      ++copy_probe[g_pgr4_scene_view][0];  // development (25/11/2026)
+    }
     if (scene_copy.taken(frame_count)) {
       if (scene_views_generation != scene_copy.generation()) {
         scene_views_generation = scene_copy.generation();
@@ -7872,9 +7945,9 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   if (ps && scene_copy_ready && EnhancedReflections() && Upscaler::IsScene(sdr.rb_surface_info) &&
       Traits(ps).road) {
     road_seen = true;
-    History& h = history[0];
+    History& h = history[g_pgr4_scene_view];  // local change (25/11/2026): the view's own
     if (h.valid && h.copy.color()) {
-      road_slot = 0;
+      road_slot = g_pgr4_scene_view;
       if (h.views_generation != h.copy.generation()) {
         h.views_generation = h.copy.generation();
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -7883,17 +7956,17 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         sd.Texture2DArray.MipLevels = 1;
         sd.Texture2DArray.ArraySize = 1;
         D3D12_CPU_DESCRIPTOR_HANDLE c = view_cpu;
-        c.ptr += size_t(kViewTableStart + kHistoryColor + road_slot) * view_stride;
+        c.ptr += size_t(kViewTableStart + kHistoryColorOf[road_slot]) * view_stride;
         sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         sd.Texture2DArray.MipLevels = SceneCopy::kColorLevels;
         device->CreateShaderResourceView(h.copy.color(), &sd, c);
         c = view_cpu;
-        c.ptr += size_t(kViewTableStart + kHistoryDepth + road_slot) * view_stride;
+        c.ptr += size_t(kViewTableStart + kHistoryDepthOf[road_slot]) * view_stride;
         sd.Format = DXGI_FORMAT_R32_FLOAT;
         sd.Texture2DArray.MipLevels = 1;
         device->CreateShaderResourceView(h.copy.depth(), &sd, c);
         c = view_cpu;
-        c.ptr += size_t(kViewTableStart + kHistoryAccum) * view_stride;
+        c.ptr += size_t(kViewTableStart + kHistoryAccumOf[road_slot]) * view_stride;
         sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         device->CreateShaderResourceView(h.copy.accum(), &sd, c);
       }
@@ -8370,7 +8443,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       a.fog_volume = ps_generic && replacer.UsesFogVolume(ps_generic->ucode_data_hash());
     } else {
       ++before_draws;
-      if (ps_generic && std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f &&
+      if (ps_generic && std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth() &&
           Upscaler::IsScene(sdr.rb_surface_info) && order.size() < 65536) {
         OrderDraw d;
         d.ps = ps_generic->ucode_data_hash();
@@ -8399,7 +8472,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       // far depth written over it, or the railing drawing no depth): every draw in the main view
       // now, fogged or not, flagged when it writes colour without depth, depth without colour, or
       // depth with the test "always".
-      if (ps_generic && std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f) {
+      if (ps_generic && std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth()) {
         BeforeSeen& b = before_fogged[ps_generic->ucode_data_hash()];
         ++b.draws;
         const bool colour = (sdr.rb_color_mask & 0xF) != 0;
@@ -8571,7 +8644,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   // kept for the volumetric fog (g_pgr4_flare_lights). The raw values every 2 s (development).
   if (ps_generic && ps_generic->ucode_data_hash() == 0xAB2BD72DF7FE8E7Aull && vs_generic &&
       vs_generic->ucode_data_hash() == 0x764E294E908A8A4Aull && membase &&
-      std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f) {
+      std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth()) {
     HangStep(1000 + 4);  // local change: the freeze probe's step
     const Pgr4VolTimer vol_timer(6);  // development (22/11/2026)
     static auto flare_last = std::chrono::steady_clock::now();
@@ -8610,9 +8683,11 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
           // returning early) dropped at the next frame's first flare (21/11/2026, the review: they
           // piled up to 4096 old ones and the new were refused; the pass takes them before the
           // frame's flares, drawn after it).
-          static uint64_t flare_frame = UINT64_MAX;
-          if (flare_frame != r.frame_index()) {
-            flare_frame = r.frame_index();
+          // Local change (25/11/2026): each view's, at its first flare of the frame.
+          auto& g_pgr4_flare_lights = g_pgr4_flare_lights_of_view[g_pgr4_scene_view];
+          static uint64_t flare_frame[kPgr4MaxViews] = {UINT64_MAX, UINT64_MAX};
+          if (flare_frame[g_pgr4_scene_view] != r.frame_index()) {
+            flare_frame[g_pgr4_scene_view] = r.frame_index();
             g_pgr4_flare_lights.clear();
           }
           for (uint32_t q = 0; q + 4 <= size / 16 && g_pgr4_flare_lights.size() < 4096; q += 4) {
@@ -8954,7 +9029,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       // view's 6 at night: the rear-view mirror's) left its constants to the next frame's volume
       // made at the first fog draw (the bumper view): the fog's colour six times too dark.
       const bool main_view = !REXCVAR_GET(pgr4_native_volumetric_fog_main_view) ||
-                             std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f;
+                             std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth();
       if ((full || !from_code) && main_view) {
         for (int k = 0; k < 4; ++k) {
           g_pgr4_fog_c10[k].store(c(10, k), std::memory_order_relaxed);
@@ -9014,7 +9089,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
           ++vp_seen.full;
           ++vp_seen.full_shaders[ps->ucode_data_hash()];
           const bool fits = gap <= 0.05f + 1e-4f * scale && m[5] > 0.0f;
-          const bool small_vp = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) <= 400.0f;
+          const bool small_vp = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) <= Upscaler::MainViewHalfWidth();
           const bool kept_out = small_vp && REXCVAR_GET(pgr4_native_volumetric_camera_main_view);
           vp_seen.taken += fits && !kept_out;
           vp_seen.taken_small += fits && !kept_out && small_vp;
@@ -9036,7 +9111,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         // the game's fog above): the rear-view mirror's pass at the frame's end gave its camera too,
         // which the pass at the resolve read.
         const bool camera_view = !REXCVAR_GET(pgr4_native_volumetric_camera_main_view) ||
-                                 std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f;
+                                 std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth();
         if (!(gap <= 0.05f + 1e-4f * scale)) {
           ++g_pgr4_fog_camera_stats[1];
         } else if (!(m[5] > 0.0f)) {
@@ -9045,7 +9120,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
           // another view's (a smaller viewport): not the volume's
         } else {
           std::memcpy(g_pgr4_fog_clip, m, sizeof(m));
-          g_pgr4_fog_clip_frame = r.frame_index();
+          g_pgr4_fog_clip_frame = Pgr4ViewKey(r.frame_index());
           ++g_pgr4_fog_camera_stats[0];
         }
       }
@@ -9053,8 +9128,8 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       // draws read it): at the frame's first main-view draw whose fog was just read (its camera and
       // the game's fog taken above), the volume made now (Volumetrics::Apply, early), before this
       // draw binds its state; its own state set on the list, so the draws bind theirs again.
-      if (full && g_pgr4_fog_clip_frame == r.frame_index() &&
-          std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > 400.0f) {
+      if (full && g_pgr4_fog_clip_frame == Pgr4ViewKey(r.frame_index()) &&
+          std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth()) {
         HangStep(1000 + 9);  // local change: the freeze probe's step
         if (ViewProbeOn() && g_view_volume_frame != r.frame_index()) {  // development: the probe
           if (Volumetrics* pv = r.volumetrics(); pv && !pv->VolumeMade(r.frame_index())) {
@@ -9265,13 +9340,13 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         } else if (!(w2c[5] > 0.0f)) {
           ++fs.mirrored;
         } else if (REXCVAR_GET(pgr4_native_volumetric_camera_main_view) &&
-                   std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) <= 400.0f) {
+                   std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) <= Upscaler::MainViewHalfWidth()) {
           // Local change (22/11/2026, pgr4_native_volumetric_camera_main_view): another view's
           // draw (a smaller viewport): neither its camera nor the volume made now.
           if (ViewProbeOn()) ++g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)].left_small;
         } else {
           std::memcpy(g_pgr4_fog_clip, w2c, sizeof(w2c));
-          g_pgr4_fog_clip_frame = r.frame_index();
+          g_pgr4_fog_clip_frame = Pgr4ViewKey(r.frame_index());
           std::memcpy(first_clip, w2c, sizeof(w2c));
           first_frame = r.frame_index();
           ++(from == 1 ? fs.from_c20 : from == 2 ? fs.from_object : fs.from_clip);
@@ -9306,7 +9381,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         }
       }
     } else if (VolProbes() && first_frame == r.frame_index() &&
-               !compared_frame && g_pgr4_fog_clip_frame == r.frame_index() &&
+               !compared_frame && g_pgr4_fog_clip_frame == Pgr4ViewKey(r.frame_index()) &&
                std::memcmp(g_pgr4_fog_clip, first_clip, sizeof(first_clip)) != 0) {
       // The fog draws' camera validated since (their c5 at its centre): ours against it.
       float scale = 1.0f, gap = 0.0f;
@@ -9521,7 +9596,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     static uint64_t given = 0, not_made = 0, shader_given = 0, shader_not_made = 0;
     static auto fog_volume_last = std::chrono::steady_clock::now();
     const Volumetrics* const v = r.volumetrics();
-    const bool made = v && v->share().volume && v->share().range && v->share().frame == r.frame_index();
+    const bool made = v && v->share().volume && v->share().range && v->share().frame == Pgr4ViewKey(r.frame_index());
     if (made) {
       const Volumetrics::Share& sh = v->share();
       if (fog_volume_view != sh.volume || fog_volume_generation != sh.generation ||
@@ -10030,7 +10105,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       for (auto& row : inv)
         for (float& v : row) v /= det;
       for (uint32_t r = 0; r < 4; ++r) {
-        float* out = road_clip + 4 * r;
+        float* out = road_clip[g_pgr4_scene_view] + 4 * r;
         for (uint32_t j = 0; j < 3; ++j)
           out[j] = vc(4 + r, 0) * inv[0][j] + vc(4 + r, 1) * inv[1][j] + vc(4 + r, 2) * inv[2][j];
         out[3] = vc(4 + r, 3) - (out[0] * t[0] + out[1] * t[1] + out[2] * t[2]);
@@ -10040,18 +10115,29 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
                               float(vp.xy_extent[0]) * hx, float(vp.xy_extent[1]) * hy,
                               vp.ndc_scale[0], vp.ndc_scale[1], vp.ndc_scale[2], 0.0f,
                               vp.ndc_offset[0], vp.ndc_offset[1], vp.ndc_offset[2], 0.0f};
-      std::memcpy(road_view, view, sizeof(view));
+      std::memcpy(road_view[g_pgr4_scene_view], view, sizeof(view));
     }
     // The previous frame's copy, its transform and mapping, and the eye.
     if (road_history) {
       std::memcpy(sys_sun.clip, road_history->clip, sizeof(sys_sun.clip));
       std::memcpy(sys_sun.view, road_history->view, sizeof(sys_sun.view));
-      sys_sun.scene[0] = kHistoryColor + road_slot;
-      sys_sun.scene[1] = kHistoryDepth + road_slot;
+      sys_sun.scene[0] = kHistoryColorOf[road_slot];
+      sys_sun.scene[1] = kHistoryDepthOf[road_slot];
       sys_sun.scene[2] = road_history->copy.width();
       sys_sun.scene[3] = road_history->copy.height();
       for (uint32_t k = 0; k < 3; ++k) sys_sun.camera[k] = vc(24, k);
-      sys_sun.camera[3] = road_history->copy.accum() ? float(kHistoryAccum) : 0.0f;
+      sys_sun.camera[3] = road_history->copy.accum() ? float(kHistoryAccumOf[road_slot]) : 0.0f;
+    }
+    // Development (25/11/2026, Tazz: the wet roads not working in split screen): each view's road
+    // draws, those with their copy, and the rain values they were given (pgr4_time.yz).
+    if (g_pgr4_dev) {
+      RoadProbe& rp = road_probe[g_pgr4_scene_view];
+      ++rp.draws;
+      rp.with_copy += road_history != nullptr;
+      rp.time_lo[0] = std::min(rp.time_lo[0], sys_sun.time[1]);
+      rp.time_hi[0] = std::max(rp.time_hi[0], sys_sun.time[1]);
+      rp.time_lo[1] = std::min(rp.time_lo[1], sys_sun.time[2]);
+      rp.time_hi[1] = std::max(rp.time_hi[1], sys_sun.time[2]);
     }
   }
   // Unnormalized fetches, texture sizes and offsets of these textures in guest texels
@@ -10696,10 +10782,27 @@ bool DrawRenderer::OnSceneEnd(ID3D12GraphicsCommandList* list, RenderTargets& ta
   // Local change (19/11/2026): also in the photo mode, for its focus (g_pgr4_photo_focus_depth).
   const bool focus = REXCVAR_GET(pgr4_native_photo_focus_depth) && Pgr4PhotoModeActive();
   if (!(m.road_seen || focus) || !m.scene_copy_ready) return false;
-  Impl::History& h = m.history[0];
+  // Local change (25/11/2026, split screen): the view's own (its next frame's roads read it).
+  const uint32_t view = g_pgr4_scene_view;
+  Impl::History& h = m.history[view];
   if (!h.copy.Take(list, targets, regs, Upscaler::SceneHeight(), m.frame_count)) return false;
-  std::memcpy(h.clip, m.road_clip, sizeof(h.clip));
-  std::memcpy(h.view, m.road_view, sizeof(h.view));
+  std::memcpy(h.clip, m.road_clip[view], sizeof(h.clip));
+  std::memcpy(h.view, m.road_view[view], sizeof(h.view));
+  ++m.copy_probe[view][1];
+  if (g_pgr4_dev) {  // development: never in the release
+    static auto copy_last = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - copy_last >= std::chrono::seconds(2)) {
+      copy_last = now;
+      if (m.copy_probe[1][0] || m.copy_probe[1][1])
+        REXLOG_INFO("PGR4 native scene copies by view over 2 s: player 1 water {} roads {} ({}x{}), "
+                    "player 2 water {} roads {} ({}x{}){}",
+                    m.copy_probe[0][0], m.copy_probe[0][1], m.history[0].copy.width(),
+                    m.history[0].copy.height(), m.copy_probe[1][0], m.copy_probe[1][1],
+                    m.history[1].copy.width(), m.history[1].copy.height(),
+                    m.copy_probe[0][1] && !m.copy_probe[1][1] ? " PLAYER 2 WITHOUT ITS OWN" : "");
+      for (auto& v : m.copy_probe) v[0] = v[1] = 0;
+    }
+  }
   h.valid = true;
   if (focus) {
     // The texel at the copy's centre (the game reads its depth resolve's, width / 2, height / 2),
@@ -10978,6 +11081,39 @@ void DrawRenderer::EndFrame(uint64_t completed_fence) {
   impl_->ui_wait_rect = impl_->ui_rect_after_hud;
   impl_->ui_hud_seen = impl_->ui_armed = impl_->ui_rect_after_hud = false;
   impl_->frames_without_road = impl_->road_drawn ? 0 : impl_->frames_without_road + 1;
+  // Development (25/11/2026): the wet roads' probe, every 2 s.
+  if (g_pgr4_dev) {
+    Impl& m = *impl_;
+    for (const auto& [vs, d] : m.rain_draws) {
+      m.rain_draws_2s[vs].draws += d.draws;
+      m.rain_draws_2s[vs].vertices += d.vertices;
+    }
+    ++m.road_probe_frames;
+    m.road_probe_sheltered += m.sheltered;
+    if (const auto now = std::chrono::steady_clock::now(); now - m.road_probe_last >= std::chrono::seconds(2)) {
+      m.road_probe_last = now;
+      if (m.road_probe[0].draws || m.road_probe[1].draws) {
+        std::string rain_text;
+        for (const auto& [vs, d] : m.rain_draws_2s)
+          rain_text += fmt::format(" {:016X} {} draws {} vertices", vs, d.draws, d.vertices);
+        const auto view_text = [&](int v) {
+          const Impl::RoadProbe& p = m.road_probe[v];
+          return p.draws ? fmt::format("{} road draws, {} with its copy, rain given c209 {:.3f}..{:.3f} c210 {:.3f}..{:.3f}",
+                                       p.draws, p.with_copy, p.time_lo[0], p.time_hi[0], p.time_lo[1], p.time_hi[1])
+                         : std::string("no road draws");
+        };
+        const bool dry = g_pgr4_weather_kind == 3 && m.rain[1] <= 0.0f;
+        REXLOG_INFO("PGR4 native wet roads over 2 s ({} frames, weather {}, sheltered in {}): rain taken c209 {:.3f} "
+                    "c210 {:.3f}; rain draws:{}; player 1: {}; player 2: {}{}",
+                    m.road_probe_frames, g_pgr4_weather_kind, m.road_probe_sheltered, m.rain[0], m.rain[1],
+                    rain_text.empty() ? std::string(" none") : rain_text, view_text(0), view_text(1),
+                    dry ? " ROADS DRY" : "");
+      }
+      m.rain_draws_2s.clear();
+      for (Impl::RoadProbe& p : m.road_probe) p = Impl::RoadProbe{};
+      m.road_probe_frames = m.road_probe_sheltered = 0;
+    }
+  }
   impl_->rain_draws.clear();
   if (impl_->frames_without_road > kRainGoneFrames) impl_->rain[0] = impl_->rain[1] = 0.0f;
   impl_->road_drawn = false;

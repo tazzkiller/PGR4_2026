@@ -4,6 +4,7 @@
 #include "d3d12_device.h"
 #include "gpu_timer.h"
 #include "upscaler.h"
+#include "volumetrics.h"  // local change (25/11/2026): Pgr4ViewKey, the split screen's views
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -1079,7 +1080,8 @@ bool SceneEffects::Initialize(ID3D12Device* device) {
 
   D3D12_DESCRIPTOR_HEAP_DESC hd = {};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight;
+  // Local change (25/11/2026): a slot per view and frame in flight (Pgr4ViewSlot).
+  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight * kPgr4MaxViews;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "scene effects heap"))
     return false;
@@ -1088,11 +1090,24 @@ bool SceneEffects::Initialize(ID3D12Device* device) {
   return true;
 }
 
+// Local change (25/11/2026): a resource some frame in flight may still use, freed once the GPU is
+// surely past it (Apply's frame then).
+void SceneEffects::Retire(ComPtr<ID3D12Resource>& resource) {
+  if (resource) retired_.emplace_back(retire_frame_, resource);
+  resource.Reset();
+}
+
+ID3D12Resource* SceneEffects::DeferredOcclusion(uint64_t frame) const {
+  return deferred_frame_ == Pgr4ViewKey(frame) ? full_.Get() : nullptr;
+}
+
 bool SceneEffects::EnsureTargets(uint32_t width, uint32_t height) {
   if (raw_ && width_ == width && height_ == height) return true;
-  raw_.Reset();
-  ao_.Reset();
-  half_depth_.Reset();
+  // Local change (25/11/2026): the old ones kept until the frames in flight are past them (Retire,
+  // as the volumetric fog's): a split screen's view changes their size during play.
+  Retire(raw_);
+  Retire(ao_);
+  Retire(half_depth_);
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC d = {};
@@ -1125,7 +1140,7 @@ bool SceneEffects::EnsureTargets(uint32_t width, uint32_t height) {
 
 bool SceneEffects::EnsureFull(uint32_t width, uint32_t height) {
   if (full_ && full_width_ == width && full_height_ == height) return true;
-  full_.Reset();
+  Retire(full_);  // local change (25/11/2026)
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC d = {};
@@ -1151,10 +1166,10 @@ bool SceneEffects::EnsureFull(uint32_t width, uint32_t height) {
 // Local addition (16/11/2026): XeGTAO's targets at the scene's full size.
 bool SceneEffects::EnsureXeTargets(uint32_t width, uint32_t height) {
   if (xe_depth_ && xe_width_ == width && xe_height_ == height) return true;
-  xe_depth_.Reset();
-  xe_ao_[0].Reset();
-  xe_ao_[1].Reset();
-  xe_edges_.Reset();
+  Retire(xe_depth_);  // local change (25/11/2026)
+  Retire(xe_ao_[0]);
+  Retire(xe_ao_[1]);
+  Retire(xe_edges_);
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC d = {};
@@ -1240,14 +1255,24 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   const auto step = [&](uint32_t s) {
     if (timer) timer->Pass(list, GpuTimer::KeyEffects(s));
   };
-  if (!ready_ || !Enabled() || applied_frame_ == frame) return;
-  applied_frame_ = frame;
+  // Local change (25/11/2026, issue 29: player 1's occlusion on player 2's half): once a view of
+  // the frame (Pgr4ViewKey: the frame alone with one view), from the view's depth and camera.
+  const uint64_t key = Pgr4ViewKey(frame);
+  if (!ready_ || !Enabled() || applied_frame_ == key) return;
+  applied_frame_ = key;
+  retire_frame_ = frame;
+  std::erase_if(retired_, [&](const auto& x) {
+    return x.first + D3D12Device::kFramesInFlight + 1 <= frame;
+  });
   RenderTarget* color = targets.GetColor(regs, 0, Upscaler::SceneHeight());
   RenderTarget* depth = targets.GetDepth(regs, Upscaler::SceneHeight());
   if (!color || !depth || color->samples != depth->samples || !(color->scale == depth->scale))
     return;
   // The draws' host extent of the scene.
-  const uint32_t w = color->scale.Extent(color->width, 0), h = color->scale.Extent(color->height, 1);
+  // Local change (25/11/2026, split screen): a view's rows (g_pgr4_split_rows, 360 of the scene's
+  // 720), its own aspect; 0: the target's, as before.
+  const uint32_t rows = g_pgr4_split_rows ? std::min(color->height, g_pgr4_split_rows) : color->height;
+  const uint32_t w = color->scale.Extent(color->width, 0), h = color->scale.Extent(rows, 1);
   // The occlusion's size: half the scene's, or all of it (pgr4_native_gtao_full).
   // Local addition (16/11/2026): XeGTAO (the menu's third choice), at the scene's full size.
   // XeGTAO under an upscaler (defer: none), or as --pgr4_native_ao_method forces.
@@ -1265,7 +1290,7 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   targets.PrepareRead(list, depth, all);
   const bool ms = depth->samples > 1;
 
-  const uint32_t first = uint32_t(frame % D3D12Device::kFramesInFlight) * kViewsPerSlot;
+  const uint32_t first = Pgr4ViewSlot(frame, D3D12Device::kFramesInFlight) * kViewsPerSlot;
   auto cpu = [&](uint32_t i) {
     D3D12_CPU_DESCRIPTOR_HANDLE h = heap_->GetCPUDescriptorHandleForHeapStart();
     h.ptr += size_t(first + i) * stride_;
@@ -1597,7 +1622,7 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
     list->SetComputeRootDescriptorTable(0, gpu(16));
     list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
     Transition(list, full_.Get(), full_state_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    deferred_frame_ = frame;
+    deferred_frame_ = key;
     return;
   }
   // color *= occlusion, a full-screen triangle into the scene's target.

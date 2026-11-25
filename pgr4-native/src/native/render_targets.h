@@ -242,12 +242,16 @@ class RenderTargets {
   // The most samples, up to `want` (a power of 2), that the host formats of every target allow.
   uint32_t SupportedSamples(uint32_t want) const;
 
-  void OverrideScene(uint32_t mask, uint32_t value, uint32_t samples, const RenderScale& scale) {
+  // Local change (25/11/2026): `value2` another surface overridden the same (the side by side
+  // split screen's views, Upscaler::kSideSceneSurface), 0 none.
+  void OverrideScene(uint32_t mask, uint32_t value, uint32_t samples, const RenderScale& scale,
+                     uint32_t value2 = 0) {
     // Local change: the ones made for an earlier override (another size or upscaler) go, or a
     // new upscaler at another render size finds them (their keys hold no scale).
     DropOverridden();
     scene_mask_ = mask;
     scene_value_ = value;
+    scene_value2_ = value2;
     scene_samples_ = samples;
     scene_scale_ = scene_size_scale_ = scale;
   }
@@ -306,7 +310,8 @@ class RenderTargets {
   // that scale (Resolver), so the cube is that much sharper (TextureCache::CopyScaledCube).
   static uint32_t OwnScale(uint32_t pitch, uint32_t edram_samples);
   bool IsOverridden(uint32_t surface_info) const {
-    return scene_mask_ && (surface_info & scene_mask_) == scene_value_;
+    return scene_mask_ && ((surface_info & scene_mask_) == scene_value_ ||
+                           (scene_value2_ && (surface_info & scene_mask_) == scene_value2_));
   }
   uint32_t HostSamples(uint32_t surface_info) const {
     if (IsOverridden(surface_info)) return scene_samples_;
@@ -339,6 +344,7 @@ class RenderTargets {
   uint64_t fill_seq_ = 0;
   std::FILE* log_ = nullptr;
   uint32_t scene_mask_ = 0, scene_value_ = 0, scene_samples_ = 1;
+  uint32_t scene_value2_ = 0;  // local change (25/11/2026): OverrideScene's value2
   RenderScale scene_scale_, scene_size_scale_;
 };
 

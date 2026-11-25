@@ -217,6 +217,36 @@ REXCVAR_DEFINE_INT32(pgr4_native_fps_limit, 0, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_camera_diag, false, "PGR4 native",
                     "Log the distinct c4-c7 matrices of the scene's depth draws every 120 frames "
                     "(local diagnostic for DLSS-G's camera)");
+// Local change (25/11/2026, issue 29, Tundreq: "ghosting shadows of player 1 on player 2's
+// screen" in split screen): the game draws each player's view as its own scene pass (its draws,
+// then its depth and color resolves, both at 0,0-1280,360: run.log of 18-19/11/2026), each with
+// its own camera and constants, so its fog in each shader and its effects are each view's. Ours
+// were made once a frame, in player 1's pass: the volumetric fog's volume (with the cars'
+// shadows), its lamps and history, and the ambient occlusion, which the deferred path multiplied
+// into player 2's color resolve too. With this on, each view gets its own (volumetrics.h
+// g_pgr4_scene_view), its camera found again at its first draws. Read at each scene draw.
+REXCVAR_DEFINE_BOOL(pgr4_native_split_screen_views, true, "PGR4 native",
+                    "Split screen: the volumetric fog and the ambient occlusion made for each "
+                    "player's view (its camera, depth, lamps and history); off: once a frame, "
+                    "player 1's for both halves");
+// ... and over the rows a view's draws cover (its depth resolve's, 360), not the scene's 720 (the
+// shaders read the volume by pixel, the occlusion takes its aspect from the size). Read at each
+// frame's end.
+REXCVAR_DEFINE_BOOL(pgr4_native_split_screen_view_rows, true, "PGR4 native",
+                    "Split screen: the volumetric fog and the ambient occlusion over each view's "
+                    "rows (360); off: over the scene's whole height");
+REXCVAR_DECLARE(bool, pgr4_split_side_by_side);  // src/pgr4_hooks.cpp (25/11/2026, the test)
+// Local change (25/11/2026, Tazz: our effects adapted to the side by side views): the game's side
+// by side split screen draws each 640x720 view on a surface of that width (pitch 640, 2x MSAA:
+// run.log of 25/11/2026, "0A010280"), which the scene's tests (Upscaler::IsScene, pitch 1280)
+// did not take: no render scale or MSAA of ours, no ambient occlusion, volumetric fog or scene
+// copies, no split screen seen (two passes of 640 columns). With this on and that layout chosen,
+// it is the scene's (Upscaler::kSideSceneSurface), a pass's whole width 640 and a main view's
+// viewport half width over 300 (320; the solo's rear-view mirror 212). Read at the start (and at
+// each upscaler or MSAA change).
+REXCVAR_DEFINE_BOOL(pgr4_native_side_by_side_views, true, "PGR4 native",
+                    "Side by side split screen: the views' surfaces get the scene's render scale, "
+                    "MSAA and effects; off: drawn as the game's other surfaces");
 
 // Local change (pgr4 project): the photo mode's screenshots (src/pgr4_menu.cpp): asked from the
 // game's thread, taken at the next frame's begin (NativeRenderer's), done once its frame is copied.
@@ -236,6 +266,10 @@ REXCVAR_DEFINE_BOOL(pgr4_native_original_look, false, "PGR4 native",
                     "or water plane changes; the other settings kept as they are");
 
 namespace pgr4::native {
+
+// Local change (25/11/2026): volumetrics.h (pgr4_native_split_screen_views, _view_rows).
+uint32_t g_pgr4_scene_view = 0;
+uint32_t g_pgr4_split_rows = 0;
 
 bool OriginalLook() { return REXCVAR_GET(pgr4_native_original_look); }
 
@@ -913,14 +947,25 @@ void NativeRenderer::SwitchUpscaler(bool on) {
   upscaler_on_ = on;
   // The scene's targets are keyed by their sample count: the next draws make the other ones,
   // and the unused ones age out (RenderTargets::BeginFrame).
+  // Local change (25/11/2026, pgr4_native_side_by_side_views): the side by side split screen's
+  // views' surface (Upscaler::kSideSceneSurface) the scene's too while that layout is chosen
+  // (pgr4_split_side_by_side): its scale, its samples, our effects. Read here (at the start and
+  // at each upscaler or MSAA change).
+  const uint32_t side = REXCVAR_GET(pgr4_split_side_by_side) &&
+                                REXCVAR_GET(pgr4_native_side_by_side_views)
+                            ? Upscaler::kSideSceneSurface
+                            : 0u;
+  if (side != Upscaler::SideSceneSurface())
+    REXLOG_INFO("PGR4 native: the side by side views' surface {}", side ? "taken as the scene's" : "not the scene's");
+  Upscaler::side_scene_surface.store(side, std::memory_order_relaxed);
   if (on) {
     rt_->OverrideScene(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, 1,
-                       upscaler_->max_scale());
+                       upscaler_->max_scale(), side);
     rt_->SetSceneScale(upscaler_->scale());
     upscaler_->Reset();
   } else if (scene_msaa_ != 2) {
     rt_->OverrideScene(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, scene_msaa_,
-                       UniformScale(DrawResolutionScale()));
+                       UniformScale(DrawResolutionScale()), side);
   } else {
     rt_->OverrideScene(0, 0, 1, {});
   }
@@ -1563,8 +1608,22 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
   draw_->BeginDrawSide(state.regs);
   ++stats_.draws;
   // Local change: the scene's passes (split screen, LimitFrameRate's neighbour below).
-  if (Upscaler::IsScene(state.regs[rex::graphics::XE_GPU_REG_RB_SURFACE_INFO]))
+  if (Upscaler::IsScene(state.regs[rex::graphics::XE_GPU_REG_RB_SURFACE_INFO])) {
     scene_drawn_since_resolve_ = true;
+    // Local change (25/11/2026, pgr4_native_split_screen_views): the scene's view these draws are
+    // on, the scene passes before them (player 2's after player 1's resolves), while the frame
+    // before had two (a split screen: one pass otherwise, its rear-view mirror after its resolves
+    // staying the view's); the camera found again in the new view's first draws.
+    const uint32_t view = split_last_frame_ && REXCVAR_GET(pgr4_native_split_screen_views)
+                              ? std::min(scene_passes_, kPgr4MaxViews - 1)
+                              : 0u;
+    if (view != g_pgr4_scene_view) {
+      g_pgr4_scene_view = view;
+      if (view > 0 &&
+          (upscaler_ || frame_generation_ || SceneEffects::Enabled() || Volumetrics::Enabled()))
+        camera_scan_ = 8;
+    }
+  }
   if (gpu_timer_) {
     uint64_t key;
     if (gpu_timer_->per_shader() && prep && prep->vs) {
@@ -1687,6 +1746,11 @@ void NativeRenderer::FindCamera(const DrawState& state) {
   if (!Upscaler::IsScene(regs[XE_GPU_REG_RB_SURFACE_INFO])) return;
   const reg::RB_DEPTHCONTROL depth{.value = regs[XE_GPU_REG_RB_DEPTHCONTROL]};
   if (!depth.z_enable || !depth.z_write_enable) return;
+  // Local change (25/11/2026): player 2's camera from its main view's draws (the viewport's half
+  // width over 400, as the volumetric fog's camera), none of a smaller view's.
+  if (g_pgr4_scene_view > 0 &&
+      !(std::abs(std::bit_cast<float>(regs[XE_GPU_REG_PA_CL_VPORT_XSCALE])) > Upscaler::MainViewHalfWidth()))
+    return;
   --camera_scan_;
   // A perspective clip transform: four aligned constant registers whose z row is a multiple of
   // their w row (fidelityfx.cpp). The scene's vertex shaders keep it in c4-c7 (td-323).
@@ -1730,8 +1794,23 @@ void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
   // into the same image, one view (draw logs of 30/10/2026); split screen resolves a depth per
   // player's view.
   if (Upscaler::IsScene(p.regs.surface_info) && Upscaler::IsSceneWidth(p.x0, p.x1) &&
-      p.source == 4 && std::exchange(scene_drawn_since_resolve_, false))
+      p.source == 4 && std::exchange(scene_drawn_since_resolve_, false)) {
     ++scene_passes_;
+    // Local change (25/11/2026, pgr4_native_split_screen_view_rows): the rows the pass's view
+    // covers, from the top (0: another place, not taken).
+    pass_rows_[std::min(scene_passes_ - 1, kPgr4MaxViews - 1)] =
+        p.x0 == 0 && p.y0 == 0 && p.y1 > 0 ? uint32_t(p.y1) : 0u;
+  }
+  // Development (25/11/2026, pgr4_split_side_by_side's test): every resolve of the frame, its
+  // surface, source, rect and destination, for the first frames with two depth resolves of a
+  // view's 640 columns (the game's side by side views, on surfaces of their width).
+  if (g_pgr4_dev && side_logs_ < 3 && REXCVAR_GET(pgr4_split_side_by_side)) {
+    side_depth_resolves_ += p.source == 4 && p.x0 == 0 && p.x1 == 640;
+    if (side_resolves_.size() < 4000)
+      side_resolves_ += fmt::format(" [surface {:08X} src {} {},{}-{},{} -> {:08X} {}x{} fmt {}]",
+                                    p.regs.surface_info, p.source, p.x0, p.y0, p.x1, p.y1,
+                                    p.dest_base, p.dest_width, p.dest_height, p.dest_format);
+  }
   if (Upscaler::IsScene(p.regs.surface_info) && scene_resolves_.size() < 2000)
     scene_resolves_ += fmt::format(" [pass {} src {} {},{}-{},{} -> {:08X} {}x{} fmt {}]",
                                    scene_passes_, p.source, p.x0, p.y0, p.x1, p.y1, p.dest_base,
@@ -1843,6 +1922,28 @@ void NativeRenderer::SplitScreenUpscaler() {
     REXLOG_INFO("PGR4 native: {} scene passes, resolves:{}", scene_passes_, scene_resolves_);
   }
   scene_resolves_.clear();
+  if (side_depth_resolves_ >= 2) {  // development (25/11/2026): pgr4_split_side_by_side's test
+    ++side_logs_;
+    REXLOG_INFO("PGR4 native side by side test: {} depth resolves of 640 columns, {} scene passes, "
+                "resolves:{}",
+                side_depth_resolves_, scene_passes_, side_resolves_);
+  }
+  side_depth_resolves_ = 0;
+  side_resolves_.clear();
+  // Local change (25/11/2026): the views of the next frame (pgr4_native_split_screen_views), and
+  // the rows of each while both views covered the same from the top (pgr4_native_split_screen_
+  // view_rows): the game's split screen, 0,0-1280,360 each (run.log of 18-19/11/2026).
+  split_last_frame_ = split;
+  const uint32_t rows = split && REXCVAR_GET(pgr4_native_split_screen_view_rows) &&
+                                pass_rows_[0] == pass_rows_[1]
+                            ? pass_rows_[0]
+                            : 0u;
+  if (rows != g_pgr4_split_rows)
+    REXLOG_INFO("PGR4 native: split screen views over {} rows{}", rows,
+                rows ? "" : " (none: the scene's whole height)");
+  g_pgr4_split_rows = rows;
+  g_pgr4_scene_view = 0;
+  pass_rows_[0] = pass_rows_[1] = 0;
   scene_passes_ = 0;
   scene_drawn_since_resolve_ = false;
   if (split) {

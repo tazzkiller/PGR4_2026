@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <map>
 #include <utility>
+#include <vector>
 
 namespace pgr4::native {
 
@@ -73,10 +74,9 @@ class SceneEffects {
   void Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets, const SurfaceRegs& regs,
              uint64_t frame, class GpuTimer* timer = nullptr, bool defer = false);
   // This frame's occlusion at the scene's host size (R8_UNORM, readable by compute shaders) when
-  // Apply deferred it, else null.
-  ID3D12Resource* DeferredOcclusion(uint64_t frame) const {
-    return deferred_frame_ == frame ? full_.Get() : nullptr;
-  }
+  // Apply deferred it, else null. Local change (25/11/2026, split screen): the view's own
+  // (volumetrics.h Pgr4ViewKey), not player 1's on player 2's half.
+  ID3D12Resource* DeferredOcclusion(uint64_t frame) const;
 
  private:
   template <typename T>
@@ -91,7 +91,7 @@ class SceneEffects {
   const FfxCamera* camera_ = nullptr;
   FogVolume fog_volume_;
   bool ready_ = false;
-  uint64_t applied_frame_ = UINT64_MAX;
+  uint64_t applied_frame_ = UINT64_MAX;  // Pgr4ViewKey (25/11/2026)
   ComPtr<ID3D12RootSignature> compute_signature_, apply_signature_;
   ComPtr<ID3D12PipelineState> down_pso_, down_ms_pso_, ao_pso_, ao_ms_pso_, blur_pso_;
   bool EnsureFull(uint32_t width, uint32_t height);
@@ -111,7 +111,12 @@ class SceneEffects {
   ComPtr<ID3D12Resource> full_;
   D3D12_RESOURCE_STATES full_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   uint32_t full_width_ = 0, full_height_ = 0;
-  uint64_t deferred_frame_ = UINT64_MAX;
+  uint64_t deferred_frame_ = UINT64_MAX;  // Pgr4ViewKey (25/11/2026)
+  // Local change (25/11/2026): the resources replaced (a size change), kept until the frames in
+  // flight are past them.
+  void Retire(ComPtr<ID3D12Resource>& resource);
+  std::vector<std::pair<uint64_t, ComPtr<ID3D12Resource>>> retired_;
+  uint64_t retire_frame_ = 0;
   ComPtr<ID3D12PipelineState> upsample_ms_pso_;
 
   // Local addition (16/11/2026): Intel's XeGTAO, the ambient occlusion under an upscaler

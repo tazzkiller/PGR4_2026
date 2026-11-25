@@ -43,7 +43,8 @@ class SceneCopy {
   bool Take(ID3D12GraphicsCommandList* list, RenderTargets& targets, const SurfaceRegs& regs,
             uint32_t height, uint64_t frame);
   // Whether this frame's copy exists (Take recorded it).
-  bool taken(uint64_t frame) const { return taken_frame_ == frame; }
+  // Local change (25/11/2026): the copy of the draws' view (volumetrics.h Pgr4ViewKey).
+  bool taken(uint64_t frame) const;
   ID3D12Resource* color() const { return color_.Get(); }
   ID3D12Resource* depth() const { return depth_.Get(); }
   uint32_t width() const { return width_; }
@@ -79,7 +80,7 @@ class SceneCopy {
                         depth_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
   uint32_t width_ = 0, height_ = 0;
   uint32_t generation_ = 0;
-  uint64_t taken_frame_ = UINT64_MAX;
+  uint64_t taken_frame_ = UINT64_MAX;  // Pgr4ViewKey (25/11/2026)
 };
 
 }  // namespace pgr4::native

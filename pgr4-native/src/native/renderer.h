@@ -298,6 +298,13 @@ class NativeRenderer {
   // SplitScreenUpscaler's (render thread).
   bool scene_drawn_since_resolve_ = false, upscaler_split_off_ = false;
   uint32_t scene_passes_ = 0, single_pass_frames_ = 0;
+  // Local change (25/11/2026): the last frame had two scene passes (its views: volumetrics.h
+  // g_pgr4_scene_view), and the rows each pass's depth resolve covered.
+  bool split_last_frame_ = false;
+  uint32_t pass_rows_[2] = {};
+  // Development (25/11/2026): the side by side test's resolves (pgr4_split_side_by_side).
+  std::string side_resolves_;
+  uint32_t side_depth_resolves_ = 0, side_logs_ = 0;
   // Local diagnostic: the frame's scene resolves (pass, source, rect, destination), logged the
   // first frames SplitScreenUpscaler sees two passes in.
   std::string scene_resolves_;

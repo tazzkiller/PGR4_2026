@@ -53,6 +53,23 @@ namespace pgr4::native {
 // draw.cpp's probe "PGR4 volumetric cut").
 void WorldMarker(uint32_t id);
 
+// Local change (25/11/2026, issue 29: player 1's shadows on player 2's half in split screen): the
+// scene's view the draws and resolves are on, 0 for player 1's (or the only one), 1 for player 2's
+// (renderer.cpp: the scene passes before it in the frame, with pgr4_native_split_screen_views;
+// always 0 with it off). The render thread's (the draws' A and the resolves). The scene effects
+// made once a frame (the volumetric fog, the ambient occlusion) are made once a view: their
+// "this frame" is this key, their slots of descriptors and uploads one per view and frame in flight.
+constexpr uint32_t kPgr4MaxViews = 2;
+extern uint32_t g_pgr4_scene_view;
+inline uint64_t Pgr4ViewKey(uint64_t frame) { return frame * kPgr4MaxViews + g_pgr4_scene_view; }
+inline uint32_t Pgr4ViewSlot(uint64_t frame, uint32_t frames_in_flight) {
+  return uint32_t(frame % frames_in_flight) * kPgr4MaxViews + g_pgr4_scene_view;
+}
+// ... and the rows each view's scene is drawn on (its depth resolve's, 360 of the scene's 720)
+// while the last frame had two scene passes, with pgr4_native_split_screen_view_rows; 0 otherwise
+// (the scene's whole height, as before).
+extern uint32_t g_pgr4_split_rows;
+
 class Volumetrics {
  public:
   bool Initialize(ID3D12Device* device);
@@ -77,12 +94,13 @@ class Volumetrics {
   bool Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets, const SurfaceRegs& regs,
              uint64_t frame, class GpuTimer* timer = nullptr, bool early = false);
   // Whether the volume was already made this frame (early): the draws look before calling.
-  bool VolumeMade(uint64_t frame) const { return volume_frame_ == frame; }
+  // Local change (25/11/2026): for the draws' view (Pgr4ViewKey).
+  bool VolumeMade(uint64_t frame) const { return volume_frame_ == Pgr4ViewKey(frame); }
   // Local change (21/11/2026): the volume as this frame made it, for the replacement shaders of the
   // game's transparent draws after it (draw.cpp, shaders/fog_volume_hooks.hlsli: the spectators'
   // flags), which take their fog's transmittance from it.
   struct Share {
-    uint64_t frame = UINT64_MAX;    // the frame it was made in
+    uint64_t frame = UINT64_MAX;    // the frame and view it was made in (Pgr4ViewKey)
     ID3D12Resource* volume = nullptr;
     uint32_t generation = 0;        // counted up each time the volume is made again
     float values[16] = {};          // pgr4_fog_volume (fog_volume_hooks.hlsli)
@@ -233,6 +251,34 @@ class Volumetrics {
   bool ground_copied_ = false;
   uint32_t volume_columns_[2] = {};
   Share share_;
+  // Local change (25/11/2026, split screen): the state each view keeps from one frame to the next
+  // (its cells' fog history and its camera then, its ground map), the members above being the
+  // view's Apply is on (active_view_), the others' kept here (SelectView swaps them). The cells'
+  // fog's size (media_columns_) is the view's own: made again when the volume's changed.
+  uint32_t media_columns_[2] = {};
+  struct ViewState {
+    ComPtr<ID3D12Resource> media[2];
+    D3D12_RESOURCE_STATES media_state[2] = {D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    uint32_t media_now = 0;
+    bool media_valid = false;
+    uint32_t media_columns[2] = {};
+    float temporal_header[20] = {};
+    float temporal_prev[16] = {};
+    double temporal_last_s = 0.0;
+    ComPtr<ID3D12Resource> ground[2];
+    D3D12_RESOURCE_STATES ground_state[2] = {D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+    float ground_made_origin[2] = {};
+    bool ground_made = false;
+  };
+  ViewState views_[kPgr4MaxViews];
+  uint32_t active_view_ = 0;
+  void SwapViewState(ViewState& s);
+  void SelectView(uint32_t view);
+  // The probe (development): each view's eye at its volume, the frame it was made in.
+  float view_eye_[kPgr4MaxViews][3] = {};
+  uint64_t view_eye_frame_[kPgr4MaxViews] = {UINT64_MAX, UINT64_MAX};
 };
 
 }  // namespace pgr4::native
