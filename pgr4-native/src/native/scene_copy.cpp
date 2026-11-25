@@ -174,8 +174,7 @@ bool SceneCopy::Initialize(ID3D12Device* device) {
   }
   D3D12_DESCRIPTOR_HEAP_DESC hd = {};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  // Local change (25/11/2026): a slot per view and frame in flight (Pgr4ViewSlot).
-  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight * kPgr4MaxViews;
+  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "scene copy heap"))
     return false;
@@ -256,6 +255,20 @@ bool SceneCopy::Take(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   // not the target's rows no view draws).
   const uint64_t key = Pgr4ViewKey(frame);
   if (!signature_ || taken_frame_ == key) return false;
+  // Local change (26/11/2026, split screen only): player 2's view's descriptors on a heap of its
+  // own, made at its first copy; one view (the solo) on the heap of before.
+  ID3D12DescriptorHeap* heap = heap_.Get();
+  if (g_pgr4_scene_view == 1) {
+    if (!heap_view1_) {
+      D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+      hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+      hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight;
+      hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+      if (Failed(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_view1_)), "scene copy heap"))
+        return false;
+    }
+    heap = heap_view1_.Get();
+  }
   if (g_pgr4_split_rows) height = std::min(height, g_pgr4_split_rows);
   RenderTarget* color = targets.GetColor(regs, 0, height);
   RenderTarget* depth = targets.GetDepth(regs, height);
@@ -274,9 +287,9 @@ bool SceneCopy::Take(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   const bool ms = color->samples > 1;
 
   const uint32_t first = Pgr4ViewSlot(frame, D3D12Device::kFramesInFlight) * kViewsPerSlot;
-  D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_->GetCPUDescriptorHandleForHeapStart();
+  D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap->GetCPUDescriptorHandleForHeapStart();
   cpu.ptr += size_t(first) * stride_;
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_->GetGPUDescriptorHandleForHeapStart();
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap->GetGPUDescriptorHandleForHeapStart();
   gpu.ptr += uint64_t(first) * stride_;
   auto at = [&](uint32_t i) {
     D3D12_CPU_DESCRIPTOR_HANDLE h = cpu;
@@ -312,7 +325,7 @@ bool SceneCopy::Take(ID3D12GraphicsCommandList* list, RenderTargets& targets,
     bs[nb++] = TransitionBarrier(depth_.Get(), depth_state_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   if (nb) list->ResourceBarrier(nb, bs);
   const CopyConstants c = {{w, h}, {hw, hh}};
-  ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+  ID3D12DescriptorHeap* heaps[] = {heap};
   list->SetDescriptorHeaps(1, heaps);
   list->SetComputeRootSignature(signature_.Get());
   list->SetPipelineState(ms ? pso_ms_.Get() : pso_.Get());

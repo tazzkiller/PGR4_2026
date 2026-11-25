@@ -67,6 +67,7 @@ class SceneCopy {
   ComPtr<ID3D12RootSignature> signature_;
   ComPtr<ID3D12PipelineState> pso_, pso_ms_, level_pso_, accum_pso_;
   ComPtr<ID3D12DescriptorHeap> heap_;
+  ComPtr<ID3D12DescriptorHeap> heap_view1_;  // local change (26/11/2026): player 2's, at its first copy
   uint32_t stride_ = 0;
   ComPtr<ID3D12Resource> color_, depth_;  // R16G16B16A16_FLOAT, R32_FLOAT, half size
   ComPtr<ID3D12Resource> accum_;          // kAccumLevel's size, R16G16B16A16_FLOAT

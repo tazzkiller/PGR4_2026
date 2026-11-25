@@ -954,12 +954,7 @@ constexpr uint32_t kSamplerHeapSize = 2048;
 constexpr uint32_t kViewTableStart = 2;
 constexpr uint32_t kNull2DArray = 0, kNull3D = 1, kNullCube = 2, kSceneColor = 3, kSceneDepth = 4,
                    kHistoryColor = 5, kHistoryDepth = 6, kHistoryAccum = 7, kFogVolume = 8,
-                   kFogRange = 9, kFirstTexture = 13;
-// Local change (25/11/2026, issue 29, split screen): each view's copy at the scene's end for its
-// wet roads (Impl::history[view]), player 2's at 10-12.
-constexpr uint32_t kHistoryColorOf[] = {kHistoryColor, 10}, kHistoryDepthOf[] = {kHistoryDepth, 11},
-                   kHistoryAccumOf[] = {kHistoryAccum, 12};
-static_assert(std::size(kHistoryColorOf) == kPgr4MaxViews && kFogRange < 10 && kFirstTexture == 13);
+                   kFogRange = 9, kFirstTexture = 10;
 static_assert(kFogVolume == DxbcShaderTranslator::kFogVolumeDescriptor &&
               kFogRange == DxbcShaderTranslator::kFogRangeDescriptor);
 // Local change (pgr4 project): the sky's pixel shaders (psSky, psSkyFog), drawn without depth.
@@ -2381,6 +2376,31 @@ struct DrawRenderer::Impl {
     float view[12] = {};
     bool valid = false;
   };
+  // Local change (26/11/2026, Tazz: the split screen's changes only ever in split screen): player
+  // 2's copy made at its first (OnSceneEnd), its three bindless slots (color, depth, the color's
+  // running average) taken then from the textures' (HistorySlots); player 1's (the solo's) 5-7 as
+  // before, the textures from 10.
+  bool history1_ready = false;
+  uint32_t history_slots[2][3] = {{kHistoryColor, kHistoryDepth, kHistoryAccum}, {0, 0, 0}};
+  bool HistorySlots(uint32_t view) {
+    if (history_slots[view][0]) return true;
+    uint32_t taken[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+      if (!free_views.empty()) {
+        taken[i] = free_views.back();
+        free_views.pop_back();
+      } else if (views_allocated < ViewLimit()) {
+        taken[i] = views_allocated++;
+      } else {
+        for (uint32_t k = 0; k < i; ++k) free_views.push_back(taken[k]);
+        return false;
+      }
+    }
+    for (uint32_t i = 0; i < 3; ++i) history_slots[view][i] = taken[i] - kViewTableStart;
+    REXLOG_INFO("PGR4 native: player 2's copy for the wet roads in the bindless table at {} {} {}",
+                history_slots[view][0], history_slots[view][1], history_slots[view][2]);
+    return true;
+  }
   // Local change (25/11/2026, split screen): one a view (g_pgr4_scene_view), each with its roads'
   // transform and mapping.
   History history[kPgr4MaxViews];
@@ -3376,9 +3396,7 @@ bool DrawRenderer::Impl::Initialize() {
   // No running average: the road's swarming it hid was its textures read at their sharpest
   // (ucode2hlsl's register LOD), and it trailed the camera.
   history[0].copy.set_accumulate(false);
-  history[1].copy.set_accumulate(false);  // local change (25/11/2026): player 2's
-  scene_copy_ready = scene_copy.Initialize(device) && history[0].copy.Initialize(device) &&
-                     history[1].copy.Initialize(device);
+  scene_copy_ready = scene_copy.Initialize(device) && history[0].copy.Initialize(device);
   r.textures().SetEvictCallback(
       [this](const std::vector<ID3D12Resource*>& resources) { ReleaseViews(resources); });
   REXLOG_INFO(
@@ -7946,7 +7964,7 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       Traits(ps).road) {
     road_seen = true;
     History& h = history[g_pgr4_scene_view];  // local change (25/11/2026): the view's own
-    if (h.valid && h.copy.color()) {
+    if (h.valid && h.copy.color() && HistorySlots(g_pgr4_scene_view)) {
       road_slot = g_pgr4_scene_view;
       if (h.views_generation != h.copy.generation()) {
         h.views_generation = h.copy.generation();
@@ -7956,17 +7974,17 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         sd.Texture2DArray.MipLevels = 1;
         sd.Texture2DArray.ArraySize = 1;
         D3D12_CPU_DESCRIPTOR_HANDLE c = view_cpu;
-        c.ptr += size_t(kViewTableStart + kHistoryColorOf[road_slot]) * view_stride;
+        c.ptr += size_t(kViewTableStart + history_slots[road_slot][0]) * view_stride;
         sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         sd.Texture2DArray.MipLevels = SceneCopy::kColorLevels;
         device->CreateShaderResourceView(h.copy.color(), &sd, c);
         c = view_cpu;
-        c.ptr += size_t(kViewTableStart + kHistoryDepthOf[road_slot]) * view_stride;
+        c.ptr += size_t(kViewTableStart + history_slots[road_slot][1]) * view_stride;
         sd.Format = DXGI_FORMAT_R32_FLOAT;
         sd.Texture2DArray.MipLevels = 1;
         device->CreateShaderResourceView(h.copy.depth(), &sd, c);
         c = view_cpu;
-        c.ptr += size_t(kViewTableStart + kHistoryAccumOf[road_slot]) * view_stride;
+        c.ptr += size_t(kViewTableStart + history_slots[road_slot][2]) * view_stride;
         sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         device->CreateShaderResourceView(h.copy.accum(), &sd, c);
       }
@@ -10121,12 +10139,12 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     if (road_history) {
       std::memcpy(sys_sun.clip, road_history->clip, sizeof(sys_sun.clip));
       std::memcpy(sys_sun.view, road_history->view, sizeof(sys_sun.view));
-      sys_sun.scene[0] = kHistoryColorOf[road_slot];
-      sys_sun.scene[1] = kHistoryDepthOf[road_slot];
+      sys_sun.scene[0] = history_slots[road_slot][0];
+      sys_sun.scene[1] = history_slots[road_slot][1];
       sys_sun.scene[2] = road_history->copy.width();
       sys_sun.scene[3] = road_history->copy.height();
       for (uint32_t k = 0; k < 3; ++k) sys_sun.camera[k] = vc(24, k);
-      sys_sun.camera[3] = road_history->copy.accum() ? float(kHistoryAccumOf[road_slot]) : 0.0f;
+      sys_sun.camera[3] = road_history->copy.accum() ? float(history_slots[road_slot][2]) : 0.0f;
     }
     // Development (25/11/2026, Tazz: the wet roads not working in split screen): each view's road
     // draws, those with their copy, and the rain values they were given (pgr4_time.yz).
@@ -10785,6 +10803,13 @@ bool DrawRenderer::OnSceneEnd(ID3D12GraphicsCommandList* list, RenderTargets& ta
   // Local change (25/11/2026, split screen): the view's own (its next frame's roads read it).
   const uint32_t view = g_pgr4_scene_view;
   Impl::History& h = m.history[view];
+  // Local change (26/11/2026, split screen only): player 2's copy made at its first.
+  if (view == 1 && !m.history1_ready) {
+    m.history[1].copy.set_accumulate(false);
+    m.history1_ready = m.history[1].copy.Initialize(m.device);
+    REXLOG_INFO("PGR4 native: player 2's copy for the wet roads {}", m.history1_ready ? "made" : "NOT made");
+    if (!m.history1_ready) return false;
+  }
   if (!h.copy.Take(list, targets, regs, Upscaler::SceneHeight(), m.frame_count)) return false;
   std::memcpy(h.clip, m.road_clip[view], sizeof(h.clip));
   std::memcpy(h.view, m.road_view[view], sizeof(h.view));

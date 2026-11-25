@@ -99,6 +99,7 @@ class SceneEffects {
   ComPtr<ID3DBlob> apply_vs_, apply_ps_, apply_ps_ms_;  // the pixel shader without, with MSAA
   ComPtr<ID3DBlob> apply_ps_debug_, apply_ps_ms_debug_;  // the debug view's (writes everywhere)
   ComPtr<ID3D12DescriptorHeap> heap_;
+  ComPtr<ID3D12DescriptorHeap> heap_view1_;  // local change (26/11/2026): player 2's, at its first occlusion
   uint32_t stride_ = 0;
   // Half the size of the scene's host target: the raw and blurred occlusion (R8_UNORM), and the
   // scene's depth (R32_FLOAT, as it is: inverted).
@@ -117,6 +118,7 @@ class SceneEffects {
   void Retire(ComPtr<ID3D12Resource>& resource);
   std::vector<std::pair<uint64_t, ComPtr<ID3D12Resource>>> retired_;
   uint64_t retire_frame_ = 0;
+  uint64_t last_split_frame_ = UINT64_MAX;  // (26/11/2026) the last frame with split screen rows
   ComPtr<ID3D12PipelineState> upsample_ms_pso_;
 
   // Local addition (16/11/2026): Intel's XeGTAO, the ambient occlusion under an upscaler

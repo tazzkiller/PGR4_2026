@@ -1364,8 +1364,7 @@ bool Volumetrics::Initialize(ID3D12Device* device) {
       return false;
   D3D12_DESCRIPTOR_HEAP_DESC hd = {};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  // Local change (25/11/2026): a slot per view and frame in flight (Pgr4ViewSlot).
-  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight * kPgr4MaxViews;
+  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "volumetrics heap"))
     return false;
@@ -1423,6 +1422,16 @@ bool Volumetrics::EnsureTargets(uint32_t width, uint32_t height) {
 
 bool Volumetrics::EnsureVolume(uint32_t columns_x, uint32_t columns_y) {
   if (!noise_pso_ || !volume_pso_) return false;
+  // Local change (26/11/2026, split screen only): player 2's descriptor heap, made at its first
+  // volume (SelectView swapped player 1's out); player 1's (the solo's) made at Initialize.
+  if (!heap_) {
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (Failed(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "volumetrics heap"))
+      return false;
+  }
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC d = {};
@@ -1447,7 +1456,7 @@ bool Volumetrics::EnsureVolume(uint32_t columns_x, uint32_t columns_y) {
     up.Type = D3D12_HEAP_TYPE_UPLOAD;
     D3D12_RESOURCE_DESC b = {};
     b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    b.Width = uint64_t(kLightElements) * 16 * D3D12Device::kFramesInFlight * kPgr4MaxViews;
+    b.Width = uint64_t(kLightElements) * 16 * D3D12Device::kFramesInFlight;
     b.Height = b.DepthOrArraySize = b.MipLevels = 1;
     b.SampleDesc.Count = 1;
     b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -1580,6 +1589,9 @@ bool Volumetrics::EnsureVolume(uint32_t columns_x, uint32_t columns_y) {
 // Local change (25/11/2026, split screen): the state a view keeps from frame to frame, swapped
 // between the members (the active view's) and `s`.
 void Volumetrics::SwapViewState(ViewState& s) {
+  std::swap(heap_, s.heap);
+  std::swap(lights_, s.lights);
+  std::swap(lights_mapped_, s.lights_mapped);
   for (int i = 0; i < 2; ++i) {
     std::swap(media_[i], s.media[i]);
     std::swap(media_state_[i], s.media_state[i]);

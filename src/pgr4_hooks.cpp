@@ -162,18 +162,25 @@ void Pgr4RenderHeightHook(PPCRegister& r) {
 REXCVAR_DEFINE_BOOL(pgr4_split_side_by_side, false, "PGR4",
                     "Two players' split screen side by side (left and right halves), the game's "
                     "own layout behind its hidden VerticalSplitScreen option; off: top and bottom");
+// Local change (26/11/2026, run.log of 00:34:57: the option changed from a side by side race's
+// pause, our renderer let its views' surface go at once while the game drew them side by side to
+// the race's end, 752 resolves): the layout the game made at the race's load (its two views'),
+// kept to its next; what the messages, the HUD and our renderer follow, not the option live.
+std::atomic<bool> g_side_by_side_laid{false};
 void Pgr4SideBySideHook(PPCRegister& r) {
   // The layout's read, logged with the profile's own value (the views' layout is made once a race).
+  const bool side = REXCVAR_GET(pgr4_split_side_by_side);
+  g_side_by_side_laid.store(side, std::memory_order_relaxed);
   static uint32_t logged = 0;
   if (logged < 8) {
     ++logged;
     REXLOG_INFO("PGR4 split screen: the layout's VerticalSplitScreen read {} in the profile, {}",
-                r.u32 & 0xFF, REXCVAR_GET(pgr4_split_side_by_side) ? "side by side forced" : "kept");
+                r.u32 & 0xFF, side ? "side by side forced" : "kept");
   }
-  if (REXCVAR_GET(pgr4_split_side_by_side)) r.u64 = 1;
+  if (side) r.u64 = 1;
 }
 void Pgr4SideBySideTextHook(PPCRegister& r) {
-  if (REXCVAR_GET(pgr4_split_side_by_side)) r.u64 = 1;
+  if (g_side_by_side_laid.load(std::memory_order_relaxed)) r.u64 = 1;
 }
 // ... and the scripts': GetOptionsVars (sub_825E59E8, its lbzx at 0x825E5F24) hands the option to
 // Lua as set (25/11/2026, the test's HUD kept the top and bottom layout: whether the scripts lay
@@ -190,7 +197,9 @@ REXCVAR_DEFINE_BOOL(pgr4_split_side_by_side_no_mirror, true, "PGR4",
                     "Side by side split screen: no rear-view mirrors, as the game's top and bottom "
                     "layout; off: the side by side layout's own mirrors");
 void Pgr4SideBySideMirrorHook(PPCRegister& r1) {
-  if (!REXCVAR_GET(pgr4_split_side_by_side) || !REXCVAR_GET(pgr4_split_side_by_side_no_mirror)) return;
+  if (!g_side_by_side_laid.load(std::memory_order_relaxed) ||
+      !REXCVAR_GET(pgr4_split_side_by_side_no_mirror))
+    return;
   *rex::system::kernel_memory()->TranslateVirtual<uint8_t*>(r1.u32 + 100) = 0;
   static uint32_t logged = 0;
   if (logged < 4) {
@@ -216,7 +225,8 @@ REXCVAR_DEFINE_DOUBLE(pgr4_split_side_by_side_gauge_x, 0.65, "PGR4",
                       "Side by side split screen: the speed and rev gauges' x in their half (the "
                       "game's 0.825 for its wide bands)");
 bool Pgr4SideBySideHud() {
-  return REXCVAR_GET(pgr4_split_side_by_side) && REXCVAR_GET(pgr4_split_side_by_side_hud);
+  return g_side_by_side_laid.load(std::memory_order_relaxed) &&
+         REXCVAR_GET(pgr4_split_side_by_side_hud);
 }
 void Pgr4SideBySideLuaHook(PPCRegister& r) {
   // The scripts see the side by side layout only for its HUD (the views' layout is the engine's,
@@ -268,6 +278,18 @@ void Pgr4SurfaceHeightHook(PPCRegister& r4) {
 
 uint32_t GuestLoad32(uint32_t a) {
   return __builtin_bswap32(*rex::system::kernel_memory()->TranslateVirtual<const uint32_t*>(a));
+}
+
+// Local change (26/11/2026, Tazz: the split screen's changes never in solo): the game lays its
+// views out each frame from NumViewports (sub_824C4B80: lwz r30,2644(r21), r21 = 0x82B5E380), side
+// by side only with two and player 1's VerticalSplitScreen byte set (0x824C535C, which
+// Pgr4SideBySideHook sets with pgr4_split_side_by_side); the players' messages (sub_8261BDA8)
+// and the 3D gauges read it with two views only too. Our renderer's side by side surface follows
+// the same (pgr4-native renderer.cpp SideSceneWanted, pgr4_native_side_by_side_live).
+int32_t Pgr4NumViewports() { return int32_t(GuestLoad32(0x82B5EDD4)); }
+// (26/11/2026) The layout made at the race's load (g_side_by_side_laid), not the option live.
+bool Pgr4SideBySideLaidOut() {
+  return g_side_by_side_laid.load(std::memory_order_relaxed) && Pgr4NumViewports() == 2;
 }
 
 void GuestStore32(uint32_t a, uint32_t v) {

@@ -305,6 +305,7 @@ class NativeRenderer {
   // Development (25/11/2026): the side by side test's resolves (pgr4_split_side_by_side).
   std::string side_resolves_;
   uint32_t side_depth_resolves_ = 0, side_logs_ = 0;
+  uint32_t side_missed_ = 0, side_without_two_ = 0, split_without_two_ = 0;  // development (26/11/2026): the live surface's probe
   // Local diagnostic: the frame's scene resolves (pass, source, rect, destination), logged the
   // first frames SplitScreenUpscaler sees two passes in.
   std::string scene_resolves_;

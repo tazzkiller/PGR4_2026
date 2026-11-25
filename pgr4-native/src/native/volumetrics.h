@@ -58,12 +58,18 @@ void WorldMarker(uint32_t id);
 // (renderer.cpp: the scene passes before it in the frame, with pgr4_native_split_screen_views;
 // always 0 with it off). The render thread's (the draws' A and the resolves). The scene effects
 // made once a frame (the volumetric fog, the ambient occlusion) are made once a view: their
-// "this frame" is this key, their slots of descriptors and uploads one per view and frame in flight.
+// "this frame" is this key, their descriptors and uploads player 2's own.
+// Local change (26/11/2026, Tazz: the split screen's changes only ever in split screen): with one
+// view (the solo) the key is the frame and the slot the frame's in flight, as before; player 2's
+// key has its top bit set, and its descriptors and uploads are on heaps and buffers of its own,
+// made at its first use (Volumetrics::ViewState, SceneCopy and SceneEffects heap_view1_).
 constexpr uint32_t kPgr4MaxViews = 2;
 extern uint32_t g_pgr4_scene_view;
-inline uint64_t Pgr4ViewKey(uint64_t frame) { return frame * kPgr4MaxViews + g_pgr4_scene_view; }
+inline uint64_t Pgr4ViewKey(uint64_t frame) {
+  return frame | (uint64_t(g_pgr4_scene_view) << 63);
+}
 inline uint32_t Pgr4ViewSlot(uint64_t frame, uint32_t frames_in_flight) {
-  return uint32_t(frame % frames_in_flight) * kPgr4MaxViews + g_pgr4_scene_view;
+  return uint32_t(frame % frames_in_flight);
 }
 // ... and the rows each view's scene is drawn on (its depth resolve's, 360 of the scene's 720)
 // while the last frame had two scene passes, with pgr4_native_split_screen_view_rows; 0 otherwise
@@ -257,6 +263,11 @@ class Volumetrics {
   // fog's size (media_columns_) is the view's own: made again when the volume's changed.
   uint32_t media_columns_[2] = {};
   struct ViewState {
+    // (26/11/2026) The view's descriptor heap and lights' upload buffer: player 2's made at its
+    // first volume (EnsureVolume), player 1's (the solo's) those of before.
+    ComPtr<ID3D12DescriptorHeap> heap;
+    ComPtr<ID3D12Resource> lights;
+    uint8_t* lights_mapped = nullptr;
     ComPtr<ID3D12Resource> media[2];
     D3D12_RESOURCE_STATES media_state[2] = {D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS};

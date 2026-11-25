@@ -1080,8 +1080,7 @@ bool SceneEffects::Initialize(ID3D12Device* device) {
 
   D3D12_DESCRIPTOR_HEAP_DESC hd = {};
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-  // Local change (25/11/2026): a slot per view and frame in flight (Pgr4ViewSlot).
-  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight * kPgr4MaxViews;
+  hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight;
   hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (Failed(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_)), "scene effects heap"))
     return false;
@@ -1092,8 +1091,12 @@ bool SceneEffects::Initialize(ID3D12Device* device) {
 
 // Local change (25/11/2026): a resource some frame in flight may still use, freed once the GPU is
 // surely past it (Apply's frame then).
+// (26/11/2026, split screen only: while its views size these targets, and for the frames in flight
+// after its last; in solo released at once, as before.)
 void SceneEffects::Retire(ComPtr<ID3D12Resource>& resource) {
-  if (resource) retired_.emplace_back(retire_frame_, resource);
+  if (resource && (g_pgr4_split_rows || (last_split_frame_ != UINT64_MAX &&
+                                         retire_frame_ <= last_split_frame_ + D3D12Device::kFramesInFlight + 1)))
+    retired_.emplace_back(retire_frame_, resource);
   resource.Reset();
 }
 
@@ -1261,9 +1264,25 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   if (!ready_ || !Enabled() || applied_frame_ == key) return;
   applied_frame_ = key;
   retire_frame_ = frame;
-  std::erase_if(retired_, [&](const auto& x) {
-    return x.first + D3D12Device::kFramesInFlight + 1 <= frame;
-  });
+  if (g_pgr4_split_rows) last_split_frame_ = frame;
+  if (!retired_.empty())
+    std::erase_if(retired_, [&](const auto& x) {
+      return x.first + D3D12Device::kFramesInFlight + 1 <= frame;
+    });
+  // Local change (26/11/2026, split screen only): player 2's view's descriptors on a heap of its
+  // own, made at its first occlusion; one view (the solo) on the heap of before.
+  ID3D12DescriptorHeap* heap = heap_.Get();
+  if (g_pgr4_scene_view == 1) {
+    if (!heap_view1_) {
+      D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+      hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+      hd.NumDescriptors = kViewsPerSlot * D3D12Device::kFramesInFlight;
+      hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+      if (Failed(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap_view1_)), "scene effects heap"))
+        return;
+    }
+    heap = heap_view1_.Get();
+  }
   RenderTarget* color = targets.GetColor(regs, 0, Upscaler::SceneHeight());
   RenderTarget* depth = targets.GetDepth(regs, Upscaler::SceneHeight());
   if (!color || !depth || color->samples != depth->samples || !(color->scale == depth->scale))
@@ -1292,12 +1311,12 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
 
   const uint32_t first = Pgr4ViewSlot(frame, D3D12Device::kFramesInFlight) * kViewsPerSlot;
   auto cpu = [&](uint32_t i) {
-    D3D12_CPU_DESCRIPTOR_HANDLE h = heap_->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
     h.ptr += size_t(first + i) * stride_;
     return h;
   };
   auto gpu = [&](uint32_t i) {
-    D3D12_GPU_DESCRIPTOR_HANDLE h = heap_->GetGPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE h = heap->GetGPUDescriptorHandleForHeapStart();
     h.ptr += uint64_t(first + i) * stride_;
     return h;
   };
@@ -1446,7 +1465,7 @@ void SceneEffects::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets
   Transition(list, half_depth_.Get(), half_depth_state_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   Transition(list, raw_.Get(), raw_state_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   Transition(list, ao_.Get(), ao_state_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  ID3D12DescriptorHeap* heaps[] = {heap_.Get()};
+  ID3D12DescriptorHeap* heaps[] = {heap};
   list->SetDescriptorHeaps(1, heaps);
   list->SetComputeRootSignature(compute_signature_.Get());
   list->SetComputeRoot32BitConstants(1, sizeof(c) / 4, &c, 0);

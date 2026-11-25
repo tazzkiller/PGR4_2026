@@ -247,6 +247,18 @@ REXCVAR_DECLARE(bool, pgr4_split_side_by_side);  // src/pgr4_hooks.cpp (25/11/20
 REXCVAR_DEFINE_BOOL(pgr4_native_side_by_side_views, true, "PGR4 native",
                     "Side by side split screen: the views' surfaces get the scene's render scale, "
                     "MSAA and effects; off: drawn as the game's other surfaces");
+// Local change (26/11/2026, Tazz: the split screen's changes only ever in split screen): that
+// surface (and the scene's tests that follow it: a pass's width 640, a main view's viewport half
+// width over 300) only while the game lays two views out side by side (src/pgr4_hooks.cpp
+// Pgr4SideBySideLaidOut: NumViewports 2 with the option), never in solo with the option chosen.
+// Read at each frame's start (BeginFrameModules), the scene's targets set again when it changes
+// (a race's load).
+REXCVAR_DEFINE_BOOL(pgr4_native_side_by_side_live, true, "PGR4 native",
+                    "Side by side split screen: the views' surface taken as the scene's only "
+                    "while the game lays out two views side by side; off: whenever the option is "
+                    "chosen, in solo too");
+bool Pgr4SideBySideLaidOut();  // src/pgr4_hooks.cpp: two views, the option on
+int32_t Pgr4NumViewports();    // src/pgr4_hooks.cpp: the game's NumViewports (0x82B5EDD4)
 
 // Local change (pgr4 project): the photo mode's screenshots (src/pgr4_menu.cpp): asked from the
 // game's thread, taken at the next frame's begin (NativeRenderer's), done once its frame is copied.
@@ -270,6 +282,18 @@ namespace pgr4::native {
 // Local change (25/11/2026): volumetrics.h (pgr4_native_split_screen_views, _view_rows).
 uint32_t g_pgr4_scene_view = 0;
 uint32_t g_pgr4_split_rows = 0;
+
+namespace {
+// The side by side views' surface the scene's now (pgr4_native_side_by_side_views, _live), or 0.
+// (26/11/2026) With _live, the layout the game made at the race's load (an option changed from its
+// pause applies from the next race, as the game's views do); without, the option alone.
+uint32_t SideSceneWanted() {
+  if (!REXCVAR_GET(pgr4_native_side_by_side_views)) return 0;
+  const bool side = REXCVAR_GET(pgr4_native_side_by_side_live) ? ::Pgr4SideBySideLaidOut()
+                                                                : REXCVAR_GET(pgr4_split_side_by_side);
+  return side ? Upscaler::kSideSceneSurface : 0;
+}
+}  // namespace
 
 bool OriginalLook() { return REXCVAR_GET(pgr4_native_original_look); }
 
@@ -951,12 +975,16 @@ void NativeRenderer::SwitchUpscaler(bool on) {
   // views' surface (Upscaler::kSideSceneSurface) the scene's too while that layout is chosen
   // (pgr4_split_side_by_side): its scale, its samples, our effects. Read here (at the start and
   // at each upscaler or MSAA change).
-  const uint32_t side = REXCVAR_GET(pgr4_split_side_by_side) &&
-                                REXCVAR_GET(pgr4_native_side_by_side_views)
-                            ? Upscaler::kSideSceneSurface
-                            : 0u;
+  // (26/11/2026: only while the game lays out two views side by side, SideSceneWanted.)
+  const uint32_t side = SideSceneWanted();
   if (side != Upscaler::SideSceneSurface())
-    REXLOG_INFO("PGR4 native: the side by side views' surface {}", side ? "taken as the scene's" : "not the scene's");
+    REXLOG_INFO("PGR4 native: the side by side views' surface {} (the game's views {}, the option {}, "
+                "{}, upscaler {})",
+                side ? "taken as the scene's" : "not the scene's", ::Pgr4NumViewports(),
+                REXCVAR_GET(pgr4_split_side_by_side) ? "vertical" : "horizontal",
+                REXCVAR_GET(pgr4_native_side_by_side_live) ? "following the game's layout"
+                                                           : "following the option alone",
+                on ? "on" : "off");
   Upscaler::side_scene_surface.store(side, std::memory_order_relaxed);
   if (on) {
     rt_->OverrideScene(Upscaler::kSceneSurfaceMask, Upscaler::kSceneSurface, 1,
@@ -991,6 +1019,10 @@ void NativeRenderer::BeginFrameModules() {
   }
   if (upscaler_switch_requested_.exchange(false, std::memory_order_relaxed))
     SwitchUpscaler(!upscaler_on_);
+  // Local change (26/11/2026, pgr4_native_side_by_side_live): the side by side views' surface
+  // taken or left as the game's layout changes (a race's load with two players side by side, or
+  // back to one view): the scene's targets set again as an upscaler or MSAA switch does.
+  if (SideSceneWanted() != Upscaler::SideSceneSurface()) SwitchUpscaler(upscaler_on_);
   // Local change (pgr4 project), debug: F1 takes pgr4_native_screenshot_burst frames in a row (each
   // once the previous one is copied), to see what changes from one frame to the next.
   // The burst's frames are raw files (present.cpp), screenshotsurst_<n>.raw.
@@ -1793,6 +1825,11 @@ void NativeRenderer::ExecuteResolve(const ResolveParams& p) {
   // garage first draws and resolves the scene's color alone, then the car's view with its depth
   // into the same image, one view (draw logs of 30/10/2026); split screen resolves a depth per
   // player's view.
+  // Development (26/11/2026, pgr4_native_side_by_side_live's probe): a depth resolve of the side
+  // by side views' surface while it is not taken as the scene's (FAULT, counted at the frame's end).
+  if (g_pgr4_dev && p.source == 4 && !Upscaler::SideSceneSurface() &&
+      (p.regs.surface_info & Upscaler::kSceneSurfaceMask) == Upscaler::kSideSceneSurface)
+    ++side_missed_;
   if (Upscaler::IsScene(p.regs.surface_info) && Upscaler::IsSceneWidth(p.x0, p.x1) &&
       p.source == 4 && std::exchange(scene_drawn_since_resolve_, false)) {
     ++scene_passes_;
@@ -1930,6 +1967,32 @@ void NativeRenderer::SplitScreenUpscaler() {
   }
   side_depth_resolves_ = 0;
   side_resolves_.clear();
+  // Development (26/11/2026): pgr4_native_side_by_side_live's faults over 2 s, by themselves: the
+  // side by side surface resolved while not taken, or taken while the game has not two views
+  // (expected with pgr4_native_side_by_side_live off, the option alone deciding).
+  if (g_pgr4_dev) {
+    if (Upscaler::SideSceneSurface() && ::Pgr4NumViewports() != 2) ++side_without_two_;
+    // ... and a frame taken as split screen's (two scene passes: player 2's view, its own effects)
+    // while the game has not two views: the solo touched (FAULT).
+    if (split && ::Pgr4NumViewports() != 2) ++split_without_two_;
+    static auto side_last = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - side_last >= std::chrono::seconds(2)) {
+      side_last = now;
+      if (split_without_two_)
+        REXLOG_INFO("PGR4 native split screen over 2 s: {} frames with two scene passes and the game's views {} "
+                    "(FAULT: player 2's view without two views)", split_without_two_, ::Pgr4NumViewports());
+      split_without_two_ = 0;
+      if (side_missed_ || side_without_two_)
+        REXLOG_INFO("PGR4 native side by side over 2 s: {} depth resolves of its surface while not "
+                    "taken{}, {} frames with it taken and the game's views {}{}",
+                    side_missed_, side_missed_ ? " (FAULT: side by side surface not taken)" : "",
+                    side_without_two_, ::Pgr4NumViewports(),
+                    side_without_two_ && REXCVAR_GET(pgr4_native_side_by_side_live)
+                        ? " (FAULT: taken without two views)"
+                        : "");
+      side_missed_ = side_without_two_ = 0;
+    }
+  }
   // Local change (25/11/2026): the views of the next frame (pgr4_native_split_screen_views), and
   // the rows of each while both views covered the same from the top (pgr4_native_split_screen_
   // view_rows): the game's split screen, 0,0-1280,360 each (run.log of 18-19/11/2026).
