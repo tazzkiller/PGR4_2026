@@ -224,6 +224,34 @@ class DrawRenderer {
   // At Swap, before EndFrame: the frame skipped draws in a burst of new pipelines (a scene's
   // first frame, before its draws began waiting for them), so it is not worth showing.
   bool FrameIncomplete() const;
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): the light flares drawn into the front
+  // buffer, drawn again into a layer (R16_FLOAT, the front buffer's target size and pixels) for the
+  // frame generation. SetFlareLayer before each draw: the draw is into the front buffer and the
+  // generation runs. FlareLayerToRead: frame `frame`'s layer moved to NON_PIXEL_SHADER_RESOURCE on
+  // `list`, nullptr when the frame drew no flare into it. FlareLayerCounts: the flares seen, drawn
+  // again and missed since the last call.
+  void SetFlareLayer(bool on);
+  ID3D12Resource* FlareLayerToRead(ID3D12GraphicsCommandList* list, uint64_t frame);
+  void FlareLayerCounts(uint64_t& draws, uint64_t& drawn, uint64_t& skipped);
+  // Local change (28/11/2026, pgr4_native_fg_hud_mask): the HUD's coverage for the frame
+  // generation (R8G8B8A8, its alpha; the front buffer's target size and pixels). SetHudLayer before
+  // each draw: the renderer's generation (counted up at each opaque composite into the front
+  // buffer) and whether the draw is the HUD's. HudLayerToRead: frame `frame`'s layer of the latest
+  // generation moved to NON_PIXEL_SHADER_RESOURCE on `list`, nullptr when it drew no HUD into it.
+  // HudLayerCounts: the HUD draws seen, drawn again, missed and added light (not drawn again)
+  // since the last call.
+  void SetHudLayer(uint64_t generation, bool mark);
+  ID3D12Resource* HudLayerToRead(ID3D12GraphicsCommandList* list, uint64_t frame);
+  void HudLayerCounts(uint64_t& draws, uint64_t& drawn, uint64_t& skipped, uint64_t& added);
+  // Local change (28/11/2026, pgr4_native_fg_mirror_mask): the cars' wing mirrors' depth (the main
+  // view's), for the frame generation. SetMirrorLayer before each draw: a generation runs.
+  // MirrorLayerToRead: frame `frame`'s layer (the scene depth target's size and pixels) moved to
+  // NON_PIXEL_SHADER_RESOURCE on `list`, its view format and whether its near is 1; nullptr when
+  // the frame drew no mirror. MirrorLayerCounts: the mirror draws seen, drawn again and missed.
+  void SetMirrorLayer(bool on);
+  ID3D12Resource* MirrorLayerToRead(ID3D12GraphicsCommandList* list, uint64_t frame,
+                                    DXGI_FORMAT* srv_format, bool* reversed);
+  void MirrorLayerCounts(uint64_t& draws, uint64_t& drawn, uint64_t& skipped);
   // Per frame, with the fence values of NativeRenderer (once per Swap, after EndFrame).
   void EndFrame(uint64_t completed_fence);
   // Local change (pgr4 project), any thread: the textures the next whole frame's draws bind (the

@@ -368,7 +368,7 @@ constexpr int kShadowSteps = 5;
 // light, fog; then the apply draw's light, fog, depth.
 // Then the noise's (made once) five, the volume's five and the apply with the volume's three.
 // ... then the grid probe's colour reading (58-62): the scene's colour, -, -, -, the probe's buffer.
-constexpr uint32_t kViewsPerSlot = 63;  // and the ground map's three passes' fifteen
+constexpr uint32_t kViewsPerSlot = 64;  // local change (28/11/2026): 63 the light mask's UAV  // and the ground map's three passes' fifteen
 // The grid probe (pgr4_native_volumetric_probe_grid): its points in the probe's buffer from
 // kGridAt, kGridStride float4 each (kGridAt, kGridStride in the HLSL too).
 constexpr uint32_t kGridX = 16, kGridY = 9, kGridAt = 8, kGridStride = 5;
@@ -969,6 +969,9 @@ Texture3D<float4> volume_tex : register(t1);
 StructuredBuffer<float4> lights : register(t3);  // the VOLUME pass's lamps (LampLight)
 Texture3D<float> noise_tex : register(t4);        // the banks' noise (the beams' texture)
 RWStructuredBuffer<float4> probe : register(u1);  // the probe's pixel's values (lights[10])
+// Local change (28/11/2026, pgr4_native_fg_light_mask): the light this pass adds (the lamps and the
+// sun-lit air), its luminance, for the frame generation (Volumetrics::LightMaskToRead).
+RWTexture2D<float2> light_mask : register(u2);  // x the lamps', y the sun-lit air's
 SamplerState linear_wrap : register(s1);
 // The fog's texture in the lamps' beams (lights[3].z its share, lights[3].w its size in metres):
 // the banks' noise, two octaves, drifting with the wind, 1 on average.
@@ -1063,6 +1066,8 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
   // at the middles of eight parts of equal light (equal steps of atan((t - t0) / k)); times the
   // game's fog extinction at the lamp (no banks: they made it come and go) and the volume's
   // transmittance from the eye to it, the lamps' strength (with c12.y) and colour.
+  float3 light_added = 0.0;  // local change (28/11/2026): the lamps' (and below the sun-lit air's)
+  float3 sun_added = 0.0;
   if (lights[3].x > 0.5) {
     float rl = length(ray);
     float3 wd = float3(dot(ray, east_view), dot(ray, up_view), dot(ray, north_view)) / rl;
@@ -1141,6 +1146,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
       lamp_light += lights[kLampsAt + 1 + 2 * i].rgb * share * ((ub - ua) / k) * lamp_sigma * to_lamp;
     }
     add += lamp_light * lh.z;
+    light_added += lamp_light * lh.z;
   }
   // The sun-lit air (MARCH), on what is drawn only.
   if (sigma > 0.0 && !sky) {
@@ -1159,6 +1165,13 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
       weights += w;
     }
     add = add + strength * light / max(weights, 1e-6) * keep;
+    sun_added += strength * light / max(weights, 1e-6) * keep;
+  }
+  {
+    const float lamps_lum = dot(max(light_added, 0.0), float3(0.2126, 0.7152, 0.0722));
+    const float sun_lum = dot(max(sun_added, 0.0), float3(0.2126, 0.7152, 0.0722));
+    light_mask[uint2(pos.xy)] = float2(isfinite(lamps_lum) ? lamps_lum : 0.0,
+                                       isfinite(sun_lum) ? sun_lum : 0.0);
   }
   // The probe (pgr4_native_volumetric_probe_uv): this pixel's values.
   if ((uint(lights[10].z) & 1u) != 0u && all(int2(pos.xy) == int2(lights[10].xy))) {
@@ -1288,11 +1301,14 @@ bool Volumetrics::Initialize(ID3D12Device* device) {
   {
     // t0-t4: t3 the lamps, t4 the banks' noise (the apply with the volume; null views for the other).
     // ... then u1 the probe's buffer (pgr4_native_volumetric_probe_uv).
-    D3D12_DESCRIPTOR_RANGE apply_ranges[2] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6, 0, 0, 0},
-                                              {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 6}};
+    // Local change (28/11/2026, pgr4_native_fg_light_mask): u2 the light mask, at 63 (17 after the
+    // table's start, 46): its own table would take the signature past 64 dwords (the constants 63).
+    D3D12_DESCRIPTOR_RANGE apply_ranges[3] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 6, 0, 0, 0},
+                                              {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1, 0, 6},
+                                              {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 2, 0, 17}};
     D3D12_ROOT_PARAMETER params[2] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[0].DescriptorTable = {2, apply_ranges};
+    params[0].DescriptorTable = {3, apply_ranges};
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[1].Constants = {0, 0, sizeof(Constants) / 4};
@@ -1624,6 +1640,15 @@ void Volumetrics::SelectView(uint32_t view) {
   SwapViewState(views_[active_view_]);
   SwapViewState(views_[view]);
   active_view_ = view;
+}
+
+ID3D12Resource* Volumetrics::LightMaskToRead(ID3D12GraphicsCommandList* list, uint64_t frame,
+                                             uint32_t* w, uint32_t* h) {
+  if (!light_mask_ || light_mask_frame_ != frame) return nullptr;
+  Transition(list, light_mask_.Get(), light_mask_state_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  *w = light_mask_w_;
+  *h = light_mask_h_;
+  return light_mask_.Get();
 }
 
 ID3D12PipelineState* Volumetrics::ApplyPipeline(DXGI_FORMAT format, uint32_t samples, bool debug) {
@@ -3011,6 +3036,34 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   list->SetGraphicsRootSignature(apply_signature_.Get());
   list->SetPipelineState(pso);
   list->SetGraphicsRootDescriptorTable(0, gpu(46));  // 46-50
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): the light mask at 63 (u2), the scene's
+  // visible size, view 0's (another view's writes go to a null view).
+  {
+    bool mask = view == 0;
+    if (mask && (!light_mask_ || light_mask_w_ != w || light_mask_h_ != h)) {
+      light_mask_old_ = std::move(light_mask_);
+      const D3D12_HEAP_PROPERTIES mheap = {D3D12_HEAP_TYPE_DEFAULT};
+      D3D12_RESOURCE_DESC md = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1,
+                                DXGI_FORMAT_R16G16_FLOAT, {1, 0}};
+      md.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+      if (FAILED(device_->CreateCommittedResource(&mheap, D3D12_HEAP_FLAG_NONE, &md,
+                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                  IID_PPV_ARGS(&light_mask_)))) {
+        light_mask_.Reset();
+        mask = false;
+      } else {
+        light_mask_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        light_mask_w_ = w;
+        light_mask_h_ = h;
+      }
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC mu = {};
+    mu.Format = DXGI_FORMAT_R16G16_FLOAT;
+    mu.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    if (mask) Transition(list, light_mask_.Get(), light_mask_state_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    device_->CreateUnorderedAccessView(mask ? light_mask_.Get() : nullptr, nullptr, &mu, cpu(63));
+    if (mask) light_mask_frame_ = frame;
+  }
   // The fog laid by the shaders this frame (InShader, the volume made): replace 2, the pass lays
   // only the lamps, the sun-lit air and the sky.
   if (c.replace && InShader() && volume_frame_ == key) c.replace = 2;

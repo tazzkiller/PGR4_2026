@@ -99,6 +99,10 @@ class FrameGeneration {
   const ResolvedImage* hudless_source(uint64_t frame) const {
     return copy_frame_ == frame ? copy_ : nullptr;
   }
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): a draw of frame `frame` into the front
+  // buffer's surface (the generation prepared), and the front buffer's resolve (nullptr without).
+  bool FrontDraw(uint64_t frame, const uint32_t* regs) const;
+  const ResolveParams* front() const { return front_ ? &*front_ : nullptr; }
 
   // After frame `frame` was drawn into image() and, with `hudless`, into hudless(), `rect` the
   // scene's part of it: records the generation of the frame before it into `list`. Returns that

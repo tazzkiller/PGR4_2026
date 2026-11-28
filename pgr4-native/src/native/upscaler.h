@@ -143,6 +143,15 @@ class Upscaler {
   void DropOpaque() { opaque_frame_ = UINT64_MAX; }
   // Frame generation's inputs, recorded by each Upscale; nullptr: none.
   void set_frame_generation(FrameGeneration* fg) { frame_generation_ = fg; }
+  // Local change (28/11/2026, pgr4_native_fg_mirror_mask): called in Upscale with the scene's
+  // final depth readable (NON_PIXEL_SHADER_RESOURCE) and its render size; the list's compute state
+  // may change.
+  using SceneDepthHook = void (*)(void* ctx, ID3D12GraphicsCommandList* list,
+                                  const RenderTarget& depth, uint32_t width, uint32_t height);
+  void set_scene_depth_hook(SceneDepthHook hook, void* ctx) {
+    scene_depth_hook_ = hook;
+    scene_depth_ctx_ = ctx;
+  }
   // The scene's camera, the renderer's, read at each Upscale.
   void set_camera(const FfxCamera* camera) { camera_ = camera; }
   // Local change (pgr4 project): frame `frame`'s world-to-clip transform, the four rows of c4-c7
@@ -190,6 +199,8 @@ class Upscaler {
   ID3D12Device* device_ = nullptr;
   const FfxApi* api_ = nullptr;
   FrameGeneration* frame_generation_ = nullptr;
+  SceneDepthHook scene_depth_hook_ = nullptr;  // local change (pgr4_native_fg_mirror_mask)
+  void* scene_depth_ctx_ = nullptr;
   const FfxCamera* camera_ = nullptr;  // the renderer's
   void* context_ = nullptr;            // ffxContext
   // The upscaled color (an R16G16B16A16_FLOAT UAV: the scene's host format), in the fields the

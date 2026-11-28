@@ -54,12 +54,14 @@ class DrawRenderer;
 class FrameGeneration;
 class FgProbe;  // development (28/11/2026)
 class HudlessCapture;
+class LightMaskPass;  // local change (28/11/2026)
 class Overlay;
 class FramePacer;
 class GpuTimer;
 class OcclusionQueries;
 class Presenter;
 class RenderTargets;
+struct RenderTarget;  // local change (28/11/2026)
 class Resolver;
 class TextureCache;
 class Upscaler;
@@ -347,6 +349,21 @@ class NativeRenderer {
   std::unique_ptr<Overlay> overlay_;  // local change
   std::unique_ptr<FrameGeneration> frame_generation_;  // --pgr4_native_frame_generation, paced
   std::unique_ptr<FgProbe> fg_probe_;  // development (28/11/2026): fg_probe.h, made on first use
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): light_mask_pass.h, made on first use;
+  // the frames it ran on, by way (FSR, DLSS-G), for the probe (development).
+  std::unique_ptr<LightMaskPass> light_mask_;
+  bool light_mask_failed_ = false;
+  uint64_t light_mask_fsr_ = 0, light_mask_dlssg_ = 0, light_mask_none_ = 0, light_mask_flares_ = 0;
+  // Local change (28/11/2026, pgr4_native_fg_hud_mask): the HUD layer's generation (counted up at
+  // each opaque composite into the front buffer), the frame's composites and the last frame's.
+  uint64_t hud_generation_ = 0, hud_frame_ = UINT64_MAX, light_mask_hud_ = 0;
+  // Local change (28/11/2026, pgr4_native_fg_mirror_mask): the wing mirrors' compare, at the
+  // upscaler's scene depth (Upscaler::set_scene_depth_hook).
+  static void SceneDepthHook(void* ctx, ID3D12GraphicsCommandList* list, const RenderTarget& depth,
+                             uint32_t width, uint32_t height);
+  bool EnsureLightMask();
+  uint64_t light_mask_mirrors_ = 0;
+  uint32_t hud_composites_ = 0, hud_composites_last_ = 0;
   // The scene's camera for the FidelityFX effects, found each frame by FindCamera (the defaults
   // until one matches); the upscaler reads it through the pointer set_camera gave it.
   FfxCamera camera_;

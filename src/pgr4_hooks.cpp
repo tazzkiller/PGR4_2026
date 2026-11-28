@@ -3669,6 +3669,73 @@ REX_HOOK_RAW(sub_82438418) {
   __imp__sub_82438418(ctx, base);
 }
 
+// --- Cars' shadow fading with their distance (local change, 28/11/2026, Tazz: « qu'elle devienne
+// moins intense plus l'adversaire est loin »). The game sets each car's shadow constants in
+// sub_82419DB8 (r3 the car, called by the shadow pass sub_82438418 for each car): c161.w, which the
+// five shadow shaders (psCarShadow0, 1, 3, 4, 5) multiply the whole shadow by, is car+0x31ec when
+// car+0x321d is set (the game's ghost cars: Vehicle.Render.Ghost.WrongWayAlphaScale 0.5,
+// BikeCrashAlphaScale 0.75), 1 otherwise; nothing else in it or the functions it calls reads them.
+// Around the call, that strength times a factor of the car's distance from the eye (the pose's
+// position, car + 736 + 48, against the road draws' eye g_pgr4_camera_eye): 1 up to _start, then
+// down to _min at _end; both put back after. Read at each car.
+REXCVAR_DEFINE_BOOL(pgr4_car_shadow_distance_fade, true, "PGR4",
+                    "The cars' shadow fainter the further the car is from the camera (off: the "
+                    "game's)");
+REXCVAR_DEFINE_DOUBLE(pgr4_car_shadow_fade_start, 10.0, "PGR4",
+                      "The distance (metres) from which the cars' shadow fades");
+REXCVAR_DEFINE_DOUBLE(pgr4_car_shadow_fade_end, 60.0, "PGR4",
+                      "The distance (metres) at which the cars' shadow is at its faintest");
+REXCVAR_DEFINE_DOUBLE(pgr4_car_shadow_fade_min, 0.3, "PGR4",
+                      "The cars' shadow's strength at its faintest (1: the game's)");
+extern std::atomic<bool> g_pgr4_dev;  // pgr4-native draw.cpp: development only
+REX_EXTERN(__imp__sub_82419DB8);
+REX_HOOK_RAW(sub_82419DB8) {
+  const uint32_t car = ctx.r3.u32;
+  const bool eye_known = g_pgr4_camera_eye[0] != 0.0f || g_pgr4_camera_eye[1] != 0.0f ||
+                         g_pgr4_camera_eye[2] != 0.0f;
+  if (!REXCVAR_GET(pgr4_car_shadow_distance_fade) || !car || !eye_known) {
+    __imp__sub_82419DB8(ctx, base);
+    return;
+  }
+  float d2 = 0.0f;
+  for (int k = 0; k < 3; ++k) {
+    const float e = BeF(base + car + 736 + 48 + 4 * k) - g_pgr4_camera_eye[k];
+    d2 += e * e;
+  }
+  const float dist = std::sqrt(d2);
+  const float start = float(std::max(REXCVAR_GET(pgr4_car_shadow_fade_start), 0.0));
+  const float end = std::max(float(REXCVAR_GET(pgr4_car_shadow_fade_end)), start + 0.1f);
+  const float least = float(std::clamp(REXCVAR_GET(pgr4_car_shadow_fade_min), 0.0, 1.0));
+  const float along = std::clamp((dist - start) / (end - start), 0.0f, 1.0f);
+  const float fade = std::isfinite(along) ? 1.0f + (least - 1.0f) * along : 1.0f;
+  const uint8_t ghost = base[car + 0x321d];
+  const float ghost_alpha = BeF(base + car + 0x31ec);
+  base[car + 0x321d] = 1;
+  PutBeF(base + car + 0x31ec, (ghost ? ghost_alpha : 1.0f) * fade);
+  __imp__sub_82419DB8(ctx, base);
+  base[car + 0x321d] = ghost;
+  PutBeF(base + car + 0x31ec, ghost_alpha);
+  // Development: each car's distance and strength, every 2 s.
+  if (g_pgr4_dev.load(std::memory_order_relaxed)) {
+    static std::string text;
+    static auto last = std::chrono::steady_clock::now();
+    static uint64_t frame = UINT64_MAX;
+    if (frame != g_frame_no && text.size() < 1500) {
+      if (!text.empty() && text.back() != '|') text += " |";
+      frame = g_frame_no;
+    }
+    if (text.size() < 1500)
+      text += fmt::format(" {:08X} {:.1f} m x{:.2f}{}", car, dist, fade,
+                          ghost ? fmt::format(" (ghost {:.2f})", ghost_alpha) : std::string());
+    if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(2)) {
+      last = now;
+      REXLOG_INFO("PGR4 car shadow distance fade ({:.0f}-{:.0f} m, x{:.2f} at least):{}", start,
+                  end, least, text);
+      text.clear();
+    }
+  }
+}
+
 // Local change (pgr4 project): the draw distance tests, back from docs/essais_distance_affichage for the
 // overlay's tab (06/11/2026), all at the game's values by default.
 extern std::atomic<int32_t> g_pgr4_world_max_lod;

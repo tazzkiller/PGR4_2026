@@ -2708,6 +2708,58 @@ struct DrawRenderer::Impl {
   // it is ready.
   ID3D12PipelineState* CoveragePipeline(const PipelineKey& key, const DxbcShader::Translation& vs,
                                         const DxbcShader::Translation* ps);
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): the light flares (psLightFlare: the
+  // street lamps' and the vehicles' headlights) drawn into the front buffer, drawn again into a
+  // layer of the front buffer's target size (R16_FLOAT, their red added), for the frame
+  // generation to take the frame's own image there (light_mask_pass.h). Their pipeline made at
+  // once (a few pipelines; the background queue holds tens of thousands after a new build).
+  struct EncodePacket;
+  void FlareLayerDraw(EncodePacket& pk, const PipelineKey& key, const DxbcShader::Translation& vs,
+                      const DxbcShader::Translation* ps, const RenderTarget* target,
+                      ID3D12GraphicsCommandList* list, uint64_t frame);
+  bool flare_mark = false;            // the renderer's mark for the next draw (the front buffer's)
+  uint64_t flare_frame = UINT64_MAX;  // the frame the layer holds
+  ComPtr<ID3D12Resource> flare_layer, flare_layer_old[2];
+  ComPtr<ID3D12DescriptorHeap> flare_rtv_heap;
+  D3D12_RESOURCE_STATES flare_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  uint32_t flare_width = 0, flare_height = 0;
+  uint64_t flare_draws = 0, flare_drawn = 0, flare_skipped = 0;  // the probe's counts
+  // Local change (28/11/2026, pgr4_native_fg_hud_mask): the HUD's coverage. The draws the renderer
+  // marks (SetHudLayer: blended into the front buffer after the frame's last opaque composite, the
+  // tone map) drawn again into a layer of the front buffer's target size (R8G8B8A8), their alpha
+  // only, as the source over: A' = a + A (1 - a). Cleared at the first marked draw of each
+  // generation (the renderer's, counted up at each opaque composite). Their pipelines made at once
+  // (the draw queue, not the background one; a draw before its pipeline is ready is missed).
+  void HudLayerDraw(EncodePacket& pk, const PipelineKey& key, const DxbcShader::Translation& vs,
+                    const DxbcShader::Translation* ps, const RenderTarget* target,
+                    ID3D12GraphicsCommandList* list, uint64_t frame);
+  uint64_t hud_generation = 0;          // the renderer's latest generation
+  bool hud_mark = false;                // the next draw is the HUD's
+  uint64_t hud_cleared_generation = 0;  // the generation the layer holds
+  uint64_t hud_frame = UINT64_MAX;      // the frame the layer holds
+  ComPtr<ID3D12Resource> hud_layer, hud_layer_old[2];
+  ComPtr<ID3D12DescriptorHeap> hud_rtv_heap;
+  D3D12_RESOURCE_STATES hud_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+  uint32_t hud_width = 0, hud_height = 0;
+  uint64_t hud_draws = 0, hud_drawn = 0, hud_skipped = 0, hud_added = 0;  // the probe's counts
+  // Local change (28/11/2026, pgr4_native_fg_mirror_mask): the cars' wing mirrors (psCarMirror*),
+  // their glass showing the reflection while their motion is the car's. Each mirror draw of the
+  // main view drawn again into a depth image of the scene's depth target (its format and size,
+  // its depth only, the draw's own depth test), cleared at the frame's first; the upscaler's
+  // scene depth compared with it later (light_mask_pass.h MirrorCompare): a mirror pixel still
+  // visible at the end of the scene. Their pipelines made at once (the draw queue).
+  void MirrorLayerDraw(EncodePacket& pk, const PipelineKey& key, const DxbcShader::Translation& vs,
+                       const DxbcShader::Translation* ps, const RenderTarget* depth,
+                       ID3D12GraphicsCommandList* list, uint64_t frame);
+  bool mirror_mark = false;            // the renderer's mark (a frame generation runs)
+  uint64_t mirror_frame = UINT64_MAX;  // the frame the layer holds
+  ComPtr<ID3D12Resource> mirror_layer, mirror_layer_old[2];
+  ComPtr<ID3D12DescriptorHeap> mirror_dsv_heap;
+  D3D12_RESOURCE_STATES mirror_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+  DXGI_FORMAT mirror_dsv_format = DXGI_FORMAT_UNKNOWN, mirror_srv_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t mirror_width = 0, mirror_height = 0;
+  bool mirror_reversed = false;  // the depth test's near is 1 (GREATER, GREATER_EQUAL)
+  uint64_t mirror_draws = 0, mirror_drawn = 0, mirror_skipped = 0;  // the probe's counts
   // Moves a pipeline's prewarm job, if no worker has taken it yet, to the draw queue: a draw
   // waits for it now.
   void PromotePipeline(Pipeline* p);
@@ -2923,6 +2975,18 @@ struct DrawRenderer::Impl {
     bool draw_indexed = true;
     uint32_t draw_count = 0, first_index = 0;
     ID3D12PipelineState* cover = nullptr;  // the occlusion coverage pipeline (A: `pipelines`)
+    // Local change (28/11/2026, pgr4_native_fg_light_mask): a light flare drawn again into the flare
+    // layer (FlareLayerDraw), with this pipeline and target; none when null.
+    ID3D12PipelineState* flare_pso = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE flare_rtv{};
+    // Local change (28/11/2026, pgr4_native_fg_hud_mask): a HUD draw's coverage drawn again into
+    // the HUD layer (HudLayerDraw), with this pipeline and target; none when null.
+    ID3D12PipelineState* hud_pso = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE hud_rtv{};
+    // Local change (28/11/2026, pgr4_native_fg_mirror_mask): a wing mirror drawn again into the
+    // mirror layer (MirrorLayerDraw), with this pipeline and depth view; none when null.
+    ID3D12PipelineState* mirror_pso = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE mirror_dsv{};
     bool no_depth = false, shaders_selected = false;
     float guest_per_host = 1.0f;
     uint32_t snap_now = 0, draw_index = 0;  // the targets' snapshot (in line only)
@@ -6584,6 +6648,314 @@ void DrawRenderer::Impl::LogDraw(const DrawState& s, const RegisterFile& regs, u
   };
   log_floats("vc", vs, XE_GPU_REG_SHADER_CONSTANT_000_X);
   if (ps) log_floats("pc", *ps, XE_GPU_REG_SHADER_CONSTANT_256_X);
+}
+
+void DrawRenderer::Impl::FlareLayerDraw(EncodePacket& pk, const PipelineKey& key,
+                                        const DxbcShader::Translation& vs,
+                                        const DxbcShader::Translation* ps,
+                                        const RenderTarget* target,
+                                        ID3D12GraphicsCommandList* list, uint64_t frame) {
+  ++flare_draws;
+  if (!target || !target->resource || target->samples != 1 || key.num_rts == 0 ||
+      !key.rt[0].mask || pk.motion || !pk.shaders_selected) {
+    ++flare_skipped;
+    return;
+  }
+  const D3D12_RESOURCE_DESC td = target->resource->GetDesc();
+  const uint32_t w = uint32_t(td.Width), h = td.Height;
+  if (!flare_layer || flare_width != w || flare_height != h) {
+    if (!flare_rtv_heap) {
+      const D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                             D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+      if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&flare_rtv_heap)))) return;
+    }
+    flare_layer_old[1] = std::move(flare_layer_old[0]);
+    flare_layer_old[0] = std::move(flare_layer);
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1,
+                              DXGI_FORMAT_R16_FLOAT, {1, 0}};
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const D3D12_CLEAR_VALUE cv = {DXGI_FORMAT_R16_FLOAT, {0.0f, 0.0f, 0.0f, 0.0f}};
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
+                                               D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                                               IID_PPV_ARGS(&flare_layer)))) {
+      flare_layer.Reset();
+      return;
+    }
+    device->CreateRenderTargetView(flare_layer.Get(), nullptr,
+                                   flare_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+    flare_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    flare_width = w;
+    flare_height = h;
+    flare_frame = UINT64_MAX;
+  }
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = flare_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  // Cleared at the frame's first flare.
+  if (flare_frame != frame) {
+    if (flare_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+      const D3D12_RESOURCE_BARRIER b =
+          TransitionBarrier(flare_layer.Get(), flare_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      list->ResourceBarrier(1, &b);
+      flare_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    const float zero[4] = {};
+    list->ClearRenderTargetView(rtv, zero, 0, nullptr);
+    flare_frame = frame;
+  }
+  // The flare's pipeline with that target: its red added, no depth.
+  PipelineKey c = key;
+  c.num_rts = 1;
+  c.rtv[0] = DXGI_FORMAT_R16_FLOAT;
+  for (int i = 1; i < 4; ++i) c.rtv[i] = DXGI_FORMAT_UNKNOWN;
+  c.dsv = DXGI_FORMAT_UNKNOWN;
+  c.depth_enable = c.depth_write = 0;
+  c.depth_func = D3D12_COMPARISON_FUNC_ALWAYS;
+  c.stencil_enable = 0;
+  c.stencil_read_mask = c.stencil_write_mask = 0;
+  std::memset(c.front, 0, sizeof(c.front));
+  std::memset(c.back, 0, sizeof(c.back));
+  for (PipelineKey::Rt& rt : c.rt) rt = PipelineKey::Rt{};
+  PipelineKey::Rt& rt = c.rt[0];
+  rt.blend = 1;
+  rt.src = rt.dst = rt.src_a = rt.dst_a = uint8_t(BlendFactor::kOne);
+  rt.op = rt.op_a = 0;
+  rt.mask = 0x1;  // red only
+  const uint64_t hash = XXH3_64bits(&c, sizeof(c));
+  Pipeline* const p = GetPipeline(hash, c, vs, ps, 0, /*background=*/false);
+  ID3D12PipelineState* const pso =
+      p->state.load(std::memory_order_acquire) == kReady ? p->pso.Get() : nullptr;
+  if (!pso) {
+    ++flare_skipped;
+    return;
+  }
+  pk.flare_pso = pso;
+  pk.flare_rtv = rtv;
+  ++flare_drawn;
+}
+
+// The cars' mirror shaders (shader_names.tsv: psCarMirror0 to psCarMirror7).
+static bool IsCarMirrorShader(uint64_t hash) {
+  switch (hash) {
+    case 0xA36DEF5A620BACF6ull:  // psCarMirror0
+    case 0x3B54D3464916C8DDull:  // psCarMirror1
+    case 0x06D2F21939B6EE06ull:  // psCarMirror2
+    case 0x698DCEC6898CF362ull:  // psCarMirror3
+    case 0xDE108A45B02E2681ull:  // psCarMirror4
+    case 0x4C198F3B6905BE27ull:  // psCarMirror4
+    case 0x75D052A9280A4C43ull:  // psCarMirror4
+    case 0x43752577A61D9299ull:  // psCarMirror5
+    case 0x437DF0A9826AFA73ull:  // psCarMirror5
+    case 0x75843244721CBC86ull:  // psCarMirror6
+    case 0xBB5E7B8D38D333E1ull:  // psCarMirror6
+    case 0xD3256E47287C2BE1ull:  // psCarMirror6
+    case 0x73D35C42EAD13B5Bull:  // psCarMirror7
+    case 0xAF6682F06DAB5C36ull:  // psCarMirror7
+      return true;
+    default:
+      return false;
+  }
+}
+
+void DrawRenderer::Impl::MirrorLayerDraw(EncodePacket& pk, const PipelineKey& key,
+                                         const DxbcShader::Translation& vs,
+                                         const DxbcShader::Translation* ps,
+                                         const RenderTarget* depth,
+                                         ID3D12GraphicsCommandList* list, uint64_t frame) {
+  ++mirror_draws;
+  DXGI_FORMAT resource_format, srv_format;
+  switch (key.dsv) {
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      resource_format = DXGI_FORMAT_R32G8X24_TYPELESS;
+      srv_format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+      break;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      resource_format = DXGI_FORMAT_R24G8_TYPELESS;
+      srv_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+      break;
+    case DXGI_FORMAT_D32_FLOAT:
+      resource_format = DXGI_FORMAT_R32_TYPELESS;
+      srv_format = DXGI_FORMAT_R32_FLOAT;
+      break;
+    default:
+      ++mirror_skipped;
+      return;
+  }
+  if (!depth || !depth->resource || depth->samples != 1 || key.samples > 1 || !key.depth_enable ||
+      !pk.shaders_selected) {
+    ++mirror_skipped;
+    return;
+  }
+  const D3D12_RESOURCE_DESC td = depth->resource->GetDesc();
+  const uint32_t w = uint32_t(td.Width), h = td.Height;
+  if (!mirror_layer || mirror_width != w || mirror_height != h || mirror_dsv_format != key.dsv) {
+    if (!mirror_dsv_heap) {
+      const D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1,
+                                             D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+      if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&mirror_dsv_heap)))) return;
+    }
+    mirror_layer_old[1] = std::move(mirror_layer_old[0]);
+    mirror_layer_old[0] = std::move(mirror_layer);
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1,
+                              resource_format, {1, 0}};
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE cv = {};
+    cv.Format = key.dsv;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
+                                               D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
+                                               IID_PPV_ARGS(&mirror_layer)))) {
+      mirror_layer.Reset();
+      return;
+    }
+    D3D12_DEPTH_STENCIL_VIEW_DESC dd = {};
+    dd.Format = key.dsv;
+    dd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    device->CreateDepthStencilView(mirror_layer.Get(), &dd,
+                                   mirror_dsv_heap->GetCPUDescriptorHandleForHeapStart());
+    mirror_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    mirror_dsv_format = key.dsv;
+    mirror_srv_format = srv_format;
+    mirror_width = w;
+    mirror_height = h;
+    mirror_frame = UINT64_MAX;
+  }
+  const D3D12_CPU_DESCRIPTOR_HANDLE dsv = mirror_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+  // Cleared at the frame's first mirror, to its far depth (the draw's test: near is 1 for
+  // GREATER and GREATER_EQUAL).
+  if (mirror_frame != frame) {
+    if (mirror_state != D3D12_RESOURCE_STATE_DEPTH_WRITE) {
+      const D3D12_RESOURCE_BARRIER b =
+          TransitionBarrier(mirror_layer.Get(), mirror_state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+      list->ResourceBarrier(1, &b);
+      mirror_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    }
+    mirror_reversed = key.depth_func == D3D12_COMPARISON_FUNC_GREATER ||
+                      key.depth_func == D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, mirror_reversed ? 0.0f : 1.0f, 0, 0,
+                                nullptr);
+    mirror_frame = frame;
+  }
+  // The draw's pipeline with that depth view alone: its depth test and bias, its depth written,
+  // no colour, no stencil (its pixel shader kept: its own discards and depth).
+  PipelineKey c = key;
+  c.num_rts = 0;
+  for (int i = 0; i < 4; ++i) c.rtv[i] = DXGI_FORMAT_UNKNOWN;
+  for (PipelineKey::Rt& rt : c.rt) rt = PipelineKey::Rt{};
+  c.depth_enable = 1;
+  c.depth_write = 1;
+  c.stencil_enable = 0;
+  c.stencil_read_mask = c.stencil_write_mask = 0;
+  std::memset(c.front, 0, sizeof(c.front));
+  std::memset(c.back, 0, sizeof(c.back));
+  const uint64_t hash = XXH3_64bits(&c, sizeof(c));
+  Pipeline* const p = GetPipeline(hash, c, vs, ps, 0, /*background=*/false);
+  ID3D12PipelineState* const pso =
+      p->state.load(std::memory_order_acquire) == kReady ? p->pso.Get() : nullptr;
+  if (!pso) {  // compiling: this frame's layer misses the draw
+    ++mirror_skipped;
+    return;
+  }
+  pk.mirror_pso = pso;
+  pk.mirror_dsv = dsv;
+  ++mirror_drawn;
+}
+
+void DrawRenderer::Impl::HudLayerDraw(EncodePacket& pk, const PipelineKey& key,
+                                      const DxbcShader::Translation& vs,
+                                      const DxbcShader::Translation* ps, const RenderTarget* target,
+                                      ID3D12GraphicsCommandList* list, uint64_t frame) {
+  ++hud_draws;
+  if (!target || !target->resource || target->samples != 1) {
+    ++hud_skipped;
+    return;
+  }
+  const D3D12_RESOURCE_DESC td = target->resource->GetDesc();
+  const uint32_t w = uint32_t(td.Width), h = td.Height;
+  if (!hud_layer || hud_width != w || hud_height != h) {
+    if (!hud_rtv_heap) {
+      const D3D12_DESCRIPTOR_HEAP_DESC hd = {D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                             D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+      if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&hud_rtv_heap)))) return;
+    }
+    hud_layer_old[1] = std::move(hud_layer_old[0]);
+    hud_layer_old[0] = std::move(hud_layer);
+    const D3D12_HEAP_PROPERTIES heap = {D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd = {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, w, h, 1, 1,
+                              DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const D3D12_CLEAR_VALUE cv = {DXGI_FORMAT_R8G8B8A8_UNORM, {0.0f, 0.0f, 0.0f, 0.0f}};
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
+                                               D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                                               IID_PPV_ARGS(&hud_layer)))) {
+      hud_layer.Reset();
+      return;
+    }
+    device->CreateRenderTargetView(hud_layer.Get(), nullptr,
+                                   hud_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+    hud_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    hud_width = w;
+    hud_height = h;
+    hud_frame = UINT64_MAX;
+    hud_cleared_generation = 0;
+  }
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = hud_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  // Cleared at the generation's first HUD draw (a later opaque composite starts it over).
+  if (hud_cleared_generation != hud_generation || hud_frame != frame) {
+    if (hud_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+      const D3D12_RESOURCE_BARRIER b =
+          TransitionBarrier(hud_layer.Get(), hud_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+      list->ResourceBarrier(1, &b);
+      hud_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    const float zero[4] = {};
+    list->ClearRenderTargetView(rtv, zero, 0, nullptr);
+    hud_cleared_generation = hud_generation;
+    hud_frame = frame;
+  }
+  if (key.num_rts == 0 || !key.rt[0].mask) return;  // nothing drawn
+  // Added light (destination factor one): nothing under it replaced, not drawn again.
+  const PipelineKey::Rt& g = key.rt[0];
+  if (g.blend && BlendFactor(g.dst) == BlendFactor::kOne) {
+    ++hud_added;
+    return;
+  }
+  if (pk.motion || !pk.shaders_selected) {
+    ++hud_skipped;
+    return;
+  }
+  // The draw's pipeline with that target: its alpha as the source over, no depth.
+  PipelineKey c = key;
+  c.num_rts = 1;
+  c.rtv[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+  for (int i = 1; i < 4; ++i) c.rtv[i] = DXGI_FORMAT_UNKNOWN;
+  c.dsv = DXGI_FORMAT_UNKNOWN;
+  c.depth_enable = c.depth_write = 0;
+  c.depth_func = D3D12_COMPARISON_FUNC_ALWAYS;
+  c.stencil_enable = 0;
+  c.stencil_read_mask = c.stencil_write_mask = 0;
+  std::memset(c.front, 0, sizeof(c.front));
+  std::memset(c.back, 0, sizeof(c.back));
+  for (PipelineKey::Rt& rt : c.rt) rt = PipelineKey::Rt{};
+  PipelineKey::Rt& rt = c.rt[0];
+  rt.blend = 1;
+  rt.src = uint8_t(BlendFactor::kZero);
+  rt.dst = uint8_t(BlendFactor::kOne);
+  rt.op = 0;
+  rt.src_a = uint8_t(BlendFactor::kOne);
+  rt.dst_a = uint8_t(BlendFactor::kInvSrcAlpha);
+  rt.op_a = 0;
+  rt.mask = 0x8;  // alpha only
+  const uint64_t hash = XXH3_64bits(&c, sizeof(c));
+  Pipeline* const p = GetPipeline(hash, c, vs, ps, 0, /*background=*/false);
+  ID3D12PipelineState* const pso =
+      p->state.load(std::memory_order_acquire) == kReady ? p->pso.Get() : nullptr;
+  if (!pso) {  // compiling: this frame's layer misses the draw
+    ++hud_skipped;
+    return;
+  }
+  pk.hud_pso = pso;
+  pk.hud_rtv = rtv;
+  ++hud_drawn;
 }
 
 ID3D12PipelineState* DrawRenderer::Impl::CoveragePipeline(const PipelineKey& key,
@@ -10276,6 +10648,15 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
   pk.no_depth = key.dsv == DXGI_FORMAT_UNKNOWN;
   pk.shaders_selected = vs == vs_selected && ps == ps_selected;
   pk.cover = nullptr;
+  pk.flare_pso = nullptr;
+  if (flare_mark && ps_generic && ps_generic->ucode_data_hash() == 0xAB2BD72DF7FE8E7Aull)
+    FlareLayerDraw(pk, key, *vst, pst, targets.color[0], list, r.frame_index());
+  pk.hud_pso = nullptr;
+  if (hud_mark) HudLayerDraw(pk, key, *vst, pst, targets.color[0], list, r.frame_index());
+  pk.mirror_pso = nullptr;
+  if (mirror_mark && g_pgr4_scene_view == 0 && ps_generic &&
+      IsCarMirrorShader(ps_generic->ucode_data_hash()))
+    MirrorLayerDraw(pk, key, *vst, pst, targets.depth, list, r.frame_index());
   if (OcclusionQueries* const occlusion = r.occlusion();
       occlusion && occlusion->counting() && !pk.no_depth && pk.shaders_selected)
     pk.cover = CoveragePipeline(key, *vst, pst);
@@ -10474,6 +10855,44 @@ void DrawRenderer::Impl::Encode(EncodePacket& p, const uint32_t* raw,
     }
     occlusion->EndCoverage(list, pair, coverage, p.guest_per_host);
     if (draw_log) std::fprintf(draw_log, "  occ pair=%u cov=%u\n", pair, uint32_t(coverage));
+  }
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): the flare into the flare layer, then the
+  // draw's own pipeline and targets back.
+  if (p.flare_pso) {
+    list->SetPipelineState(p.flare_pso);
+    list->OMSetRenderTargets(1, &p.flare_rtv, FALSE, nullptr);
+    if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
+    issue();
+    list->SetPipelineState(p.pso);
+    bound_pso = p.pso;
+    if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
+    list->OMSetRenderTargets(p.rt_count, p.rt_count ? p.rtv : nullptr, FALSE,
+                             p.dsv.ptr ? &p.dsv : nullptr);
+  }
+  // Local change (28/11/2026, pgr4_native_fg_hud_mask): the HUD draw's coverage into the HUD
+  // layer, then the draw's own pipeline and targets back.
+  if (p.hud_pso) {
+    list->SetPipelineState(p.hud_pso);
+    list->OMSetRenderTargets(1, &p.hud_rtv, FALSE, nullptr);
+    if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
+    issue();
+    list->SetPipelineState(p.pso);
+    bound_pso = p.pso;
+    if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
+    list->OMSetRenderTargets(p.rt_count, p.rt_count ? p.rtv : nullptr, FALSE,
+                             p.dsv.ptr ? &p.dsv : nullptr);
+  }
+  // Local change (28/11/2026, pgr4_native_fg_mirror_mask): the wing mirror's depth into the mirror
+  // layer, then the draw's own pipeline and targets back.
+  if (p.mirror_pso) {
+    list->SetPipelineState(p.mirror_pso);
+    list->OMSetRenderTargets(0, nullptr, FALSE, &p.mirror_dsv);
+    issue();
+    list->SetPipelineState(p.pso);
+    bound_pso = p.pso;
+    if (dynamic_depth_bias) bound_depth_bias = bound_slope_bias = 0.0f;
+    list->OMSetRenderTargets(p.rt_count, p.rt_count ? p.rtv : nullptr, FALSE,
+                             p.dsv.ptr ? &p.dsv : nullptr);
   }
   ++st.draws;
   ++diag_draws;
@@ -11035,6 +11454,81 @@ void DrawRenderer::LogResolve(const ResolveParams& p) {
 bool DrawRenderer::FrameIncomplete() const {
   const Impl& m = *impl_;
   return m.HoldsFrame();
+}
+
+// Local change (28/11/2026, pgr4_native_fg_light_mask, Impl::FlareLayerDraw).
+void DrawRenderer::SetFlareLayer(bool on) { impl_->flare_mark = on; }
+
+ID3D12Resource* DrawRenderer::FlareLayerToRead(ID3D12GraphicsCommandList* list, uint64_t frame) {
+  Impl& m = *impl_;
+  if (!m.flare_layer || m.flare_frame != frame) return nullptr;
+  if (m.flare_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+    const D3D12_RESOURCE_BARRIER b = TransitionBarrier(
+        m.flare_layer.Get(), m.flare_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(1, &b);
+    m.flare_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  }
+  return m.flare_layer.Get();
+}
+
+// Local change (28/11/2026, pgr4_native_fg_mirror_mask, Impl::MirrorLayerDraw).
+void DrawRenderer::SetMirrorLayer(bool on) { impl_->mirror_mark = on; }
+
+ID3D12Resource* DrawRenderer::MirrorLayerToRead(ID3D12GraphicsCommandList* list, uint64_t frame,
+                                                DXGI_FORMAT* srv_format, bool* reversed) {
+  Impl& m = *impl_;
+  if (!m.mirror_layer || m.mirror_frame != frame) return nullptr;
+  if (m.mirror_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+    const D3D12_RESOURCE_BARRIER b = TransitionBarrier(
+        m.mirror_layer.Get(), m.mirror_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(1, &b);
+    m.mirror_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  }
+  *srv_format = m.mirror_srv_format;
+  *reversed = m.mirror_reversed;
+  return m.mirror_layer.Get();
+}
+
+void DrawRenderer::MirrorLayerCounts(uint64_t& draws, uint64_t& drawn, uint64_t& skipped) {
+  Impl& m = *impl_;
+  draws = std::exchange(m.mirror_draws, 0);
+  drawn = std::exchange(m.mirror_drawn, 0);
+  skipped = std::exchange(m.mirror_skipped, 0);
+}
+
+// Local change (28/11/2026, pgr4_native_fg_hud_mask, Impl::HudLayerDraw).
+void DrawRenderer::SetHudLayer(uint64_t generation, bool mark) {
+  impl_->hud_generation = generation;
+  impl_->hud_mark = mark;
+}
+
+ID3D12Resource* DrawRenderer::HudLayerToRead(ID3D12GraphicsCommandList* list, uint64_t frame) {
+  Impl& m = *impl_;
+  if (!m.hud_layer || m.hud_frame != frame || m.hud_cleared_generation != m.hud_generation)
+    return nullptr;
+  if (m.hud_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+    const D3D12_RESOURCE_BARRIER b = TransitionBarrier(
+        m.hud_layer.Get(), m.hud_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    list->ResourceBarrier(1, &b);
+    m.hud_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  }
+  return m.hud_layer.Get();
+}
+
+void DrawRenderer::HudLayerCounts(uint64_t& draws, uint64_t& drawn, uint64_t& skipped,
+                                  uint64_t& added) {
+  Impl& m = *impl_;
+  draws = std::exchange(m.hud_draws, 0);
+  drawn = std::exchange(m.hud_drawn, 0);
+  skipped = std::exchange(m.hud_skipped, 0);
+  added = std::exchange(m.hud_added, 0);
+}
+
+void DrawRenderer::FlareLayerCounts(uint64_t& draws, uint64_t& drawn, uint64_t& skipped) {
+  Impl& m = *impl_;
+  draws = std::exchange(m.flare_draws, 0);
+  drawn = std::exchange(m.flare_drawn, 0);
+  skipped = std::exchange(m.flare_skipped, 0);
 }
 
 void DrawRenderer::Impl::WriteCatalog() {

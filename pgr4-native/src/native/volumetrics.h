@@ -119,6 +119,13 @@ class Volumetrics {
   // pass at the resolve then lays only the lamps, the sun-lit air and the sky (draw.cpp sets it).
   static bool InShader();
   const Share& share() const { return share_; }
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): the light the pass at the resolve added
+  // (the lamps and the sun-lit air), its luminance per pixel of the scene (R16G16_FLOAT: x the
+  // lamps', y the sun-lit air's; the scene's
+  // visible size `w` x `h`), for the frame generation: frame `frame`'s, moved to
+  // NON_PIXEL_SHADER_RESOURCE on `list`; nullptr when this frame laid none (view 0 only).
+  ID3D12Resource* LightMaskToRead(ID3D12GraphicsCommandList* list, uint64_t frame, uint32_t* w,
+                                  uint32_t* h);
 
  private:
   template <typename T>
@@ -219,6 +226,11 @@ class Volumetrics {
   uint64_t grid_written_[3] = {UINT64_MAX, UINT64_MAX, UINT64_MAX};
   float grid_eye_[3][3] = {};
   bool grid_on_ = false;
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): LightMaskToRead's image.
+  ComPtr<ID3D12Resource> light_mask_, light_mask_old_;
+  D3D12_RESOURCE_STATES light_mask_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  uint32_t light_mask_w_ = 0, light_mask_h_ = 0;
+  uint64_t light_mask_frame_ = UINT64_MAX;
   struct GridPoint {
     float colour[4], depth[4], fog[4], add[4], volume[4];
   };

@@ -93,6 +93,14 @@ bool FrameGeneration::CopyAtHud(ID3D12GraphicsCommandList* list, uint64_t frame,
   return true;
 }
 
+bool FrameGeneration::FrontDraw(uint64_t frame, const uint32_t* regs) const {
+  using enum rex::graphics::Register;
+  if (!front_ || prepared_frame_ != frame) return false;
+  const SurfaceRegs& f = front_->regs;
+  return regs[XE_GPU_REG_RB_SURFACE_INFO] == f.surface_info &&
+         ColorStorage(regs[XE_GPU_REG_RB_COLOR_INFO]) == ColorStorage(f.color_info[front_->source]);
+}
+
 bool FrameGeneration::NoteComposite(uint64_t frame, const uint32_t* regs) {
   using enum rex::graphics::Register;
   const SurfaceRegs& f = front_->regs;
@@ -131,10 +139,15 @@ bool FrameGeneration::Resize(uint32_t width, uint32_t height, bool hdr) {
                                              D3D12_RESOURCE_STATE_PRESENT, nullptr,
                                              IID_PPV_ARGS(&image_)),
              "CreateCommittedResource(frame generation image)") ||
-      Failed(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
-                                             D3D12_RESOURCE_STATE_PRESENT, nullptr,
-                                             IID_PPV_ARGS(&hudless_)),
-             "CreateCommittedResource(frame generation HUD-less image)"))
+      [&] {
+        // Local change (28/11/2026, pgr4_native_fg_light_mask): also written by LightMaskPass.
+        D3D12_RESOURCE_DESC hd = rd;
+        hd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        return Failed(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &hd,
+                                                      D3D12_RESOURCE_STATE_PRESENT, nullptr,
+                                                      IID_PPV_ARGS(&hudless_)),
+                      "CreateCommittedResource(frame generation HUD-less image)");
+      }())
     return false;
   rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   if (Failed(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,

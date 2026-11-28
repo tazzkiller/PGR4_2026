@@ -12,6 +12,7 @@
 #include "fg_probe.h"  // development (28/11/2026)
 #include "tunables.h"
 #include "hudless.h"
+#include "light_mask_pass.h"
 #include "overlay.h"
 #include "frame_pacer.h"
 #include "gpu_timer.h"
@@ -201,6 +202,42 @@ pgr4::native::FgProbeDraws& Pgr4FgDraws(uint64_t frame);
 REXCVAR_DEFINE_BOOL(pgr4_native_hudless_last_composite, false, "PGR4 native",
                     "Frame generation (FSR's and DLSS-G): the HUD-less copy taken after the frame's "
                     "last opaque composite (the tone map), not its first (off: as in v1.65)");
+// Local change (28/11/2026, Tazz: v1.65's frame generation kept, only the volumetric lights'
+// flashes to fix): the HUD-less image given to FSR's frame generation and DLSS-G made unlike the
+// frame's image where the volumetric pass added light (light_mask_pass.h). Read at each Swap.
+REXCVAR_DEFINE_BOOL(pgr4_native_fg_light_mask, true, "PGR4 native",
+                    "Frame generation: the volumetric lamps' and sun-lit air's light taken from the "
+                    "frame's own image, not generated (off: as in v1.65)");
+REXCVAR_DEFINE_DOUBLE(pgr4_native_fg_light_mask_min, 0.002, "PGR4 native",
+                      "Frame generation: the volumetric light (luminance, the scene's units) from "
+                      "which a pixel is the frame's own");
+// Local change (28/11/2026, Tazz: "ajoute les phares dans le masque", "retire le soleil pour
+// voir"): the light flares (the street lamps' and the vehicles' headlights, psLightFlare) in the mask
+// too, from where they lit; the sun-lit air's light out of it unless asked. Read at each draw and
+// each Swap.
+REXCVAR_DEFINE_BOOL(pgr4_native_fg_flare_mask, true, "PGR4 native",
+                    "Frame generation: the light flares (lamps and headlights) taken from the "
+                    "frame's own image too (off: not in the mask)");
+REXCVAR_DEFINE_DOUBLE(pgr4_native_fg_flare_mask_min, 0.02, "PGR4 native",
+                      "Frame generation: the flares' light (red, added) from which a pixel is the "
+                      "frame's own");
+// Local change (28/11/2026, Tazz: the speedometers' trails, bonnet view, wet road): the HUD drawn
+// after the frame's last opaque composite (the tone map) in the mask too, its coverage from its own
+// draws. Read at each draw and each Swap.
+REXCVAR_DEFINE_BOOL(pgr4_native_fg_hud_mask, true, "PGR4 native",
+                    "Frame generation: the HUD's pixels taken from the frame's own image too (off: "
+                    "the HUD-less copy alone tells them)");
+REXCVAR_DEFINE_DOUBLE(pgr4_native_fg_hud_mask_min, 0.02, "PGR4 native",
+                      "Frame generation: the HUD's coverage (alpha) from which a pixel is the "
+                      "frame's own");
+// Local change (28/11/2026, Tazz: the wing mirrors' trails; "fais la version propre avec la
+// profondeur"): the cars' wing mirrors still visible at the end of the scene in the mask too.
+// Read at each draw and at the upscaler's scene depth.
+REXCVAR_DEFINE_BOOL(pgr4_native_fg_mirror_mask, true, "PGR4 native",
+                    "Frame generation: the cars' wing mirrors (their reflection) taken from the "
+                    "frame's own image too (off: interpolated with the car's motion)");
+REXCVAR_DEFINE_BOOL(pgr4_native_fg_light_mask_sun, false, "PGR4 native",
+                    "Frame generation: the volumetric sun-lit air's light in the mask too");
 REXCVAR_DEFINE_BOOL(pgr4_native_fg_probe, true, "PGR4 native",
                     "Development (the capture dir set): the frame generation probe (fg_probe.h), "
                     "each frame's image, generated frame and HUD-less copy against each other, "
@@ -882,6 +919,39 @@ bool NativeRenderer::RebuildPipeline() {
   return true;
 }
 
+// Local change (28/11/2026, pgr4_native_fg_light_mask): the light mask pass, made once (a failure
+// logged once: the frame generation as in v1.65).
+bool NativeRenderer::EnsureLightMask() {
+  if (!light_mask_ && !light_mask_failed_) {
+    light_mask_ = std::make_unique<LightMaskPass>(*device_);
+    if (!light_mask_->Initialize()) {
+      light_mask_.reset();
+      light_mask_failed_ = true;
+      REXLOG_WARN("PGR4 native: the frame generation's light mask pass failed; as in v1.65");
+    }
+  }
+  return light_mask_ != nullptr;
+}
+
+// Local change (28/11/2026, pgr4_native_fg_mirror_mask): at the upscaler's scene depth, the wing
+// mirrors' layer compared with it (light_mask_pass.h MirrorCompare).
+void NativeRenderer::SceneDepthHook(void* ctx, ID3D12GraphicsCommandList* list,
+                                    const RenderTarget& depth, uint32_t width, uint32_t height) {
+  NativeRenderer& r = *static_cast<NativeRenderer*>(ctx);
+  if (!REXCVAR_GET(pgr4_native_fg_light_mask) || !REXCVAR_GET(pgr4_native_fg_mirror_mask) ||
+      !depth.resource)
+    return;
+  DXGI_FORMAT mirror_format = DXGI_FORMAT_UNKNOWN;
+  bool reversed = false;
+  ID3D12Resource* const mirrors =
+      r.draw_->MirrorLayerToRead(list, r.frame_index_, &mirror_format, &reversed);
+  if (!mirrors || !r.EnsureLightMask()) return;
+  r.light_mask_->MirrorCompare(list, uint32_t(r.frame_index_ & 1), depth.resource.Get(),
+                               depth.srv_format, mirrors, mirror_format, reversed, width, height,
+                               r.frame_index_);
+  r.draw_->InvalidateListState();
+}
+
 // Local change (pgr4 project): FidelityFX's frame generation made or dropped to follow
 // --pgr4_native_frame_generation (the game's Graphics page: RequestFsrFrameGeneration), with
 // the frame pacer only. Between frames.
@@ -989,6 +1059,7 @@ void NativeRenderer::SwitchUpscaler(bool on) {
     }
     upscaler_->set_frame_generation(frame_generation_.get());
     upscaler_->set_camera(&camera_);
+    upscaler_->set_scene_depth_hook(&NativeRenderer::SceneDepthHook, this);
   }
   upscaler_on_ = on;
   // The scene's targets are keyed by their sample count: the next draws make the other ones,
@@ -1097,6 +1168,7 @@ void NativeRenderer::BeginFrameModules() {
       parked_key_ = current_key;
       upscaler_->set_frame_generation(frame_generation_.get());
       upscaler_->set_camera(&camera_);
+      upscaler_->set_scene_depth_hook(&NativeRenderer::SceneDepthHook, this);
       REXLOG_INFO("PGR4 native upscaler: {} taken back (kept since its last use), {} kept",
                   want_dlss ? "DLSS" : "FSR", want_dlss ? "FSR" : "DLSS");
       if (on) SwitchUpscaler(true);
@@ -1714,6 +1786,42 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
     fd.copy_draw = fd.draws;
     fd.rain_after = fd.road_after = 0;
   }
+  // Local change (28/11/2026, pgr4_native_fg_flare_mask): the light flares drawn into the front
+  // buffer while a generation runs, drawn again into the flare layer (draw.h).
+  const bool front_draw =
+      REXCVAR_GET(pgr4_native_fg_light_mask) &&
+      ((frame_generation_ && frame_generation_->FrontDraw(frame_index_, state.regs)) ||
+       (hudless_capture_ && streamline::FrameGenerationActive() &&
+        hudless_capture_->FrontDraw(state.regs)));
+  draw_->SetFlareLayer(front_draw && REXCVAR_GET(pgr4_native_fg_flare_mask));
+  // Local change (28/11/2026, pgr4_native_fg_hud_mask): the HUD, the blended draws into the front
+  // buffer after the frame's last opaque composite (as many composites as the last frame's: the
+  // tone map, 6B06B8CD, draw log 83235), drawn again into the HUD layer (draw.h).
+  {
+    using enum rex::graphics::Register;
+    if (hud_frame_ != frame_index_) {
+      hud_composites_last_ = hud_composites_;
+      hud_composites_ = 0;
+      hud_frame_ = frame_index_;
+    }
+    bool hud = false;
+    if (front_draw && REXCVAR_GET(pgr4_native_fg_hud_mask) &&
+        (state.regs[XE_GPU_REG_RB_COLOR_MASK] & 0x7)) {
+      if ((state.regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF) == 0x0001) {
+        ++hud_composites_;
+        ++hud_generation_;
+      } else {
+        hud = hud_composites_ > 0 && hud_composites_ >= hud_composites_last_;
+      }
+    }
+    draw_->SetHudLayer(hud_generation_, hud);
+  }
+  // Local change (28/11/2026, pgr4_native_fg_mirror_mask): the wing mirrors drawn again into the
+  // mirror layer while a generation runs (FSR's, made; or DLSS-G's).
+  draw_->SetMirrorLayer(REXCVAR_GET(pgr4_native_fg_light_mask) &&
+                        REXCVAR_GET(pgr4_native_fg_mirror_mask) &&
+                        (frame_generation_ ||
+                         (hudless_capture_ && streamline::FrameGenerationActive())));
   draw_->OnDraw(state, prep);
   draw_->EndDrawSide();  // local change (24/11/2026, branch cpu_thread)
   SubmitEarly();
@@ -2180,6 +2288,100 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   }
   // The resolved front buffer into the back buffer (PRESENT in and out).
   present_->OnSwap(swap, shown, hudless.image ? &hudless : nullptr);
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): the HUD-less image made unlike the
+  // frame's image under the volumetric light, for FSR's generation (the frame's image) or DLSS-G
+  // (the back buffer, copied).
+  if (shown && hudless.drawn && hudless.target && REXCVAR_GET(pgr4_native_fg_light_mask)) {
+    uint32_t mirrors_w = 0, mirrors_h = 0;
+    ID3D12Resource* const mirrors = light_mask_ && REXCVAR_GET(pgr4_native_fg_mirror_mask)
+                                        ? light_mask_->MirrorMask(frame_index_, &mirrors_w,
+                                                                  &mirrors_h)
+                                        : nullptr;
+    ID3D12GraphicsCommandList* const list = d.command_list();
+    uint32_t mw = 0, mh = 0;
+    ID3D12Resource* const mask =
+        volumetrics_ ? volumetrics_->LightMaskToRead(list, frame_index_, &mw, &mh) : nullptr;
+    ID3D12Resource* const flares =
+        REXCVAR_GET(pgr4_native_fg_flare_mask) ? draw_->FlareLayerToRead(list, frame_index_) : nullptr;
+    ID3D12Resource* const hud =
+        REXCVAR_GET(pgr4_native_fg_hud_mask) ? draw_->HudLayerToRead(list, frame_index_) : nullptr;
+    const ResolveParams* front = nullptr;
+    ID3D12Resource* image = nullptr;
+    if ((mask || flares || hud || mirrors) && generate) {
+      image = fg->image();
+      front = fg->front();
+    } else if ((mask || flares || hud || mirrors) && hudless_capture_ &&
+               streamline::FrameGenerationActive() &&
+               hudless_capture_->shown()) {
+      front = hudless_capture_->front();
+      ID3D12Resource* const bb = d.back_buffer();
+      D3D12_RESOURCE_BARRIER cb[2] = {
+          TransitionBarrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+          TransitionBarrier(hudless_capture_->shown(), D3D12_RESOURCE_STATE_PRESENT,
+                            D3D12_RESOURCE_STATE_COPY_DEST)};
+      list->ResourceBarrier(2, cb);
+      list->CopyResource(hudless_capture_->shown(), bb);
+      for (D3D12_RESOURCE_BARRIER& b : cb)
+        std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+      list->ResourceBarrier(2, cb);
+      image = hudless_capture_->shown();
+    }
+    if (image) EnsureLightMask();
+    if (image && light_mask_) {
+      const ImageRect& r = present_->image_rect();
+      const int32_t rect[4] = {r.left, r.top, r.width, r.height};
+      // The flare layer's pixels: the front buffer's target's, the copy's size times its scale over
+      // the image's rectangle, from the resolve's source corner.
+      const uint32_t s = std::max(hudless.image->scale, 1u);
+      const float to_flares[2] = {
+          r.width > 0 ? float(hudless.image->width * s) / float(r.width) : 1.0f,
+          r.height > 0 ? float(hudless.image->height * s) / float(r.height) : 1.0f};
+      const int32_t flare_origin[2] = {front ? (front->x0 - front->dest_x) * int32_t(s) : 0,
+                                       front ? (front->y0 - front->dest_y) * int32_t(s) : 0};
+      light_mask_->Apply(list, uint32_t(frame_index_ & 1), image, hudless.target, mask, mw, mh,
+                         rect, float(REXCVAR_GET(pgr4_native_fg_light_mask_min)), flares,
+                         to_flares, flare_origin,
+                         float(REXCVAR_GET(pgr4_native_fg_flare_mask_min)),
+                         REXCVAR_GET(pgr4_native_fg_light_mask_sun), hud,
+                         float(REXCVAR_GET(pgr4_native_fg_hud_mask_min)), mirrors, mirrors_w,
+                         mirrors_h);
+      light_mask_mirrors_ += mirrors != nullptr;
+      draw_->InvalidateListState();
+      ++(generate ? light_mask_fsr_ : light_mask_dlssg_);
+      light_mask_flares_ += flares != nullptr;
+      light_mask_hud_ += hud != nullptr;
+    } else {
+      ++light_mask_none_;
+    }
+    if (g_pgr4_dev.load(std::memory_order_relaxed)) {
+      static auto mask_last = std::chrono::steady_clock::now();
+      if (const auto now = std::chrono::steady_clock::now(); now - mask_last >= std::chrono::seconds(2)) {
+        mask_last = now;
+        uint64_t fdraws = 0, fdrawn = 0, fskipped = 0;
+        draw_->FlareLayerCounts(fdraws, fdrawn, fskipped);
+        uint64_t hdraws = 0, hdrawn = 0, hskipped = 0, hadded = 0;
+        draw_->HudLayerCounts(hdraws, hdrawn, hskipped, hadded);
+        uint64_t mdraws = 0, mdrawn = 0, mskipped = 0;
+        draw_->MirrorLayerCounts(mdraws, mdrawn, mskipped);
+        REXLOG_INFO("PGR4 native frame generation mirror mask over 2 s: {} frames with it, {} "
+                    "mirror draws, {} drawn again, {} missed{}",
+                    light_mask_mirrors_, mdraws, mdrawn, mskipped, mskipped ? " MISSED" : "");
+        light_mask_mirrors_ = 0;
+        REXLOG_INFO("PGR4 native frame generation light mask over 2 s: FSR {} frames, DLSS-G {}, "
+                    "without the mask {} (no volumetric light nor flare this frame, or no "
+                    "generation); with the flares {} ({} flare draws, {} drawn again, {} missed{}); "
+                    "the sun-lit air {}; with the HUD {} ({} HUD draws, {} drawn again, {} missed{}, "
+                    "{} added light; {} composites a frame)",
+                    light_mask_fsr_, light_mask_dlssg_, light_mask_none_, light_mask_flares_, fdraws,
+                    fdrawn, fskipped, fskipped ? " MISSED" : "",
+                    REXCVAR_GET(pgr4_native_fg_light_mask_sun) ? "in" : "out", light_mask_hud_,
+                    hdraws, hdrawn, hskipped, hskipped ? " MISSED" : "", hadded,
+                    hud_composites_last_);
+        light_mask_fsr_ = light_mask_dlssg_ = light_mask_none_ = light_mask_flares_ = 0;
+        light_mask_hud_ = 0;
+      }
+    }
+  }
   // Local change: DLSS-G maps the scene's depth and motion onto the image's part of the back
   // buffer (streamline.h).
   if (shown && streamline::FrameGenerationActive()) {

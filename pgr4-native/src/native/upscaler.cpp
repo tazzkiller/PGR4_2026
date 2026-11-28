@@ -1205,6 +1205,9 @@ RenderTarget* Upscaler::Upscale(ID3D12GraphicsCommandList* list, RenderTargets& 
                 uint32_t(color->resource->GetDesc().Format));
   }
 
+  // Local change (28/11/2026, pgr4_native_fg_mirror_mask): the scene's final depth to the hook.
+  if (scene_depth_hook_ && depth->state == kInputState)
+    scene_depth_hook_(scene_depth_ctx_, list, *depth, render_width_, render_height_);
   // The reactive mask (local change), from the copy before this frame's transparents.
   const bool reactive = reactive_pso_ && opaque_ && opaque_frame_ == frame_ &&
                         REXCVAR_GET(pgr4_native_reactive_mask) &&

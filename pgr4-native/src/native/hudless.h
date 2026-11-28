@@ -69,6 +69,16 @@ class HudlessCapture {
   const ResolvedImage* source(uint64_t frame) const {
     return copy_frame_ == frame ? copy_ : nullptr;
   }
+  // Local change (28/11/2026, pgr4_native_fg_light_mask): a draw into the front buffer's surface,
+  // and the front buffer's resolve (nullptr without).
+  bool FrontDraw(const uint32_t* regs) const {
+    using enum rex::graphics::Register;
+    if (!front_) return false;
+    const SurfaceRegs& f = front_->regs;
+    return regs[XE_GPU_REG_RB_SURFACE_INFO] == f.surface_info &&
+           ColorStorage(regs[XE_GPU_REG_RB_COLOR_INFO]) == ColorStorage(f.color_info[front_->source]);
+  }
+  const ResolveParams* front() const { return front_ ? &*front_ : nullptr; }
 
   // The image (the back buffers' size and format, PRESENT outside the Presenter's draw), made
   // again when they change; false (logged) on failure.
@@ -97,19 +107,29 @@ class HudlessCapture {
                               hdr ? D3D12Device::kHdrBackBufferFormat
                                   : D3D12Device::kBackBufferFormat,
                               {1, 0}};
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    // Local change (28/11/2026, pgr4_native_fg_light_mask): also written by LightMaskPass, from
+    // the back buffer's copy (shown_).
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (Failed(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
                                                D3D12_RESOURCE_STATE_PRESENT, nullptr,
                                                IID_PPV_ARGS(&image_)),
                "CreateCommittedResource(DLSS-G HUD-less image)"))
       return false;
     device->CreateRenderTargetView(image_.Get(), nullptr, rtv());
+    shown_.Reset();
+    D3D12_RESOURCE_DESC sd = rd;
+    sd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &sd,
+                                               D3D12_RESOURCE_STATE_PRESENT, nullptr,
+                                               IID_PPV_ARGS(&shown_))))
+      shown_.Reset();
     width_ = w;
     height_ = h;
     hdr_ = hdr;
     return true;
   }
   ID3D12Resource* image() const { return image_.Get(); }
+  ID3D12Resource* shown() const { return shown_.Get(); }  // the back buffer's copy (local change)
   D3D12_CPU_DESCRIPTOR_HANDLE rtv() const { return rtv_heap_->GetCPUDescriptorHandleForHeapStart(); }
 
  private:
@@ -123,6 +143,7 @@ class HudlessCapture {
   D3D12Device& device_;
   Resolver& resolver_;
   Microsoft::WRL::ComPtr<ID3D12Resource> image_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> shown_;  // local change (pgr4_native_fg_light_mask)
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtv_heap_;
   uint32_t width_ = 0, height_ = 0;
   bool hdr_ = false;
