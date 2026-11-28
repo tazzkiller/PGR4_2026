@@ -25,6 +25,12 @@
 #include <mutex>
 #include <string>
 
+// Local change (28/11/2026): DLSS SR's inputs tagged valid until the evaluate (EvaluateDlss): no
+// Streamline copy of them each frame. Read at each frame.
+REXCVAR_DEFINE_BOOL(pgr4_native_dlss_inputs_until_evaluate, true, "PGR4 native",
+                    "DLSS: its inputs tagged valid until the evaluate, which follows at once: "
+                    "Streamline makes no copy of them (off: copied each frame, as before)");
+REXCVAR_DECLARE(bool, pgr4_native_dlss_vram_warning);  // streamline.cpp
 REXCVAR_DEFINE_BOOL(pgr4_native_upscaler, false, "PGR4 native",
                     "Render the 3D scene without MSAA and antialias it with AMD FidelityFX Super "
                     "Resolution (amd_fidelityfx_loader_dx12.dll and "
@@ -1534,13 +1540,20 @@ bool Upscaler::EvaluateDlss(ID3D12GraphicsCommandList* list, RenderTarget* depth
   // without one this frame (untagged).
   sl::Resource bias_res(sl::ResourceType::eTex2d, reactive_ ? opaque_.Get() : nullptr,
                         uint32_t(kInputState));
+  // Local change (28/11/2026, pgr4_native_dlss_inputs_until_evaluate): DLSS SR's inputs tagged valid
+  // until the evaluate, which follows on this list: Streamline copies an input only when it is
+  // tagged "only valid now" (resourceTaggingForFrame.cpp, makeCopy), here about 217 MB a frame at
+  // x3 DLAA (color, depth, motion, the 3840x3072 bias), kept until its recycling. DLSS-G's own
+  // tags (viewport 0, below) keep theirs: it reads them at the present.
+  const sl::ResourceLifecycle in_life = REXCVAR_GET(pgr4_native_dlss_inputs_until_evaluate)
+                                            ? sl::ResourceLifecycle::eValidUntilEvaluate
+                                            : sl::ResourceLifecycle::eOnlyValidNow;
   const sl::ResourceTag tags[] = {
-      {&color_res, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &render},
-      {&depth_res, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &render},
-      {&motion_res, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &render},
+      {&color_res, sl::kBufferTypeScalingInputColor, in_life, &render},
+      {&depth_res, sl::kBufferTypeDepth, in_life, &render},
+      {&motion_res, sl::kBufferTypeMotionVectors, in_life, &render},
       {&output_res, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow},
-      {&bias_res, sl::kBufferTypeBiasCurrentColorHint, sl::ResourceLifecycle::eOnlyValidNow,
-       &render},
+      {&bias_res, sl::kBufferTypeBiasCurrentColorHint, in_life, &render},
   };
   if (const sl::Result r =
           sl_api.setTagForFrame(*token, viewport, tags, uint32_t(std::size(tags)), list);
@@ -1552,8 +1565,14 @@ bool Upscaler::EvaluateDlss(ID3D12GraphicsCommandList* list, RenderTarget* depth
   if (const sl::Result r = sl_api.evaluateFeature(sl::kFeatureDLSS, *token, inputs,
                                                    uint32_t(std::size(inputs)), list);
       r != sl::Result::eOk) {
-    PGR4_WARN_ONCE("PGR4 native DLSS: slEvaluateFeature failed ({})", int(r));
-    return false;
+    // Local change (28/11/2026, pgr4_native_dlss_vram_warning, streamline.cpp): 39 is returned after
+    // a successful evaluate: the output is there, the frame goes on (its DLSS-G tags, MarkScene).
+    if (r == sl::Result::eWarnOutOfVRAM && REXCVAR_GET(pgr4_native_dlss_vram_warning)) {
+      PGR4_WARN_ONCE("PGR4 native DLSS: slEvaluateFeature: out of video memory (39), output kept");
+    } else {
+      PGR4_WARN_ONCE("PGR4 native DLSS: slEvaluateFeature failed ({})", int(r));
+      return false;
+    }
   }
   // DLSS-G (viewport 0, read at the present): the same camera, its motion vector factors, and
   // the depth and motion.
@@ -1564,7 +1583,10 @@ bool Upscaler::EvaluateDlss(ID3D12GraphicsCommandList* list, RenderTarget* depth
     if (streamline::SkipGeneration()) c.reset = sl::Boolean::eTrue;
     if (const sl::Result r = sl_api.setConstants(c, *token, fg_viewport); r != sl::Result::eOk)
       PGR4_WARN_ONCE("PGR4 native DLSS-G: slSetConstants failed ({})", int(r));
-    const sl::ResourceTag fg_tags[] = {tags[1], tags[2]};
+    // Read by DLSS-G at the present: copied (only valid now), whatever DLSS SR's own tags say.
+    const sl::ResourceTag fg_tags[] = {
+        {&depth_res, sl::kBufferTypeDepth, sl::ResourceLifecycle::eOnlyValidNow, &render},
+        {&motion_res, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eOnlyValidNow, &render}};
     if (const sl::Result r = sl_api.setTagForFrame(*token, fg_viewport, fg_tags,
                                                    uint32_t(std::size(fg_tags)), list);
         r != sl::Result::eOk)

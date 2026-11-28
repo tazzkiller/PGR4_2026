@@ -247,6 +247,24 @@ class TextureCache {
                : 0;
   }
   uint64_t video_budget() const { return video_budget_; }
+  // Development (28/11/2026, fg_probe.h): the adapter's local and non-local (system) memory in use
+  // and their budgets now, the HD versions' and the textures' bytes (0 when unknown).
+  void MemoryDev(uint64_t& local, uint64_t& local_budget, uint64_t& nonlocal,
+                 uint64_t& nonlocal_budget, uint64_t& hd, uint64_t& textures) const {
+    DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+    local = local_budget = nonlocal = nonlocal_budget = 0;
+    if (adapter_ && SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+      local = info.CurrentUsage;
+      local_budget = info.Budget;
+    }
+    if (adapter_ &&
+        SUCCEEDED(adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
+      nonlocal = info.CurrentUsage;
+      nonlocal_budget = info.Budget;
+    }
+    hd = hd_cache_bytes_;
+    textures = resident_bytes_;
+  }
   size_t texture_count() const { return textures_.size(); }
   uint64_t resident_bytes() const { return resident_bytes_; }
 
@@ -430,6 +448,14 @@ class TextureCache {
   std::unordered_map<uint64_t, HdCached> hd_cache_;
   uint64_t hd_cache_bytes_ = 0;
   void TrimHdCache();
+  // Local change (28/11/2026, pgr4_native_texture_purge_at_load): a race or replay left (the race
+  // screen off, g_pgr4_race_screen), until the next race: the textures unused for kPurgeUnusedMs
+  // evicted whatever the budget (EvictOverBudget) and the HD versions nothing holds freed (Retire).
+  // By time, not frames: the same at any frame rate.
+  void UpdatePurge();
+  static constexpr uint64_t kPurgeUnusedMs = 3000;
+  bool purge_armed_ = false, purge_race_ = false;
+  uint64_t purge_start_ms_ = 0, purge_textures_ = 0, purge_texture_bytes_ = 0, purge_hd_bytes_ = 0;
   // Local change (pgr4 project): HD versions freed together are destroyed on this thread: on the render
   // thread hundreds of them held a frame for 50 to 70 ms (06/11/2026).
   void ReleaseMain();

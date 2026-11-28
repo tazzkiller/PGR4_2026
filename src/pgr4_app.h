@@ -24,6 +24,8 @@ bool Pgr4StartedByLauncher();
 // src/pgr4_hooks.cpp: the game's 16:9 made the frame's own aspect (1280 x render height).
 void Pgr4ApplyRenderAspect();
 void Pgr4HideWindow(void* hwnd);
+// src/pgr4_guest_access.cpp (built in pgr4_recomp): which guest memory accesses the recompiled code uses.
+void Pgr4LogGuestAccess();
 
 class Pgr4App : public rex::ReXApp {
  public:
@@ -48,6 +50,7 @@ class Pgr4App : public rex::ReXApp {
   void OnPostLoadXexImage() override { title_launch::Restore(runtime()); }
 
   void OnPreLaunchModule() override {
+    Pgr4LogGuestAccess();
     // The launcher's precompile step (--pgr4_native_precompile, pgr4-native draw.cpp): the
     // window hidden at once, nothing asked or brought to the front; the process exits once the
     // shaders are compiled.

@@ -83,9 +83,16 @@ class FrameGeneration {
   void OnSwap(uint32_t front_base);
   // Before each draw of frame `frame` (`regs` its register file): when the draw is the HUD's first,
   // records the copy into `list` and returns true (the list's compute state changed).
-  bool BeforeDraw(ID3D12GraphicsCommandList* list, uint64_t frame, const uint32_t* regs) {
-    if (!front_ || prepared_frame_ != frame || copy_frame_ == frame) [[likely]]
+  // Local change (28/11/2026, `last_composite`: pgr4_native_hudless_last_composite): the copy taken
+  // again after each later opaque composite of the frame, so that the one after the last (the
+  // tone map, 6B06B8CD, before the HUD) is given, not the one after the scene's first composite
+  // (27A38989: no car shadows, flares, rain nor tone map; draw log 26835 of 19/11/2026).
+  bool BeforeDraw(ID3D12GraphicsCommandList* list, uint64_t frame, const uint32_t* regs,
+                  bool last_composite) {
+    if (!front_ || prepared_frame_ != frame) [[likely]]
       return false;
+    if (copy_frame_ == frame && (!last_composite || copied_since_composite_)) [[likely]]
+      return last_composite ? NoteComposite(frame, regs) : false;
     return CopyAtHud(list, frame, regs);
   }
   // Frame `frame`'s copy (ResolvedImage of the front buffer's format and size), nullptr without.
@@ -105,6 +112,9 @@ class FrameGeneration {
   void Destroy();
   D3D12_CPU_DESCRIPTOR_HANDLE Rtv(uint32_t i) const;
   bool CopyAtHud(ID3D12GraphicsCommandList* list, uint64_t frame, const uint32_t* regs);
+  // After the frame's copy: an opaque composite into the front buffer's surface asks for the copy
+  // again at the next blended draw (copied_since_composite_ false). Always returns false.
+  bool NoteComposite(uint64_t frame, const uint32_t* regs);
 
   D3D12Device& device_;
   Resolver& resolver_;
@@ -121,6 +131,7 @@ class FrameGeneration {
   std::optional<ResolveParams> front_;      // the front buffer's resolve
   uint64_t composited_frame_ = UINT64_MAX;  // the last frame drawn opaque into front_'s surface
   uint64_t copy_frame_ = UINT64_MAX;        // the last frame CopyAtHud ran in
+  bool copied_since_composite_ = false;     // its copy taken after the frame's latest composite
   const ResolvedImage* copy_ = nullptr;     // its copy
 };
 

@@ -25,6 +25,13 @@
 
 #include "log.h"
 
+// Local change (28/11/2026, Tazz: « un retour au menu devrait décharger une bonne partie de la
+// mémoire »): from 10:05 to 10:17 the video memory only grew, race after race (1.4 to 9.2 GB), the
+// textures and HD versions of every track kept. Read at each frame (TextureCache::UpdatePurge).
+REXCVAR_DEFINE_BOOL(pgr4_native_texture_purge_at_load, true, "PGR4 native",
+                    "A race or replay left (a loading screen or the menus): the textures and HD "
+                    "versions unused for 3 s freed until the next race, as the game unloads its "
+                    "track (the cars' common HD textures kept)");
 REXCVAR_DEFINE_STRING(pgr4_native_texture_trace, "", "PGR4 native",
                       "Log every TextureCache::Get of the texture at this guest physical address "
                       "(hex): dirty upload, resolved image seq, copy");
@@ -81,6 +88,10 @@ REXCVAR_DEFINE_BOOL(pgr4_native_scaled_cube, true, "PGR4 native",
 
 
 REXCVAR_DECLARE(bool, pgr4_native_dred);
+#ifndef PGR4_TEXTURES_OFFLINE
+// A race's, the garage's, a replay's or photo screen shown (draw.cpp, set by src/pgr4_menu.cpp).
+extern bool g_pgr4_race_screen;
+#endif
 
 namespace pgr4::native {
 
@@ -1296,7 +1307,10 @@ void TextureCache::EvictOverBudget(uint64_t completed_fence) {
   // Over 90 % of the video memory budget, whatever the card: the textures unused for the soft
   // lifetime go even under the soft limit, and then the HD versions only they held (TrimHdCache).
   const bool tight = VideoMemoryTight(90) || MemoryPressure();
-  if (!tight && resident_bytes_ <= budget_.soft_bytes) return;
+  // Local change (28/11/2026): a race left (UpdatePurge): the textures unused for kPurgeUnusedMs
+  // go too, whatever the budget.
+  const bool purge = purge_armed_;
+  if (!tight && !purge && resident_bytes_ <= budget_.soft_bytes) return;
   const uint64_t t0 = NowNs();
   evict_batch_.clear();
   evict_resources_.clear();
@@ -1305,9 +1319,11 @@ void TextureCache::EvictOverBudget(uint64_t completed_fence) {
   for (Texture* t = lru_first_; t && evict_batch_.size() < kMaxEvictionsPerFrame; t = t->lru_next) {
     // A frame in flight may read it, and every texture used after it.
     if (t->used_fence > completed_fence) break;
-    if (bytes <= budget_.hard_bytes &&
-        ((!tight && bytes <= budget_.soft_bytes) || now_ms_ - t->used_ms < budget_.soft_lifetime_ms))
-      break;
+    const bool over = !(bytes <= budget_.hard_bytes &&
+                        ((!tight && bytes <= budget_.soft_bytes) ||
+                         now_ms_ - t->used_ms < budget_.soft_lifetime_ms));
+    const bool stale = purge && now_ms_ - t->used_ms >= kPurgeUnusedMs;
+    if (!over && !stale) break;
     evict_batch_.push_back(t);
     evict_resources_.push_back(t->resource.Get());
     if (t->scaled_cube) evict_resources_.push_back(t->scaled_cube.Get());
@@ -1321,13 +1337,17 @@ void TextureCache::EvictOverBudget(uint64_t completed_fence) {
     bytes -= t->bytes;
   }
   if (evict_batch_.empty()) return;
+  if (purge) {
+    purge_textures_ += evict_batch_.size();
+    purge_texture_bytes_ += resident_bytes_ - bytes;
+  }
   if (MemoryPressure())
     PGR4_LOG_FIRST(16, INFO, "PGR4 native textures: {}: {} unused textures evicted",
                    views_tight_ ? "view heap nearly full" : "a texture refused", evict_batch_.size());
   if (tight)
     PGR4_LOG_FIRST(16, INFO, "PGR4 native textures: video memory {} of {} MB: {} unused textures evicted",
                    video_usage_ >> 20, video_budget_ >> 20, evict_batch_.size());
-  if (!stats_.evicted)
+  if (!stats_.evicted && !purge)
     REXLOG_INFO(
         "PGR4 native textures: {} MB in {} textures, over the budget (soft {} MB for {} s "
         "unused, hard {} MB): evicting",
@@ -2727,6 +2747,36 @@ uint64_t TextureCache::FreeHd(uint64_t bytes, uint64_t before) {
   return freed;
 }
 
+void TextureCache::UpdatePurge() {
+#ifndef PGR4_TEXTURES_OFFLINE
+  // Local change (28/11/2026): the game unloads its track when a race or replay is left (a
+  // loading screen or the menus: the race screen off). From then until the next race, the
+  // textures unused for kPurgeUnusedMs and the HD versions nothing holds any more are freed
+  // (EvictOverBudget, Retire); made again from the guest's memory or the HD files when drawn.
+  const bool race = g_pgr4_race_screen;
+  const bool on = REXCVAR_GET(pgr4_native_texture_purge_at_load);
+  if (purge_armed_ && (race || !on)) {
+    purge_armed_ = false;
+    REXLOG_INFO("PGR4 native textures: race left, after {:.1f} s: {} textures freed ({} MB), HD "
+                "versions {} MB; now textures {} MB, HD versions {} MB, video memory {} of {} MB",
+                double(now_ms_ - purge_start_ms_) / 1000.0, purge_textures_,
+                purge_texture_bytes_ >> 20, purge_hd_bytes_ >> 20, resident_bytes_ >> 20,
+                hd_cache_bytes_ >> 20, video_usage_ >> 20, video_budget_ >> 20);
+  } else if (on && purge_race_ && !race && !purge_armed_) {
+    purge_armed_ = true;
+    purge_start_ms_ = now_ms_;
+    purge_textures_ = purge_texture_bytes_ = purge_hd_bytes_ = 0;
+    preload_last_area_ = -1;  // the area's HD versions preloaded again at its next race
+    REXLOG_INFO("PGR4 native textures: race left: the textures and HD versions unused for {} s "
+                "freed until the next race (textures {} MB, HD versions {} MB, video memory {} of "
+                "{} MB)",
+                kPurgeUnusedMs / 1000, resident_bytes_ >> 20, hd_cache_bytes_ >> 20,
+                video_usage_ >> 20, video_budget_ >> 20);
+  }
+  purge_race_ = race;
+#endif
+}
+
 void TextureCache::TrimHdCache() {
   // Over 90 % of the budget: down to 85 %.
   if (VideoMemoryTight(90))
@@ -2743,10 +2793,13 @@ void TextureCache::Retire(uint64_t completed_fence) {
   now_ms_ = NowNs() / 1000000;
   ++retire_count_;
   RecheckContents();
+  UpdatePurge();  // local change (28/11/2026)
   if (++video_poll_ >= 30) {
     video_poll_ = 0;
     PollVideoMemory();
     TrimHdCache();
+    // A race left: every HD version no texture holds any more (the cars' common ones kept).
+    if (purge_armed_) purge_hd_bytes_ += FreeHd(~0ull);
   }
   EvictOverBudget(completed_fence);
   hd_frame_bytes_.store(0, std::memory_order_relaxed);

@@ -37,8 +37,14 @@ class HudlessCapture {
   }
   // Before each draw of frame `frame`: when the draw is the HUD's first, records the copy into
   // `list` and returns true (the list's compute state changed).
-  bool BeforeDraw(ID3D12GraphicsCommandList* list, uint64_t frame, const uint32_t* regs) {
-    if (!front_ || copy_frame_ == frame) [[likely]]
+  // Local change (28/11/2026, `last_composite`: pgr4_native_hudless_last_composite): the copy taken
+  // again after each later opaque composite of the frame, so that the one after the last (the
+  // tone map, 6B06B8CD, before the HUD) is given, not the one after the scene's first composite
+  // (27A38989: no car shadows, flares, rain nor tone map; draw log 26835 of 19/11/2026). The same
+  // image each time (Resolver's own destination), written over in the list's order.
+  bool BeforeDraw(ID3D12GraphicsCommandList* list, uint64_t frame, const uint32_t* regs,
+                  bool last_composite) {
+    if (!front_ || (copy_frame_ == frame && !last_composite)) [[likely]]
       return false;
     using enum rex::graphics::Register;
     const SurfaceRegs& f = front_->regs;
@@ -49,10 +55,13 @@ class HudlessCapture {
     // RB_BLENDCONTROL0's color part: source ONE, ADD, destination ZERO replaces what was there.
     if ((regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF) == 0x0001) {
       composited_frame_ = frame;
+      copied_since_composite_ = false;
       return false;
     }
     if (composited_frame_ != frame) return false;
+    if (copy_frame_ == frame && copied_since_composite_) return false;
     copy_frame_ = frame;
+    copied_since_composite_ = true;
     copy_ = resolver_.ResolveCopy(list, *front_);
     return true;
   }
@@ -121,6 +130,7 @@ class HudlessCapture {
   std::optional<ResolveParams> front_;
   uint64_t composited_frame_ = UINT64_MAX;
   uint64_t copy_frame_ = UINT64_MAX;
+  bool copied_since_composite_ = false;  // the copy taken after the frame's latest composite
   const ResolvedImage* copy_ = nullptr;
 };
 

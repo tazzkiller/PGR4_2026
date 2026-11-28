@@ -9,6 +9,7 @@
 #include "draw.h"
 #include "frame_dump.h"
 #include "frame_generation.h"
+#include "fg_probe.h"  // development (28/11/2026)
 #include "tunables.h"
 #include "hudless.h"
 #include "overlay.h"
@@ -186,6 +187,23 @@ bool Pgr4PhotoModeActive();
 // The game's clock stands still (the pause, the photo mode; draw.cpp, set by src/pgr4_hooks.cpp).
 extern bool g_pgr4_game_paused;
 extern std::atomic<bool> g_pgr4_dev;  // draw.cpp: development (the capture dir set), never in the release
+// Development (28/11/2026, fg_probe.h): the frame's game draws for the frame generation probe
+// (draw.cpp), and the probe's switches.
+pgr4::native::FgProbeDraws& Pgr4FgDraws(uint64_t frame);
+// Local change (28/11/2026, Tazz: the road flickering yellow and black with FSR's frame generation and
+// DLSS-G): the HUD-less copy taken after the frame's last opaque composite (the tone map, before the
+// HUD), not its first (the scene's, before its shadows, flares, rain and tone map: the copy 0.66 of
+// the image, so FidelityFX took most of the frame for HUD). Read at each draw.
+REXCVAR_DEFINE_BOOL(pgr4_native_hudless_last_composite, true, "PGR4 native",
+                    "Frame generation (FSR's and DLSS-G): the HUD-less copy taken after the frame's "
+                    "last opaque composite (the tone map), not its first (off: as before)");
+REXCVAR_DEFINE_BOOL(pgr4_native_fg_probe, true, "PGR4 native",
+                    "Development (the capture dir set): the frame generation probe (fg_probe.h), "
+                    "each frame's image, generated frame and HUD-less copy against each other, "
+                    "with the frame's rain and road draws and the memory; read at each frame");
+REXCVAR_DEFINE_INT32(pgr4_native_fg_probe_dumps, 6, "PGR4 native",
+                     "Development: the frame generation probe's whole-image dumps at most (two "
+                     "frames after each fault, fgprobe_<frame>_<what>.bin beside the executable)");
 // The game's blur pass run since the last Swap (pgr4_d3d_trace.cpp, its step hook; development).
 extern std::atomic<uint32_t> g_pgr4_blur_pass_calls;
 // A race's or its replay's screens shown (src/pgr4_menu.cpp), or a race loaded before its first
@@ -1670,12 +1688,28 @@ void NativeRenderer::ExecuteDraw(const DrawState& state, const DrawPrep* prep) {
       (upscaler_ || frame_generation_ || SceneEffects::Enabled() || Volumetrics::Enabled()))
     FindCamera(state);
   if (REXCVAR_GET(pgr4_native_camera_diag)) DiagCamera(state);
-  if (frame_generation_ &&
-      frame_generation_->BeforeDraw(device_->recording_list(), frame_index_, state.regs))
+  bool hudless_copied = false;
+  // Local change (28/11/2026): the HUD-less copy after the frame's last composite (frame_generation.h,
+  // hudless.h), read at each draw.
+  const bool last_composite = REXCVAR_GET(pgr4_native_hudless_last_composite);
+  if (frame_generation_ && frame_generation_->BeforeDraw(device_->recording_list(), frame_index_,
+                                                         state.regs, last_composite)) {
     draw_->InvalidateListState();
+    hudless_copied = true;
+  }
   if (hudless_capture_ && streamline::FrameGenerationActive() &&
-      hudless_capture_->BeforeDraw(device_->recording_list(), frame_index_, state.regs))
+      hudless_capture_->BeforeDraw(device_->recording_list(), frame_index_, state.regs,
+                                   last_composite)) {
     draw_->InvalidateListState();
+    hudless_copied = true;
+  }
+  // Development (28/11/2026, fg_probe.h): the HUD-less copy's place among the frame's draws (the
+  // last one taken: the draws before it are in it).
+  if (hudless_copied && g_pgr4_dev.load(std::memory_order_relaxed)) {
+    FgProbeDraws& fd = Pgr4FgDraws(frame_index_);
+    fd.copy_draw = fd.draws;
+    fd.rain_after = fd.road_after = 0;
+  }
   draw_->OnDraw(state, prep);
   draw_->EndDrawSide();  // local change (24/11/2026, branch cpu_thread)
   SubmitEarly();
@@ -2207,10 +2241,39 @@ void NativeRenderer::ExecuteSwap(const SwapCall& swap) {
   }
   if (fg) fg->OnSwap(present_->front_buffer_base());
   if (hudless_capture_) hudless_capture_->OnSwap(present_->front_buffer_base());
+  ID3D12Resource* generated = nullptr;
   if (generate) {
     const ImageRect& r = present_->image_rect();
-    d.SetGeneratedFrame(fg->Generate(d.command_list(), frame_index_,
-                                     {r.left, r.top, r.width, r.height}, hudless.image));
+    generated = fg->Generate(d.command_list(), frame_index_, {r.left, r.top, r.width, r.height},
+                             hudless.image);
+    d.SetGeneratedFrame(generated);
+  }
+  // Development (28/11/2026, fg_probe.h): the frame's image, FSR's generated frame and the HUD-less
+  // copy, sampled for the frame generation probe, with the frame's draws and memory.
+  if (g_pgr4_dev.load(std::memory_order_relaxed) && REXCVAR_GET(pgr4_native_fg_probe)) {
+    if (!fg_probe_) fg_probe_ = std::make_unique<FgProbe>();
+    if (shown) {
+      FgProbe::Frame info;
+      info.frame = frame_index_;
+      info.generated = generated != nullptr;
+      info.hudless = hudless.drawn;
+      info.dlss_fg = streamline::FrameGenerationActive();
+      info.draws = Pgr4FgDraws(frame_index_);
+      if (++fg_probe_->memory_poll >= 30 || !fg_probe_->memory.local_budget) {
+        fg_probe_->memory_poll = 0;
+        FgProbeMemory& m = fg_probe_->memory;
+        textures_->MemoryDev(m.local, m.local_budget, m.nonlocal, m.nonlocal_budget, m.hd, m.textures);
+        m.private_bytes = FgProbePrivateBytes();
+      }
+      info.memory = fg_probe_->memory;
+      info.gpu_busy_ms = double(d.gpu_busy_ns()) / 1e6;
+      const ImageRect& r = present_->image_rect();
+      fg_probe_->Sample(d.device(), d.command_list(), d.frame_fence(), info, d.back_buffer(),
+                        generated, hudless.drawn ? hudless.target : nullptr, uint32_t(r.left),
+                        uint32_t(r.top), uint32_t(r.width), uint32_t(r.height),
+                        REXCVAR_GET(pgr4_native_fg_probe_dumps));
+    }
+    fg_probe_->Poll(d.completed_fence());
   }
   // The frame's texture copies read upload memory the untile workers fill.
   const uint64_t u0 = NowNs();

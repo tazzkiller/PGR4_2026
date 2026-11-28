@@ -47,7 +47,11 @@ REXCVAR_DEFINE_DOUBLE(pgr4_native_volumetric_distance, 150.0, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_fog, true, "PGR4 native",
                     "Volumetric fog: the game's own fog taken out of the scene and laid again in "
                     "volume, its thickness and color kept (false: the game's as it is; live)");
-REXCVAR_DEFINE_DOUBLE(pgr4_native_volumetric_fog_variation, 0.45, "PGR4 native",
+// 0.7 by default since 28/11/2026 (Tazz, photo mode in Macau's fog: 0.45 was no good compromise;
+// 0 tried first the same morning, then "tu vas mettre 0.70, l'effet est parfait comme ça"). At 0.7
+// the thinnest parts of the banks hold no fog of ours (Thickening's max(..., 0)). pgr4.toml files
+// holding the old 0.45, or version 11's 0: src/pgr4_profile.cpp, versions 11 and 12.
+REXCVAR_DEFINE_DOUBLE(pgr4_native_volumetric_fog_variation, 0.7, "PGR4 native",
                       "Volumetric fog: how much its banks thicken and thin (0: even, the game's own "
                       "exactly)")
     .range(0.0, 1.0);
@@ -129,6 +133,23 @@ REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_eye_from_camera, true, "PGR4 native",
 REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_volume_early, true, "PGR4 native",
                     "Volumetric fog: the volume made before the scene's draws (at its first draw "
                     "with the game's fog), not at the scene's resolve; off: at the resolve");
+// Local change (27/11/2026, issue 32): the volume's fog from the game's engine (Pgr4EngineFog, draw.cpp)
+// rather than from one draw's copy; read at each volume (live).
+REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_fog_from_engine, true, "PGR4 native",
+                    "Volumetric fog: the game's fog (colour, density, height fog, scale after the fog) "
+                    "read from its engine each frame; off: copied from the last fog draw, as before");
+// Local change (28/11/2026): the scale after the fog (c12.y: the lamps' strength, the fog's colour)
+// from the main view's fog draws, not the engine's Shaders.OutputGain read at any instant (6 or 1
+// by runs of frames: the lamps blinking). Read at each Apply.
+REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_gain_from_draws, true, "PGR4 native",
+                    "Volumetric fog: the game's scale after the fog (c12.y) from the main view's "
+                    "fog draws (off: read from the engine at any instant, as on 27/11)");
+// Local change (28/11/2026, issue 32): the cells' fog slot written this frame was read as a UAV
+// (the previous) by the last frame's MEDIA and stays in the UAV state: D3D12 asks for a UAV barrier
+// between those two accesses, none was there. Off: no barrier, as up to v1.68.
+REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_media_uav_barrier, true, "PGR4 native",
+                    "Volumetric fog: a UAV barrier on the cells' fog written this frame, read as a UAV "
+                    "by the last frame (off: none, as up to v1.68)");
 REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_fog_c12, true, "PGR4 native",
                     "Volumetric fog: the fog's color times the fog shaders' c12.y, as in the scene; "
                     "off: c10.rgb alone");
@@ -1672,7 +1693,32 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       if (t0) g_pgr4_vol_ticks[slot] += Ticks() - t0;
     }
   } const vol_time{vol_t0, early ? 1 : 2};
-  if (!ready_ || !Enabled() || !clip_rows_) return false;
+  // Development (27/11/2026, issue 32, pgr4_native_volumetric_missing_probe): this try's answer and
+  // the values it worked from, kept in its frame's record (Pgr4FogFrame) at each return; not for the
+  // early calls that find the frame tried already (every later draw of the frame).
+  struct TryNote {
+    bool on = false, early = false;
+    uint64_t key = 0;
+    Pgr4FogTry t;
+    ~TryNote() {
+      if (!on) return;
+      Pgr4FogFrame& f = Pgr4FogFrameOf(key);
+      (early ? f.early : f.late) = t;
+      f.early_calls += early;
+    }
+  } note;
+  const bool probe_try = Pgr4FogMissingProbe();
+  if (!ready_ || !Enabled() || !clip_rows_) {
+    if (probe_try) {
+      note.on = true;
+      note.early = early;
+      note.key = Pgr4ViewKey(frame);
+      note.t.code = kFogTryOff;
+      note.t.enabled = ready_ && Enabled();
+      note.t.clip_rows = clip_rows_ != nullptr;
+    }
+    return false;
+  }
   // Local change (25/11/2026, split screen): once a view of the frame (Pgr4ViewKey: the frame
   // alone with one view), each view with its own history (SelectView).
   const uint64_t key = Pgr4ViewKey(frame);
@@ -1683,6 +1729,13 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
     return false;
   SelectView(view);
   if (early) early_tried_frame_ = key;
+  if (probe_try) {
+    note.on = true;
+    note.early = early;
+    note.key = key;
+    note.t.enabled = note.t.clip_rows = true;
+    note.t.code = kFogTryMade;  // set again at each return below
+  }
   // Local change (22/11/2026): the freeze probe, the step reached (HangStep).
   HangMark hang_mark(HangWhat::kVolume, early ? 100 : 200);
   // The volume already made this frame by the early pass: not made again here.
@@ -1711,8 +1764,14 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   }
   RenderTarget* color = targets.GetColor(regs, 0, Upscaler::SceneHeight());
   RenderTarget* depth = targets.GetDepth(regs, Upscaler::SceneHeight());
-  if (!color || !depth || color->samples != depth->samples || !(color->scale == depth->scale))
+  if (!color || !depth || color->samples != depth->samples || !(color->scale == depth->scale)) {
+    note.t.code = kFogTryNoTarget;
+    note.t.color = color != nullptr;
+    note.t.depth = depth != nullptr;
+    note.t.color_samples = color ? color->samples : 0;
+    note.t.depth_samples = depth ? depth->samples : 0;
     return false;
+  }
   // The scene's visible height (21/11/2026, the lamps' glow below the lamps: the target is the
   // EDRAM's, 1024 guest rows, of which the scene draws the top SceneHeight (720); the rays mapped
   // over all of it stood 1024 / 720 = 1.42 times too low on the screen, the banks, the ground map and
@@ -1823,14 +1882,49 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   const bool road_from_car = false;
   const float car_distance = -1.0f;
   // The fog's color as the scene has it: c10.rgb times the shaders' scale after the fog (c12.y).
-  const float fog_c12 = g_pgr4_fog_c12y.load(std::memory_order_relaxed);
-  if (REXCVAR_GET(pgr4_native_volumetric_fog_c12) && fog_c12 > 0.0f && std::isfinite(fog_c12))
-    for (int k = 0; k < 3; ++k) c.fog_color[k] *= fog_c12;
+  float fog_c12 = g_pgr4_fog_c12y.load(std::memory_order_relaxed);
   c.fog_distance = g_pgr4_fog_c10[3].load(std::memory_order_relaxed);
   c.fog_ceiling = g_pgr4_fog_c11[0].load(std::memory_order_relaxed);
   c.fog_density = g_pgr4_fog_c11[1].load(std::memory_order_relaxed);
   c.fog_falloff = g_pgr4_fog_c11[2].load(std::memory_order_relaxed);
   c.fog_height_on = g_pgr4_fog_height_on.load(std::memory_order_relaxed);
+  // Local change (27/11/2026, issue 32, pgr4_native_volumetric_fog_from_engine): the game's fog
+  // from its engine (Pgr4EngineFog: the lighting, Lighting.HeightFog, Shaders.OutputGain, as
+  // sub_823C53A8 and sub_822B40C0 give the scene's draws; equal to the draws' on 10 372 frames of
+  // 10 372 measured), not the copy of one draw (the previous frame's last fog-reading draw: a
+  // copy from another kind of draw laid the fog without its light, the far scene black). The
+  // copy kept where the engine's is not known (no race loaded yet) or with the switch off. Its
+  // exponent's scale (fog_exp2, the shaders' own constant, 1 / ln 2 in all) stays the copy's.
+  float fog_rgb[3] = {c.fog_color[0], c.fog_color[1], c.fog_color[2]};
+  bool fog_from_engine = false;
+  const float copy_c12 = fog_c12;  // the main view's fog draws' c12.y (draw.cpp, main_view)
+  float engine_gain = -1.0f;
+  if (REXCVAR_GET(pgr4_native_volumetric_fog_from_engine)) {
+    float e10[4], e11[3], gain;
+    bool height_on;
+    if (Pgr4EngineFog(e10, e11, gain, height_on)) {
+      fog_from_engine = true;
+      for (int k = 0; k < 3; ++k) fog_rgb[k] = c.fog_color[k] = e10[k];
+      c.fog_distance = e10[3];
+      c.fog_ceiling = e11[0];
+      c.fog_density = e11[1];
+      c.fog_falloff = e11[2];
+      c.fog_height_on = height_on;
+      engine_gain = gain;
+      // Local change (28/11/2026, pgr4_native_volumetric_gain_from_draws): Shaders.OutputGain read
+      // here is the guest's value at this instant, which the game changes within its frame (6 for
+      // the main view at night, 1 for the rear-view mirror drawn at its end) while it runs ahead of
+      // this thread: the lamps' strength (out[2]) took 6 or 1 by runs of frames (Tazz, 28/11: the
+      // road's orange light pool blinking, with frame generation, even paused). The main view's
+      // draws' own c12.y instead, as they had it; the engine's only without a copy yet.
+      fog_c12 = REXCVAR_GET(pgr4_native_volumetric_gain_from_draws) && copy_c12 > 0.0f &&
+                        std::isfinite(copy_c12)
+                    ? copy_c12
+                    : gain;
+    }
+  }
+  if (REXCVAR_GET(pgr4_native_volumetric_fog_c12) && fog_c12 > 0.0f && std::isfinite(fog_c12))
+    for (int k = 0; k < 3; ++k) c.fog_color[k] *= fog_c12;
   c.fog_exp2 = g_pgr4_fog_exp2.load(std::memory_order_relaxed);
   c.variation = float(REXCVAR_GET(pgr4_native_volumetric_fog_variation));
   c.noise_scale = 1.0f / float(REXCVAR_GET(pgr4_native_volumetric_fog_size));
@@ -1873,12 +1967,22 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
     // The fog shaders' c12.y copied: its changes from frame to frame, its range.
     uint64_t c12_changes = 0;
     float c12_lo = 0.0f, c12_hi = 0.0f;
+    // Local change (28/11/2026): every Apply (early and at the resolve): the engine's gain read
+    // against the main view's draws' copy (pgr4_native_volumetric_gain_from_draws).
+    uint64_t gain_reads = 0, gain_off = 0;
+    float gain_lo = 0.0f, gain_hi = 0.0f;
     float gap_max = 0.0f, c5_lo = 0.0f, c5_hi = 0.0f, camera_lo = 0.0f, camera_hi = 0.0f;
     float lo[4], hi[4];  // the exponent's scale, the distance fog, the eye's height, the mist
   };
   static InputsSeen in;
   static bool in_last_replace = false, in_last_sun = false, in_any = false;
   static float in_last_eye = 0.0f, in_last_scale = 0.0f, in_last_c12 = 0.0f;
+  if (g_pgr4_dev && engine_gain >= 0.0f) {  // development only, as its log below
+    in.gain_lo = in.gain_reads ? std::min(in.gain_lo, engine_gain) : engine_gain;
+    in.gain_hi = in.gain_reads ? std::max(in.gain_hi, engine_gain) : engine_gain;
+    ++in.gain_reads;
+    in.gain_off += copy_c12 > 0.0f && std::abs(engine_gain - copy_c12) > 1e-4f;
+  }
   if (!early) {
     const float v[4] = {c.fog_exp2, c.fog_distance, c.eye[1], c.mist_density};
     if (in_any) {
@@ -1942,9 +2046,13 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
                                              : "");
       const bool flicker = in.replace_flips || in.sun_flips || in.eye_jumps || in.scale_changes ||
                            in.c12_changes;
-      REXLOG_INFO("PGR4 native volumetrics c12: the copy changed in {} of {} frames ({:.4f}..{:.4f}){}",
+      REXLOG_INFO("PGR4 native volumetrics c12: the copy changed in {} of {} frames ({:.4f}..{:.4f}){}; "
+                  "the engine's gain read {} times ({:.4f}..{:.4f}), off the main view's draws' in "
+                  "{}{} (the lamps and the fog from the {})",
                   in.c12_changes, in.frames, in.c12_lo, in.c12_hi,
-                  in.c12_changes ? " FLICKER" : "");
+                  in.c12_changes ? " FLICKER" : "", in.gain_reads, in.gain_lo, in.gain_hi,
+                  in.gain_off, in.gain_off ? " ENGINE GAIN OFF" : "",
+                  REXCVAR_GET(pgr4_native_volumetric_gain_from_draws) ? "draws' copy" : "engine");
       REXLOG_INFO("PGR4 native volumetrics camera: the fog draws' in {} of {} frames (draws taken {}, "
                   "not world to clip {}, mirrored {}); up in view {:.3f} {:.3f} {:.3f}; the scene "
                   "camera's centre {:.1f} {:.1f} {:.1f}{}, up {:.3f} {:.3f} {:.3f}",
@@ -1987,14 +2095,48 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
                   temporal_header_[15], temporal_header_[19], temporal_header_[11]);
     }
   }
+  // Development (27/11/2026, issue 32): the values this try works from (its record).
+  if (note.on) {
+    Pgr4FogTry& t = note.t;
+    t.axes = axes_known;
+    t.fog_camera = fog_camera;
+    t.color = t.depth = t.same_target = true;
+    t.w = w;
+    t.h = h;
+    t.color_samples = color->samples;
+    t.depth_samples = depth->samples;
+    t.replace = c.replace;
+    t.height_on = c.fog_height_on;
+    t.fog_exp2 = c.fog_exp2;
+    t.fog_distance = c.fog_distance;
+    t.fog_c12 = fog_c12;
+    t.from_engine = fog_from_engine;
+    for (int k = 0; k < 3; ++k) {
+      t.fog_color[k] = c.fog_color[k];
+      t.eye[k] = c.eye[k];
+    }
+    t.sigma = c.sigma;
+    t.mist = c.mist_density;
+    t.near_plane = c.near_plane;
+    t.far_plane = c.far_plane;
+    t.tan_half[0] = c.tan_half[0];
+    t.tan_half[1] = c.tan_half[1];
+  }
   if (!axes_known || (!c.replace && !(c.sigma > 0.0f) && !(c.mist_density > 0.0f)) || !w || !h ||
-      !EnsureTargets(hw, hh))
+      !EnsureTargets(hw, hh)) {
+    note.t.code = !axes_known ? kFogTryNoAxes
+                  : (!c.replace && !(c.sigma > 0.0f) && !(c.mist_density > 0.0f)) ? kFogTryNothing
+                                                                                  : kFogTryNoSize;
     return false;
+  }
 
   // The volume (columns of 16 x 16 pixels, kSlices deep). Not made (its memory refused): no
   // volumetric fog this frame, the shaders keep the game's fog (volume_frame_ not this frame's).
   const uint32_t columns_x = (w + 15) / 16, columns_y = (h + 15) / 16;  HangStep((early ? 100 : 200) + 1);
-  if (!EnsureVolume(columns_x, columns_y)) return false;
+  if (!EnsureVolume(columns_x, columns_y)) {
+    note.t.code = kFogTryNoVolume;
+    return false;
+  }
   const D3D12_RECT all = {0, 0, LONG(color->width), LONG(color->height)};
   // The cells' fog: last frame's becomes the previous (pgr4_native_volumetric_temporal); here,
   // past the early returns, so that a frame without the pass does not swap them (21/11/2026, the
@@ -2830,8 +2972,25 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
     HangStep((early ? 100 : 200) + 7);
     // The cells' fog (MEDIA): this frame's written, the previous frame's read (both UAVs), then
     // this frame's read by VOLUME.
-    Transition(list, media_[media_now_].Get(), media_state_[media_now_], kWrite);
-    Transition(list, media_[1 - media_now_].Get(), media_state_[1 - media_now_], kWrite);
+    // Local change (28/11/2026, issue 32, pgr4_native_volumetric_media_uav_barrier): the slot
+    // written now was the previous one read as a UAV by the last frame's MEDIA, still in the UAV
+    // state (no transition): a UAV barrier, in the same call as the other slot's transition (the
+    // GPU waits there already).
+    {
+      D3D12_RESOURCE_BARRIER mb[2] = {};
+      UINT mn = 0;
+      for (const uint32_t s : {media_now_, 1u - media_now_}) {
+        if (media_state_[s] != kWrite) {
+          mb[mn++] = TransitionBarrier(media_[s].Get(), media_state_[s], kWrite);
+          media_state_[s] = kWrite;
+        } else if (s == media_now_ && REXCVAR_GET(pgr4_native_volumetric_media_uav_barrier)) {
+          mb[mn].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+          mb[mn++].UAV.pResource = media_[s].Get();
+          ++media_uav_barriers_;
+        }
+      }
+      if (mn) list->ResourceBarrier(mn, mb);
+    }
     list->SetPipelineState(media_pso_.Get());
     list->SetComputeRootDescriptorTable(0, gpu(53));
     list->Dispatch((columns_x + 3) / 4, (columns_y + 3) / 4, kSlices / 4);
@@ -2877,7 +3036,7 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
       s[9] = c.fog_color[1];
       s[10] = c.fog_color[2];
       s[11] = inv_c12;
-      for (int k = 0; k < 3; ++k) s[12 + k] = g_pgr4_fog_c10[k].load(std::memory_order_relaxed);
+      for (int k = 0; k < 3; ++k) s[12 + k] = fog_rgb[k];  // c10.rgb (the engine's or the copy's)
       s[15] = c.replace ? 1.0f : 0.0f;
     }
     share_.frame = key;
@@ -2961,6 +3120,8 @@ bool Volumetrics::Apply(ID3D12GraphicsCommandList* list, RenderTargets& targets,
   if (timer) timer->Pass(list, GpuTimer::KeyEffects(6));
   ID3D12PipelineState* pso = ApplyPipeline(color->view_format, color->samples, debug);
   HangStep((early ? 100 : 200) + 10);
+  // Development (27/11/2026, issue 32): at the resolve, laid on the volume made early, or made here.
+  note.t.code = !pso ? kFogTryNoPipeline : volume_done ? kFogTryLaid : kFogTryMade;
   if (!pso) return true;
   targets.PrepareRead(list, color, all);
   // The grid probe: the scene's colour at its points before the apply (as the shaders left it).
@@ -3163,6 +3324,10 @@ void Volumetrics::GridProbe(ID3D12GraphicsCommandList* list, uint64_t frame, con
         moved = std::sqrt(moved);
         uint32_t n = 0;
         std::string points;
+        // Development (27/11/2026, issue 32): this frame's points compared and their colour's jumps
+        // by way, for the whole scene jumping at once (below).
+        uint32_t frame_compared = 0, frame_darker = 0, frame_brighter = 0;
+        float frame_far = 0.0f;  // the farthest point compared (m)
         for (uint32_t i = 0; i < kPoints; ++i) {
           const GridPoint& a = grid_prev_[i];
           const GridPoint& b = now[i];
@@ -3170,6 +3335,8 @@ void Volumetrics::GridProbe(ID3D12GraphicsCommandList* list, uint64_t frame, con
           const float da = a.depth[1], db = b.depth[1];
           if (!(std::abs(da - db) <= 0.02f * std::max(da, db) + 0.05f)) continue;
           ++st.compared;
+          ++frame_compared;
+          if (std::isfinite(db)) frame_far = std::max(frame_far, db);
           // The colour's jumps, counted only: the scene's colour before the upscaler moves with its
           // sub-pixel jitter (21/11/2026: 1.24, 1.75, 1.22 on one point, the eye still, the fog the
           // same), so they are not the fog's.
@@ -3177,6 +3344,7 @@ void Volumetrics::GridProbe(ID3D12GraphicsCommandList* list, uint64_t frame, con
           if (d > 0.03f && d > 0.35f * std::max(std::min(la, lb), 0.02f)) {
             ++st.colour_jumps;
             ++(lb < la ? st.darker : st.brighter);
+            ++(lb < la ? frame_darker : frame_brighter);
           }
           // The fog's: on the same surface (the game's T within 0.01), our transmittance moving by
           // over 0.03 or the volume's light by over 0.03 and 15 %.
@@ -3198,6 +3366,73 @@ void Volumetrics::GridProbe(ID3D12GraphicsCommandList* list, uint64_t frame, con
                                   a.volume[0], a.volume[1], a.volume[2], b.volume[0], b.volume[1],
                                   b.volume[2], a.add[0], a.add[1], a.add[2], b.add[0], b.add[1],
                                   b.add[2], a.depth[3], b.depth[3]);
+          }
+        }
+        // Development (27/11/2026, issue 32, pgr4_native_volumetric_missing_probe): the scene's
+        // colour jumping one way at 30 % or more of its points (20 at least): the jitter moves a few
+        // points either way (some 3 of 140 a frame, 26/11/2026), the fog gone for a frame most of the
+        // far ones. Logged with the way to the volume of this frame and the one before (draw.cpp).
+        if (Pgr4FogMissingProbe() && frame_compared >= 20) {
+          const uint32_t most = std::max(frame_darker, frame_brighter);
+          static uint32_t jump_logs = 0;
+          static auto jump_last = std::chrono::steady_clock::now();
+          if (const auto t = std::chrono::steady_clock::now(); t - jump_last >= std::chrono::seconds(2)) {
+            jump_last = t;
+            jump_logs = 0;
+          }
+          // One way only (28/11/2026): the other way at most a fifth of it. The upscaler's jitter on
+          // the far scenery in clear weather moves some 30 of 100 points, but both ways (12 to 23
+          // the other way, Tazz's race of 28/11); issue 32's flashes went one way (77/1, 92/0, 46/9,
+          // 43/6).
+          const bool one_way = 5 * std::min(frame_darker, frame_brighter) <= most;
+          if (10 * most >= 3 * frame_compared && one_way && jump_logs < 10) {
+            ++jump_logs;
+            // Development (28/11/2026, issue 32): the jump's points in values, and which side moved.
+            // The scene's colour is what the scene's shaders left (they read the volume per pixel);
+            // our T, To and the volume's light are what the apply read from the volume at the
+            // resolve. The points jumping the main way with the volume the same (T and To within
+            // 0.03, its light within 0.03 or 15 %): the scene's shaders did not get the volume the
+            // apply read (VOLUME THE SAME); with it moved, the volume itself (VOLUME CHANGED).
+            const bool dark_way = frame_darker >= frame_brighter;
+            uint32_t same = 0, moved_volume = 0;
+            std::string jump_points;
+            for (uint32_t i = 0; i < kPoints; ++i) {
+              const GridPoint& a = grid_prev_[i];
+              const GridPoint& b = now[i];
+              if (a.depth[2] > 0.5f || b.depth[2] > 0.5f) continue;
+              const float da = a.depth[1], db = b.depth[1];
+              if (!(std::abs(da - db) <= 0.02f * std::max(da, db) + 0.05f)) continue;
+              const float la = lum(a.colour), lb = lum(b.colour), dl = std::abs(lb - la);
+              const bool jumped = dl > 0.03f && dl > 0.35f * std::max(std::min(la, lb), 0.02f) &&
+                                  (lb < la) == dark_way;
+              const float va = lum(a.volume), vb = lum(b.volume), dv = std::abs(vb - va);
+              const bool volume_same = std::abs(a.fog[1] - b.fog[1]) <= 0.03f &&
+                                       std::abs(a.volume[3] - b.volume[3]) <= 0.03f &&
+                                       (dv <= 0.03f || dv <= 0.15f * std::max(va, vb));
+              if (jumped) ++(volume_same ? same : moved_volume);
+              jump_points += fmt::format(
+                  " | {},{}{} {:.1f} m: colour {:.3f} {:.3f} {:.3f} -> {:.3f} {:.3f} {:.3f}, the game's T "
+                  "{:.3f} -> {:.3f}, ours {:.3f} -> {:.3f}, To {:.3f} -> {:.3f}, the volume's T {:.3f} -> "
+                  "{:.3f}, its light {:.3f} {:.3f} {:.3f} -> {:.3f} {:.3f} {:.3f}, the apply's {:.3f} -> "
+                  "{:.3f}, replace {:.0f} -> {:.0f}",
+                  i % kGridX, i / kGridX, jumped ? (volume_same ? " JUMP, VOLUME SAME," : " JUMP, VOLUME MOVED,") : "",
+                  db, a.colour[0], a.colour[1], a.colour[2], b.colour[0], b.colour[1], b.colour[2],
+                  a.fog[0], b.fog[0], a.fog[1], b.fog[1], a.volume[3], b.volume[3], a.add[3], b.add[3],
+                  a.volume[0], a.volume[1], a.volume[2], b.volume[0], b.volume[1], b.volume[2], lum(a.add),
+                  lum(b.add), a.depth[3], b.depth[3]);
+            }
+            const char* verdict = same >= 4 * moved_volume ? "VOLUME THE SAME (the scene's shaders)"
+                                  : moved_volume >= 4 * same ? "VOLUME CHANGED (the volume itself)"
+                                                             : "VOLUME MIXED";
+            REXLOG_INFO("PGR4 fog missing probe: SCENE JUMP frame {}: {} of {} points {} ({} the other "
+                        "way, up to {:.0f} m), the eye moved {:.2f} m; {}: of the jumping points {} "
+                        "with the volume the same, {} with it moved; the media UAV barrier {} ({} put); "
+                        "the volume's inputs{}; frame {}: {}; frame {}: {}; the points{}",
+                        f, most, frame_compared, dark_way ? "darker" : "brighter",
+                        std::min(frame_darker, frame_brighter), frame_far, moved, verdict, same,
+                        moved_volume, REXCVAR_GET(pgr4_native_volumetric_media_uav_barrier) ? "on" : "off",
+                        media_uav_barriers_, VolumeInputsChanged(f - 1, f), f - 1,
+                        Pgr4FogFrameText(f - 1), f, Pgr4FogFrameText(f), jump_points);
           }
         }
         st.flashes += n;
@@ -3262,12 +3497,15 @@ void Volumetrics::GridProbe(ID3D12GraphicsCommandList* list, uint64_t frame, con
                 "{} frames with 3 or more FOG JUMPS{} ({} with the eye still, "
                 "{} with the fog draws before the volume changed); the centre now: colour {:.3f} {:.3f} {:.3f} at "
                 "{:.1f} m{}, the game's T {:.3f}, ours {:.3f}, ratio {:.3f}, To {:.3f}, the volume's "
-                "light {:.3f} {:.3f} {:.3f}, the apply's {:.3f} {:.3f} {:.3f}, replace {:.0f}{}",
+                "light {:.3f} {:.3f} {:.3f}, the apply's {:.3f} {:.3f} {:.3f}, replace {:.0f}; the media UAV "
+                "barrier {} ({} put){}",
                 st.frames, st.compared, st.colour_jumps, st.darker, st.brighter, st.flashes,
                 st.flash_frames, st.flash_frames ? " FOG JUMPS" : "", st.still_frames, st.order_changed, m.colour[0], m.colour[1],
                 m.colour[2], m.depth[1], m.depth[2] > 0.5f ? " (sky)" : "", m.fog[0], m.fog[1],
                 m.fog[2], m.volume[3], m.volume[0], m.volume[1], m.volume[2], m.add[0], m.add[1],
-                m.add[2], m.depth[3], st.events);
+                m.add[2], m.depth[3],
+                REXCVAR_GET(pgr4_native_volumetric_media_uav_barrier) ? "on" : "off", media_uav_barriers_,
+                st.events);
     st = Stats{};
     {
       std::string bands;

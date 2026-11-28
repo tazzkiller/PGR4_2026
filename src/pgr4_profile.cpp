@@ -62,6 +62,7 @@ REXCVAR_DECLARE(double, pgr4_native_xegtao_intensity);
 REXCVAR_DECLARE(double, pgr4_native_volumetric_light_strength);  // pgr4-native volumetrics.cpp
 REXCVAR_DECLARE(double, pgr4_native_volumetric_light_cone);
 REXCVAR_DECLARE(double, pgr4_native_volumetric_light_cone_around);
+REXCVAR_DECLARE(double, pgr4_native_volumetric_fog_variation);
 // Local change (16/11/2026): the version of the settings in pgr4.toml, for Pgr4MigrateSettings.
 // A change of default reaches a pgr4.toml an earlier version wrote once, then the version is
 // raised: a value the player sets afterwards, the old default included, stays.
@@ -573,7 +574,7 @@ void Pgr4MigrateSettings() {
   // Local change (16/11/2026): each step once, for a pgr4.toml older than it (pgr4_settings_version;
   // pgr4.default.toml has the current one). Before, the steps ran at every start: a player who
   // chose the GTAO's old values again had them replaced at the next.
-  constexpr int32_t kSettingsVersion = 10;
+  constexpr int32_t kSettingsVersion = 12;
   const int32_t from = REXCVAR_GET(pgr4_settings_version);
   if (from >= kSettingsVersion) return;
   if (from < 1) MigrateToVersion1();
@@ -695,6 +696,23 @@ void Pgr4MigrateSettings() {
                 "# XeGTAO in fog: Tazz's tuning as the new default (src/pgr4_profile.cpp).");
     REXLOG_INFO("PGR4 settings: pgr4_native_xegtao_fog in pgr4.toml from \"intensity=0.1 "
                 "falloff=1\" to \"intensity=0.05 falloff=1\"");
+  }
+  // Versions 11 and 12 (28/11/2026): the volumetric fog's banks (pgr4-native volumetrics.cpp).
+  // Version 11 first made them even (Tazz: « nappe variation à zéro corrige bien le problème »), then
+  // the same morning Tazz chose 0.7 (« tu vas mettre 0.70, l'effet est parfait comme ça »). The same
+  // rule as versions 4 and 5: exactly the old default (0.45, which the overlay's save wrote) gets the
+  // new one; and, as version 9, version 11's 0 only for a pgr4.toml brought to version 11 (only the
+  // development build's was).
+  {
+    const double variation = REXCVAR_GET(pgr4_native_volumetric_fog_variation);
+    if ((from < 11 && variation == 0.45) || (from == 11 && variation == 0.0)) {
+      REXCVAR_SET(pgr4_native_volumetric_fog_variation, 0.7);
+      SaveSetting("pgr4_native_volumetric_fog_variation", "0.700000",
+                  "# The volumetric fog's banks: Tazz's choice as the new default "
+                  "(src/pgr4_profile.cpp).");
+      REXLOG_INFO("PGR4 settings: pgr4_native_volumetric_fog_variation in pgr4.toml from {} to 0.7",
+                  variation);
+    }
   }
   REXCVAR_SET(pgr4_settings_version, kSettingsVersion);
   SaveSetting("pgr4_settings_version", std::to_string(kSettingsVersion),

@@ -68,6 +68,14 @@ REXCVAR_DEFINE_BOOL(pgr4_native_streamline_dev_imgui, false, "PGR4 native",
                     "Development: with pgr4_native_streamline_dev_dir, load sl.imgui too (it "
                     "removed the GPU on 17/11/2026)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Local change (28/11/2026): Streamline's 39 (eWarnOutOfVRAM, sl_result.h) is a warning, returned
+// after the work was done (commonInterface.cpp). Taken as an error, slDLSSGSetOptions's turned
+// DLSS-G off for the session: no PCL markers any more, so Streamline stopped recycling its copies
+// of the frames' inputs (recycleTags reads kMarkerPresentFrame) and kept 32 frames of them (about
+// 7 GB at x3 DLAA; 10:17 on 28/11/2026, then a TDR). Read at each frame (upscaler.cpp too).
+REXCVAR_DEFINE_BOOL(pgr4_native_dlss_vram_warning, true, "PGR4 native",
+                    "DLSS and DLSS-G: Streamline's out-of-video-memory warning (39) taken as a "
+                    "warning, the work kept (off: as an error, DLSS-G off for the session)");
 REXCVAR_DEFINE_BOOL(pgr4_native_dlss_fg_debug_generated_only, false, "PGR4 native",
                     "DLSS-G debug: show only the generated frames (DLSSGFlags::"
                     "eShowOnlyInterpolatedFrame)")
@@ -329,7 +337,17 @@ void BeginFrame(uint64_t frame) {
     o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
     if (REXCVAR_GET(pgr4_native_dlss_fg_debug_generated_only))
       o.flags |= sl::DLSSGFlags::eShowOnlyInterpolatedFrame;
-    if (const sl::Result r = slDLSSGSetOptions(sl::ViewportHandle(0), o); r != sl::Result::eOk) {
+    const sl::Result r = slDLSSGSetOptions(sl::ViewportHandle(0), o);
+    // Local change (28/11/2026, pgr4_native_dlss_vram_warning): out of video memory, the generation
+    // stays (and its markers with it); the options are asked again at the next frame.
+    if (r == sl::Result::eWarnOutOfVRAM && REXCVAR_GET(pgr4_native_dlss_vram_warning)) {
+      static uint32_t logged = 0;
+      if (logged++ < 8)
+        REXLOG_WARN("PGR4 native DLSS: slDLSSGSetOptions: out of video memory (39); asked again "
+                    "next frame, frame generation kept");
+      return;
+    }
+    if (r != sl::Result::eOk) {
       REXLOG_ERROR("PGR4 native DLSS: slDLSSGSetOptions failed ({}); no frame generation", int(r));
       g.fg = false;
       return;

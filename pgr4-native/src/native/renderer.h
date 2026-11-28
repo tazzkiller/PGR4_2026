@@ -52,6 +52,7 @@ namespace pgr4::native {
 class D3D12Device;
 class DrawRenderer;
 class FrameGeneration;
+class FgProbe;  // development (28/11/2026)
 class HudlessCapture;
 class Overlay;
 class FramePacer;
@@ -345,6 +346,7 @@ class NativeRenderer {
   std::unique_ptr<HudlessCapture> hudless_capture_;
   std::unique_ptr<Overlay> overlay_;  // local change
   std::unique_ptr<FrameGeneration> frame_generation_;  // --pgr4_native_frame_generation, paced
+  std::unique_ptr<FgProbe> fg_probe_;  // development (28/11/2026): fg_probe.h, made on first use
   // The scene's camera for the FidelityFX effects, found each frame by FindCamera (the defaults
   // until one matches); the upscaler reads it through the pointer set_camera gave it.
   FfxCamera camera_;

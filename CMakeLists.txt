@@ -38,6 +38,7 @@ add_executable(pgr4 WIN32
     src/pgr4_profile.cpp
     src/pgr4_autopilot.cpp
     src/pgr4_freecam.cpp
+    src/pgr4_audio_probe.cpp
     "${PGR4_NATIVE_COMMON}/title_launch.cpp"
     "${PGR4_NATIVE_SRC}/pgr4_d3d_trace.cpp"
     ${PGR4_NATIVE_SOURCES}
@@ -137,6 +138,20 @@ if(TARGET pgr4_recomp)
     target_precompile_headers(pgr4_recomp PRIVATE
         "$<$<PLATFORM_ID:Windows>:<excpt.h$<ANGLE-R>>"
         <rex/platform/exceptions.h>)
+endif()
+
+# Local change (26/11/2026, branch cpu_thread): the recompiled code's guest loads and stores are
+# relaxed atomics (the SDK's pch_h.inja, REX_GUEST_LOAD...). ON gives back the volatile accesses of
+# before (clang's -fms-volatile: each an acquire or a release), the same machine code as before, for
+# A/B builds. Compile-time only: it cannot be switched while the game runs. ON by default since
+# 27/11/2026 (Tazz: no risk taken, the volatile accesses back in the release); OFF for the relaxed ones.
+option(PGR4_VOLATILE_GUEST_ACCESS "Recompiled code: volatile guest memory accesses, as before" ON)
+if(TARGET pgr4_recomp AND PGR4_VOLATILE_GUEST_ACCESS)
+    target_compile_definitions(pgr4_recomp PRIVATE REX_VOLATILE_GUEST_ACCESS)
+endif()
+if(TARGET pgr4_recomp)
+    # Built with the recompiled code's pch and definitions: run.log says which accesses it uses.
+    target_sources(pgr4_recomp PRIVATE src/pgr4_guest_access.cpp)
 endif()
 
 # The release's launcher (src/launcher/launcher.cpp): Direct2D, no SDK; the C++ runtime linked in,

@@ -60,10 +60,10 @@ index 37ccbf2..258ca60 100644
  }  // namespace rex::audio
 diff --git a/include/rex/audio/audio_media_player.h b/include/rex/audio/audio_media_player.h
 new file mode 100644
-index 0000000..d4afcfa
+index 0000000..795160a
 --- /dev/null
 +++ b/include/rex/audio/audio_media_player.h
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,274 @@
 +/**
 + ******************************************************************************
 + * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -91,6 +91,8 @@ index 0000000..d4afcfa
 +#include <vector>
 +
 +#include <rex/audio/audio_driver.h>
++
++struct SDL_AudioStream;  // local change (pgr4 project, 26/11/2026): the music's resampler
 +#include <rex/kernel/xam/apps/xmp_app.h>
 +#include <rex/thread.h>
 +
@@ -291,6 +293,17 @@ index 0000000..d4afcfa
 +  uint64_t capture_handed_ = 0, capture_starved_ = 0;
 +  uint32_t capture_blocks_ = 0, capture_next_ = 0;
 +  bool CaptureFrame(const Request& request, const float* samples);
++  // Local change (pgr4 project, 26/11/2026, xmp_capture_resampler): the song's L and R resampled to
++  // 48 kHz by SDL3's windowed sinc (as its output did before the capture), not linearly; made at the
++  // song's first frame (SetupDriver drops it).
++  SDL_AudioStream* capture_stream_ = nullptr;
++  bool capture_stream_used_ = false;  // the last frame's way (the other one's state then reset)
++  // xmp_capture_float_unclamped: whether the last block handed out was clamped (for the probe).
++  std::atomic<bool> capture_clamped_ = true;
++  std::vector<float> capture_stereo_, capture_resampled_;
++  // ... and its probe (xmp_capture_probe_dir, development).
++  struct CaptureProbe;
++  std::unique_ptr<CaptureProbe> capture_probe_;
 +  std::vector<float> capture_last_;  // the block last handed out, as queued
 +  bool capture_returned_ = false;
 +  uint32_t capture_last_frames_ = 0;
@@ -365,6 +378,188 @@ index 33fd32c..0343ab8 100644
    uint32_t queued_frames_;
  
    std::atomic<bool> worker_running_ = {false};
+diff --git a/include/rex/audio/conversion.h b/include/rex/audio/conversion.h
+index 42cdddb..547df6e 100644
+--- a/include/rex/audio/conversion.h
++++ b/include/rex/audio/conversion.h
+@@ -12,6 +12,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstdint>
+ 
+ #include <rex/assert.h>
+@@ -24,7 +25,7 @@ namespace rex::audio::conversion {
+ #if REX_ARCH_AMD64
+ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
+                                                 size_t ch_sample_count, const SurroundMix& mix,
+-                                                float gain) {
++                                                float gain, bool clamp = true) {
+   // The gain pass below walks the output four floats at a time, and its weight
+   // table assumes 6 channels divide evenly into those windows.
+   assert_true(ch_sample_count % 2 == 0);
+@@ -59,8 +60,10 @@ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* inpu
+   const float l = mix.lfe * gain;
+   const __m128 w[3] = {_mm_setr_ps(gain, gain, c, l), _mm_setr_ps(s, s, gain, gain),
+                        _mm_setr_ps(c, l, s, s)};
+-  const __m128 lo = _mm_set1_ps(-1.0f);
+-  const __m128 hi = _mm_set1_ps(1.0f);
++  // Local change (pgr4 project, 26/11/2026): clamp false leaves the samples above 1 to the output
++  // limiter (audio_soft_limiter), which replaces this hard clip.
++  const __m128 lo = _mm_set1_ps(clamp ? -1.0f : -INFINITY);
++  const __m128 hi = _mm_set1_ps(clamp ? 1.0f : INFINITY);
+   const size_t count = ch_sample_count * 6;
+   for (size_t i = 0, phase = 0; i < count; i += 4, phase = (phase + 1) % 3) {
+     const __m128 v = _mm_mul_ps(_mm_loadu_ps(&output[i]), w[phase]);
+@@ -70,7 +73,7 @@ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* inpu
+ 
+ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* input,
+                                                 size_t ch_sample_count, const StereoFold& fold,
+-                                                float gain) {
++                                                float gain, bool clamp = true) {
+   assert_true(ch_sample_count % 4 == 0);
+ 
+   const __m128i byte_swap_shuffle =
+@@ -79,8 +82,10 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
+   const __m128 lfe = _mm_set1_ps(fold.lfe);
+   const __m128 surround = _mm_set1_ps(fold.surround);
+   const __m128 scale = _mm_set1_ps(fold.scale * gain);
+-  const __m128 lo = _mm_set1_ps(-1.0f);
+-  const __m128 hi = _mm_set1_ps(1.0f);
++  // Local change (pgr4 project, 26/11/2026): clamp false leaves the samples above 1 to the output
++  // limiter (audio_soft_limiter), which replaces this hard clip.
++  const __m128 lo = _mm_set1_ps(clamp ? -1.0f : -INFINITY);
++  const __m128 hi = _mm_set1_ps(clamp ? 1.0f : INFINITY);
+ 
+   for (size_t sample = 0; sample < ch_sample_count; sample += 4) {
+     // load 4 samples from 6 channels each
+@@ -112,20 +117,20 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
+ #else
+ inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
+                                                 size_t ch_sample_count, const SurroundMix& mix,
+-                                                float gain) {
++                                                float gain, bool clamp = true) {
+   const float w[6] = {
+       gain, gain, mix.center * gain, mix.lfe * gain, mix.surround * gain, mix.surround * gain};
+   for (size_t sample = 0; sample < ch_sample_count; sample++) {
+     for (size_t channel = 0; channel < 6; channel++) {
+       const float v = rex::byte_swap(input[channel * ch_sample_count + sample]) * w[channel];
+-      output[sample * 6 + channel] = std::clamp(v, -1.0f, 1.0f);
++      output[sample * 6 + channel] = clamp ? std::clamp(v, -1.0f, 1.0f) : v;
+     }
+   }
+ }
+ 
+ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* input,
+                                                 size_t ch_sample_count, const StereoFold& fold,
+-                                                float gain) {
++                                                float gain, bool clamp = true) {
+   // Default 5.1 channel mapping is fl, fr, fc, lf, bl, br
+   // https://docs.microsoft.com/en-us/windows/win32/xaudio2/xaudio2-default-channel-mapping
+   const float scale = fold.scale * gain;
+@@ -138,8 +143,10 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
+     const float br = rex::byte_swap(input[5 * ch_sample_count + sample]);
+     // Center and LFE land on both sides.
+     const float mid = fc * fold.center + lf * fold.lfe;
+-    output[sample * 2] = std::clamp((fl + mid + bl * fold.surround) * scale, -1.0f, 1.0f);
+-    output[sample * 2 + 1] = std::clamp((fr + mid + br * fold.surround) * scale, -1.0f, 1.0f);
++    const float left = (fl + mid + bl * fold.surround) * scale;
++    const float right = (fr + mid + br * fold.surround) * scale;
++    output[sample * 2] = clamp ? std::clamp(left, -1.0f, 1.0f) : left;
++    output[sample * 2 + 1] = clamp ? std::clamp(right, -1.0f, 1.0f) : right;
+   }
+ }
+ #endif
+diff --git a/include/rex/audio/limiter.h b/include/rex/audio/limiter.h
+new file mode 100644
+index 0000000..9d22bf3
+--- /dev/null
++++ b/include/rex/audio/limiter.h
+@@ -0,0 +1,83 @@
++/**
++ * @file        audio/limiter.h
++ * @brief       Lookahead peak limiter for the device output (local change, pgr4 project)
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
++ *              All rights reserved.
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <vector>
++
++namespace rex::audio {
++
++/**
++ * Local change (pgr4 project, 26/11/2026, docs/audit_audio.md n° 4): a lookahead peak limiter on
++ * the device's output, in place of the hard clip at +-1, the same for every layout (stereo fold,
++ * 5.1 passthrough, a mono device after SDL's collapse).
++ *
++ * Linked across channels, so the image holds, and worked per sample: nothing in it depends on the
++ * frame or the device callback's length, only on the sample rate. The gain a sample needs is
++ * reached by the time that sample plays (ramped over the lookahead), then recovers with the
++ * release. Below the ceiling the gain is exactly 1: a pure delay of the lookahead, bit for bit.
++ *
++ * The gain path: the needed gain (ceiling / peak), released (instant attack, exponential
++ * recovery), held at its minimum over the lookahead, then averaged over the lookahead. The audio
++ * is delayed by the lookahead less one sample, which makes the averaged gain at each sample no
++ * more than the gain that sample needs.
++ */
++class OutputLimiter {
++ public:
++  struct Stats {
++    uint64_t frames = 0;    // sample frames processed
++    uint64_t limited = 0;   // of those, played at a gain below 1
++    uint64_t over = 0;      // samples above 1 coming in (what the hard clip would have cut)
++    uint64_t clamped = 0;   // samples still above 1 going out (the safety clamp; should be 0)
++    uint64_t nonfinite = 0; // NaN or infinite samples coming in (zeroed)
++    float peak_in = 0.0f;
++    float peak_out = 0.0f;
++    float min_gain = 1.0f;
++  };
++
++  static constexpr float kCeiling = 0.96605088f;  // -0.3 dBFS
++  static constexpr double kLookaheadSeconds = 0.0015;
++  static constexpr double kReleaseSeconds = 0.100;
++
++  void Configure(uint32_t rate, uint32_t channels);
++  void Reset();
++  /// Interleaved frames, in place. `stats` may be null.
++  void Process(float* data, uint32_t frames, Stats* stats);
++  uint32_t channels() const { return channels_; }
++  uint32_t lookahead() const { return lookahead_; }
++
++ private:
++  uint32_t rate_ = 0;
++  uint32_t channels_ = 0;
++  uint32_t lookahead_ = 0;  // L: hold and average length; the audio is delayed by L - 1
++  double release_ = 0.0;    // per-sample recovery coefficient
++  double envelope_ = 1.0;
++
++  // Hold: monotonic deque of (value, index) over the last L envelope values.
++  std::vector<double> hold_value_;
++  std::vector<uint64_t> hold_index_;
++  uint32_t hold_head_ = 0, hold_size_ = 0;
++  uint64_t index_ = 0;
++
++  // Average: the last L held values and their sum; non_unity_ counts those below 1, so a run of
++  // ones gives exactly 1 whatever the sum's rounding.
++  std::vector<double> box_;
++  uint32_t box_pos_ = 0;
++  double box_sum_ = 0.0;
++  uint32_t non_unity_ = 0;
++
++  // Delay line: L - 1 frames of interleaved samples.
++  std::vector<float> delay_;
++  uint32_t delay_pos_ = 0;
++};
++
++}  // namespace rex::audio
 diff --git a/include/rex/audio/nop/nop_audio_system.h b/include/rex/audio/nop/nop_audio_system.h
 index e2a1fc2..7f7be1b 100644
 --- a/include/rex/audio/nop/nop_audio_system.h
@@ -378,6 +573,48 @@ index e2a1fc2..7f7be1b 100644
    void DestroyDriver(AudioDriver* driver) override;
  };
  
+diff --git a/include/rex/audio/output_probe.h b/include/rex/audio/output_probe.h
+new file mode 100644
+index 0000000..7e7408f
+--- /dev/null
++++ b/include/rex/audio/output_probe.h
+@@ -0,0 +1,36 @@
++/**
++ * @file        audio/output_probe.h
++ * @brief       Development probe of the device output (local change, pgr4 project)
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
++ *              All rights reserved.
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <functional>
++#include <string>
++
++namespace rex::audio {
++
++/// Development (audio_output_probe_dir set): the device output's probe is on.
++bool OutputProbeEnabled();
++
++/// Values a title adds to the output probe's line, asked every 10 s from the device's callback
++/// thread. Empty function: none.
++void SetOutputProbeExtra(std::function<std::string()> extra);
++
++/// XMA voices started with subframes to skip (apu_xma_start_skip): starts seen since the last
++/// call, by the number of subframes the title asked to skip (0 to 4, more counted in 4), and how
++/// many were applied. Read and reset by the output probe.
++struct XmaStartSkipCounts {
++  std::array<uint64_t, 5> asked = {};
++  uint64_t applied = 0;
++};
++XmaStartSkipCounts TakeXmaStartSkipCounts();
++
++}  // namespace rex::audio
 diff --git a/include/rex/audio/pacing_audio_driver.h b/include/rex/audio/pacing_audio_driver.h
 new file mode 100644
 index 0000000..73a29a1
@@ -453,18 +690,26 @@ index 0000000..73a29a1
 +
 +}  // namespace rex::audio
 diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
-index f8949ca..21867b0 100644
+index f8949ca..6b71656 100644
 --- a/include/rex/audio/sdl/sdl_audio_driver.h
 +++ b/include/rex/audio/sdl/sdl_audio_driver.h
-@@ -11,6 +11,7 @@
+@@ -11,11 +11,15 @@
  
  #pragma once
  
 +#include <atomic>
++#include <memory>
  #include <mutex>
  #include <queue>
  #include <stack>
-@@ -24,28 +25,41 @@ namespace rex::audio::sdl {
++#include <vector>
+ 
+ #include <rex/audio/audio_driver.h>
++#include <rex/audio/limiter.h>
+ #include <rex/thread.h>
+ 
+ #include <SDL3/SDL.h>
+@@ -24,31 +28,53 @@ namespace rex::audio::sdl {
  
  class SDLAudioDriver : public AudioDriver {
   public:
@@ -515,6 +760,18 @@ index f8949ca..21867b0 100644
    std::queue<float*> frames_queued_ = {};
    std::stack<float*> frames_unused_ = {};
    std::mutex frames_mutex_ = {};
++
++  // Local change (pgr4 project, 26/11/2026, docs/audit_audio.md n° 3 and 4): the output limiter
++  // (audio_soft_limiter) and the development probe of the output (audio_output_probe_dir). Only
++  // touched by the device callback.
++  OutputLimiter limiter_;
++  bool limiter_on_ = false;
++  struct OutputProbe;
++  std::unique_ptr<OutputProbe> output_probe_;
++  std::vector<float> probe_scratch_;
+ };
+ 
+ }  // namespace rex::audio::sdl
 diff --git a/include/rex/audio/sdl/sdl_audio_system.h b/include/rex/audio/sdl/sdl_audio_system.h
 index 471149c..a2dd5cd 100644
 --- a/include/rex/audio/sdl/sdl_audio_system.h
@@ -529,7 +786,7 @@ index 471149c..a2dd5cd 100644
  
   protected:
 diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
-index 8426798..6816881 100644
+index 8426798..c4e2895 100644
 --- a/include/rex/audio/xma/context.h
 +++ b/include/rex/audio/xma/context.h
 @@ -62,6 +62,9 @@ struct XMA_CONTEXT_DATA {
@@ -542,6 +799,19 @@ index 8426798..6816881 100644
    uint32_t loop_subframe_end : 2;             // +12bit, XMAPlaybackSetLoop
                                                // dwLoopSubframeEnd: last loop frame
                                                // plays subframes 0..end
+@@ -306,6 +309,12 @@ class XmaContext {
+   bool carry_valid_ = false;
+   uint8_t pending_output_limit_ = 0;
+   uint8_t pending_start_skip_ = 0;
++
++  // Local change (pgr4 project, 26/11/2026, D3): a voice's start, seen at a reset or when the
++  // title moved the input read offset from where this decoder left it; its first decoded frame
++  // skips the subframes the title asked for (apu_xma_start_skip).
++  bool voice_start_pending_ = true;
++  uint32_t last_stored_read_offset_ = 0xFFFFFFFFu;
+ };
+ 
+ }  // namespace rex::audio
 diff --git a/include/rex/audio/xma/decoder.h b/include/rex/audio/xma/decoder.h
 index df00f06..97a8b3f 100644
 --- a/include/rex/audio/xma/decoder.h
@@ -2091,22 +2361,79 @@ index afb4a30..7c2aa06 100644
    // Ordered by the Z order, and then by the time of addition.
    // Note: All the iteration logic involving this Z ordering must be the same as
    // in input handling (in the input listeners in the Window), but in reverse.
+diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
+index 68274d2..d56cb53 100644
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -132,17 +132,42 @@ extern PPCFuncMapping PPCFuncMappings[];
+ 
+ #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
+ 
+-#define REX_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+-#define REX_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+-#define REX_LOAD_U32(x) __builtin_bswap32(*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+-#define REX_LOAD_U64(x) __builtin_bswap64(*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
++// Local change (26/11/2026, pgr4 branch cpu_thread; after ReXenon, the XenonRecomp fork of the FM2 and
++// PGR4-ReGPU ports): the guest's scalar loads and stores as relaxed atomics. clang targeting MSVC
++// compiles volatile with -fms-volatile, each volatile load an acquire and each store a release, so no
++// ctx register could be kept across a guest access. The console's CPU is weakly ordered: the order
++// between threads comes from the guest's own barriers, translated as fences (sync and eieio seq_cst,
++// lwsync acq_rel) and stwcx. as an acq_rel compare-exchange; relaxed atomics are what those fences
++// order. Vector accesses (lvx, lvlx, lvrx, stvx) become volatile, so they are never merged, removed or
++// reused across the relaxed scalar ones (a 16-byte volatile is a plain volatile under -fms-volatile,
++// wider than a pointer); lwarx's load is a relaxed atomic. REX_VOLATILE_GUEST_ACCESS (pgr4: the CMake
++// option PGR4_VOLATILE_GUEST_ACCESS) gives back the accesses as before: volatile scalars, plain vector
++// and lwarx loads.
++#if defined(REX_VOLATILE_GUEST_ACCESS)
++#define REX_GUEST_LOAD(T, p) (*(volatile T*)(p))
++#define REX_GUEST_STORE(T, p, v) (*(volatile T*)(p) = (v))
++#define REX_GUEST_VLOAD(p) simde_mm_load_si128((simde__m128i*)(p))
++#define REX_GUEST_VSTORE(p, v) simde_mm_store_si128((simde__m128i*)(p), (v))
++#define REX_GUEST_RESERVE_LOAD(T, p) (*(T*)(p))
++#else
++#define REX_GUEST_LOAD(T, p) __atomic_load_n((T*)(p), __ATOMIC_RELAXED)
++#define REX_GUEST_STORE(T, p, v) __atomic_store_n((T*)(p), (T)(v), __ATOMIC_RELAXED)
++#define REX_GUEST_VLOAD(p) (*(volatile simde__m128i*)(p))
++#define REX_GUEST_VSTORE(p, v) (*(volatile simde__m128i*)(p) = (v))
++#define REX_GUEST_RESERVE_LOAD(T, p) __atomic_load_n((T*)(p), __ATOMIC_RELAXED)
++#endif
++
++#define REX_LOAD_U8(x) REX_GUEST_LOAD(u8, REX_RAW_ADDR(x))
++#define REX_LOAD_U16(x) __builtin_bswap16(REX_GUEST_LOAD(u16, REX_RAW_ADDR(x)))
++#define REX_LOAD_U32(x) __builtin_bswap32(REX_GUEST_LOAD(u32, REX_RAW_ADDR(x)))
++#define REX_LOAD_U64(x) __builtin_bswap64(REX_GUEST_LOAD(u64, REX_RAW_ADDR(x)))
+ #define REX_LOAD_STRING(x, len) \
+   std::string_view(reinterpret_cast<const char*>(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)), (len))
+ 
+-#define REX_STORE_U8(x, y)  (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = (y))
+-#define REX_STORE_U16(x, y) (*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap16(y))
+-#define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
+-#define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
++#define REX_STORE_U8(x, y)  REX_GUEST_STORE(u8, REX_RAW_ADDR(x), (y))
++#define REX_STORE_U16(x, y) REX_GUEST_STORE(u16, REX_RAW_ADDR(x), __builtin_bswap16(y))
++#define REX_STORE_U32(x, y) REX_GUEST_STORE(u32, REX_RAW_ADDR(x), __builtin_bswap32(y))
++#define REX_STORE_U64(x, y) REX_GUEST_STORE(u64, REX_RAW_ADDR(x), __builtin_bswap64(y))
+ 
+ #define REX_MEMORY_SIZE 0x100000000ull
+ 
 diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
-index d55f16a..5042d44 100644
+index d55f16a..716324d 100644
 --- a/src/audio/CMakeLists.txt
 +++ b/src/audio/CMakeLists.txt
-@@ -4,8 +4,10 @@
+@@ -4,8 +4,12 @@
  add_library(rexaudio OBJECT
      
      audio_driver.cpp
 +    audio_media_player.cpp
      audio_system.cpp
      downmix.cpp
++    limiter.cpp
++    mmcss.cpp  # local change (pgr4 project, 28/11/2026)
 +    pacing_audio_driver.cpp
      xma_context.cpp
      xma_decoder.cpp
      xma_register_file.cpp
-@@ -37,5 +39,5 @@ target_include_directories(rexaudio PUBLIC
+@@ -37,5 +41,5 @@ target_include_directories(rexaudio PUBLIC
  
  target_link_libraries(rexaudio
      PUBLIC rexcore SDL3::SDL3
@@ -2128,10 +2455,10 @@ index f01eb6a..765d0da 100644
  }  // namespace rex::audio
 diff --git a/src/audio/audio_media_player.cpp b/src/audio/audio_media_player.cpp
 new file mode 100644
-index 0000000..3120624
+index 0000000..c97f683
 --- /dev/null
 +++ b/src/audio/audio_media_player.cpp
-@@ -0,0 +1,982 @@
+@@ -0,0 +1,1176 @@
 +/**
 + ******************************************************************************
 + * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -2171,6 +2498,14 @@ index 0000000..3120624
 +#pragma warning(push)
 +#pragma warning(disable : 4101 4244 5033)
 +#endif
++#include <SDL3/SDL_audio.h>
++#include <SDL3/SDL_error.h>
++
++#include <cstdio>
++#include <filesystem>
++
++#include <fmt/format.h>
++
 +#include "libavcodec/avcodec.h"
 +#include "libavformat/avformat.h"
 +#include "libavformat/avio.h"
@@ -2188,6 +2523,28 @@ index 0000000..3120624
 +                     "The samples handed to the title (xmp_capture_output), each block 2048 bytes of 48 kHz "
 +                     "stereo: 0 16-bit big-endian, 1 16-bit little-endian, 2 float big-endian, 3 float "
 +                     "little-endian (local change, pgr4 project; live)");
++// Local change (pgr4 project, 26/11/2026, docs/audit_audio.md n° 1): the music the title captures
++// (44.1 kHz WMA) resampled to 48 kHz by SDL3's windowed sinc, as SDL's output did before the capture
++// (14/11/2026), not by the linear interpolation that dulled the highs (-1.5 dB at 10 kHz, -3.4 dB
++// at 15 kHz) and folded them back (-11.5 dB). Read at each decoded frame (live).
++REXCVAR_DEFINE_BOOL(xmp_capture_resampler, true, "Audio",
++                    "The captured music resampled to 48 kHz by SDL3's sinc resampler; off: linear "
++                    "interpolation (local change, pgr4 project; live)");
++// Local change (pgr4 project, 26/11/2026, docs/audit_audio.md n° 2): the music handed to the title
++// as floats (xmp_capture_format 2 and 3) left unclamped. 36 of the 58 songs decode above 0 dBFS
++// (up to +1.74 dB), and the title lowers the music by 4.4 dB at least (0.6 x setting^2) before its
++// mix: the clamp at +-1 cut peaks the title's own volume would have kept. The 16-bit formats keep
++// it, which they need. The output stage still bounds what reaches the device. Read at each block.
++REXCVAR_DEFINE_BOOL(xmp_capture_float_unclamped, true, "Audio",
++                    "The captured music handed to the title as floats without the clamp at +-1 "
++                    "(local change, pgr4 project; live)");
++// Development: the capture's probe, empty for none (never in a release). Every 10 s, in values: the
++// way, the song's rate and channels, frames in and out against the expected ratio (FAULT beyond
++// 0.2 %), the queue, the starvations, the peak and the samples over 1 before TakeCaptureBlock's
++// clamp, SDL's errors; and the music handed out as 48 kHz stereo float WAVs in this folder (30 s
++// each, a new one at each change of way or song, 16 at most a session).
++REXCVAR_DEFINE_STRING(xmp_capture_probe_dir, "", "Audio",
++                      "Development: the music capture's probe folder (log and WAVs); empty: off");
 +REXCVAR_DEFINE_DOUBLE(xmp_default_volume, 0.7, "Audio",
 +                      "Music Player volume (0.0-1.0) until the title sets one. Stands in for "
 +                      "the dashboard music volume setting, which defaults to 0.7.");
@@ -2302,6 +2659,59 @@ index 0000000..3120624
 +
 +}  // namespace
 +
++// Local change (pgr4 project, 26/11/2026): xmp_capture_probe_dir's probe.
++struct AudioMediaPlayer::CaptureProbe {
++  std::FILE* wav = nullptr;
++  uint64_t wav_frames = 0;
++  uint32_t wav_count = 0;
++  bool wav_way = false;
++  uint64_t in_frames = 0, out_frames = 0, overs = 0, sdl_errors = 0;
++  uint64_t starved_at = 0;
++  float peak = 0.0f;
++  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++
++  void CloseWav() {
++    if (!wav) return;
++    // RIFF and data sizes, patched at the end.
++    const uint32_t data = uint32_t(wav_frames * 8), riff = 36 + data;
++    std::fseek(wav, 4, SEEK_SET);
++    std::fwrite(&riff, 4, 1, wav);
++    std::fseek(wav, 40, SEEK_SET);
++    std::fwrite(&data, 4, 1, wav);
++    std::fclose(wav);
++    wav = nullptr;
++  }
++  void OpenWav(const std::string& dir, bool way, uint32_t rate) {
++    CloseWav();
++    if (wav_count >= 16) return;
++    std::error_code ec;
++    std::filesystem::create_directories(dir, ec);
++    const std::string path = fmt::format("{}/xmp_capture_{:02}_{}_{}hz.wav", dir, wav_count++,
++                                         way ? "sdl" : "linear", rate);
++    wav = std::fopen(path.c_str(), "wb");
++    wav_frames = 0;
++    wav_way = way;
++    if (!wav) return;
++    // A 44-byte header: IEEE float (3), 2 channels, 48 kHz, 32 bits.
++    const uint32_t fmt_size = 16, rate48 = 48000, bytes_per_s = 48000 * 8, zero = 0;
++    const uint16_t format = 3, channels = 2, align = 8, bits = 32;
++    std::fwrite("RIFF", 1, 4, wav);
++    std::fwrite(&zero, 4, 1, wav);
++    std::fwrite("WAVEfmt ", 1, 8, wav);
++    std::fwrite(&fmt_size, 4, 1, wav);
++    std::fwrite(&format, 2, 1, wav);
++    std::fwrite(&channels, 2, 1, wav);
++    std::fwrite(&rate48, 4, 1, wav);
++    std::fwrite(&bytes_per_s, 4, 1, wav);
++    std::fwrite(&align, 2, 1, wav);
++    std::fwrite(&bits, 2, 1, wav);
++    std::fwrite("data", 1, 4, wav);
++    std::fwrite(&zero, 4, 1, wav);
++    REXAPU_INFO("AudioMediaPlayer: capture probe: recording {}", path);
++  }
++  ~CaptureProbe() { CloseWav(); }
++};
++
 +AudioMediaPlayer::AudioMediaPlayer(AudioSystem* audio_system, system::KernelState* kernel_state)
 +    : volume_(static_cast<float>(std::clamp(REXCVAR_GET(xmp_default_volume), 0.0, 1.0))),
 +      audio_system_(audio_system),
@@ -2309,6 +2719,10 @@ index 0000000..3120624
 +
 +AudioMediaPlayer::~AudioMediaPlayer() {
 +  Shutdown();
++  if (capture_stream_) {  // local change (pgr4 project, 26/11/2026)
++    SDL_DestroyAudioStream(capture_stream_);
++    capture_stream_ = nullptr;
++  }
 +}
 +
 +void AudioMediaPlayer::Setup() {
@@ -2964,18 +3378,114 @@ index 0000000..3120624
 +  }
 +  const uint32_t channels = std::max<uint32_t>(capture_channels_, 1);
 +  const uint32_t frames = AudioDriver::kFrameSamplesMax / channels;
-+  const double step = double(capture_rate_) / 48000.0;
-+  for (uint32_t f = 0; f < frames; ++f) {
-+    const float l = samples[f * channels], r = channels > 1 ? samples[f * channels + 1] : l;
-+    while (capture_phase_ < 1.0) {
-+      const float k = float(capture_phase_);
-+      capture_fifo_.push_back(capture_previous_[0] + (l - capture_previous_[0]) * k);
-+      capture_fifo_.push_back(capture_previous_[1] + (r - capture_previous_[1]) * k);
-+      capture_phase_ += step;
++  const size_t queued_before = capture_fifo_.size();
++  // Local change (pgr4 project, 26/11/2026, xmp_capture_resampler): SDL3's sinc resampler; the
++  // linear way below when off, or when the stream cannot be made. Each way starts clean when taken
++  // over from the other.
++  bool sdl = REXCVAR_GET(xmp_capture_resampler);
++  uint64_t sdl_errors = 0;
++  if (sdl && !capture_stream_) {
++    const SDL_AudioSpec src = {SDL_AUDIO_F32, 2, int(capture_rate_)};
++    const SDL_AudioSpec dst = {SDL_AUDIO_F32, 2, 48000};
++    capture_stream_ = SDL_CreateAudioStream(&src, &dst);
++    if (!capture_stream_) {
++      static bool warned = false;
++      if (!std::exchange(warned, true))
++        REXAPU_WARN("AudioMediaPlayer: capture: no SDL resampler ({}), linear instead", SDL_GetError());
++      ++sdl_errors;
 +    }
-+    capture_phase_ -= 1.0;
-+    capture_previous_[0] = l;
-+    capture_previous_[1] = r;
++  }
++  sdl = sdl && capture_stream_;
++  if (sdl != capture_stream_used_) {
++    if (sdl) {
++      SDL_ClearAudioStream(capture_stream_);
++    } else {
++      capture_phase_ = 0.0;
++      capture_previous_[0] = samples[0];
++      capture_previous_[1] = channels > 1 ? samples[1] : samples[0];
++    }
++    capture_stream_used_ = sdl;
++  }
++  if (sdl) {
++    // The song's L and R, as the linear way takes them (mono: L = R).
++    capture_stereo_.resize(size_t(frames) * 2);
++    for (uint32_t f = 0; f < frames; ++f) {
++      capture_stereo_[2 * f] = samples[f * channels];
++      capture_stereo_[2 * f + 1] = channels > 1 ? samples[f * channels + 1] : samples[f * channels];
++    }
++    if (!SDL_PutAudioStreamData(capture_stream_, capture_stereo_.data(), int(frames * 8))) ++sdl_errors;
++    const int available = SDL_GetAudioStreamAvailable(capture_stream_);
++    if (available > 0) {
++      capture_resampled_.resize(size_t(available) / 4);
++      const int got = SDL_GetAudioStreamData(capture_stream_, capture_resampled_.data(), available);
++      if (got < 0) {
++        ++sdl_errors;
++      } else {
++        capture_fifo_.insert(capture_fifo_.end(), capture_resampled_.begin(),
++                             capture_resampled_.begin() + (got / 8) * 2);
++      }
++    } else if (available < 0) {
++      ++sdl_errors;
++    }
++  } else {
++    const double step = double(capture_rate_) / 48000.0;
++    for (uint32_t f = 0; f < frames; ++f) {
++      const float l = samples[f * channels], r = channels > 1 ? samples[f * channels + 1] : l;
++      while (capture_phase_ < 1.0) {
++        const float k = float(capture_phase_);
++        capture_fifo_.push_back(capture_previous_[0] + (l - capture_previous_[0]) * k);
++        capture_fifo_.push_back(capture_previous_[1] + (r - capture_previous_[1]) * k);
++        capture_phase_ += step;
++      }
++      capture_phase_ -= 1.0;
++      capture_previous_[0] = l;
++      capture_previous_[1] = r;
++    }
++  }
++  // Development: the probe (xmp_capture_probe_dir), on what this frame queued.
++  const std::string probe_dir = REXCVAR_GET(xmp_capture_probe_dir);
++  if (!probe_dir.empty()) {
++    if (!capture_probe_) capture_probe_ = std::make_unique<CaptureProbe>();
++    CaptureProbe& p = *capture_probe_;
++    p.in_frames += frames;
++    p.sdl_errors += sdl_errors;
++    const size_t added = capture_fifo_.size() - queued_before;
++    p.out_frames += added / 2;
++    for (size_t i = queued_before; i < capture_fifo_.size(); ++i) {
++      const float a = std::abs(capture_fifo_[i]);
++      p.peak = std::max(p.peak, a);
++      p.overs += a > 1.0f;
++    }
++    if (!p.wav || p.wav_way != sdl || p.wav_frames >= 48000ull * 30) {
++      if (!p.wav || p.wav_way != sdl) p.OpenWav(probe_dir, sdl, capture_rate_);
++      else p.CloseWav();
++    }
++    if (p.wav) {
++      for (size_t i = queued_before; i < capture_fifo_.size(); ++i) {
++        const float v = capture_fifo_[i];
++        std::fwrite(&v, 4, 1, p.wav);
++      }
++      p.wav_frames += added / 2;
++    }
++    const auto now = std::chrono::steady_clock::now();
++    if (now - p.last >= std::chrono::seconds(10) && p.in_frames) {
++      p.last = now;
++      const double expected = 48000.0 / double(std::max<uint32_t>(capture_rate_, 1));
++      const double ratio = double(p.out_frames) / double(p.in_frames);
++      const bool ratio_fault = p.in_frames >= capture_rate_ && std::abs(ratio / expected - 1.0) > 0.002;
++      REXAPU_INFO(
++          "AudioMediaPlayer: capture probe over 10 s: {} resampler, song {} Hz {} channels, frames in "
++          "{} out {} (ratio {:.5f}, expected {:.5f}){}, queued {} frames, starved {} (+{}), peak "
++          "{:.4f}, {} samples over 1 ({}), SDL errors {}{}",
++          sdl ? "SDL3 sinc" : "linear", capture_rate_, channels, p.in_frames, p.out_frames, ratio,
++          expected, ratio_fault ? " FAULT: ratio off" : "", capture_fifo_.size() / 2,
++          capture_starved_, capture_starved_ - p.starved_at, p.peak, p.overs,
++          capture_clamped_ ? "clamped" : "kept, float unclamped", p.sdl_errors,
++          p.sdl_errors ? " FAULT: SDL errors" : "");
++      p.starved_at = capture_starved_;
++      p.in_frames = p.out_frames = p.overs = p.sdl_errors = 0;
++      p.peak = 0.0f;
++    }
 +  }
 +  return true;
 +}
@@ -3032,8 +3542,11 @@ index 0000000..3120624
 +  const uint32_t address = capture_blocks_ + (capture_next_++ % kSlots) * kBytes;
 +  auto* out = memory->TranslateVirtual<uint8_t*>(address);
 +  capture_last_.assign(capture_fifo_.begin(), capture_fifo_.begin() + kFrames * 2);
++  const bool clamp = format < 2 || !REXCVAR_GET(xmp_capture_float_unclamped);
++  capture_clamped_ = clamp;
 +  for (uint32_t i = 0; i < kFrames * 2; ++i) {
-+    const float v = std::clamp(capture_fifo_.front(), -1.0f, 1.0f);
++    const float v =
++        clamp ? std::clamp(capture_fifo_.front(), -1.0f, 1.0f) : capture_fifo_.front();
 +    capture_fifo_.pop_front();
 +    if (format < 2) {
 +      const int16_t s = int16_t(std::lround(v * 32767.0f));
@@ -3068,6 +3581,14 @@ index 0000000..3120624
 +    capture_phase_ = 0.0;
 +    capture_previous_[0] = capture_previous_[1] = 0.0f;
 +    capture_fifo_.clear();
++    // Local change (26/11/2026): the resampler made again for the song's rate at its first frame,
++    // and the probe's recording started over with it.
++    if (capture_stream_) {
++      SDL_DestroyAudioStream(capture_stream_);
++      capture_stream_ = nullptr;
++    }
++    capture_stream_used_ = false;
++    if (capture_probe_) capture_probe_->CloseWav();
 +  }
 +
 +  std::lock_guard<std::mutex> guard(driver_mutex_);
@@ -3115,18 +3636,41 @@ index 0000000..3120624
 +
 +}  // namespace rex::audio
 diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
-index 7a711a8..4402176 100644
+index 7a711a8..838b2cb 100644
 --- a/src/audio/audio_system.cpp
 +++ b/src/audio/audio_system.cpp
-@@ -11,6 +11,7 @@
+@@ -9,8 +9,11 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
  
++#include <climits>
++
  #include <rex/assert.h>
  #include <rex/audio/audio_driver.h>
 +#include <rex/audio/audio_media_player.h>
  #include <rex/audio/audio_system.h>
  #include <rex/audio/flags.h>
  #include <rex/audio/xma/decoder.h>
-@@ -93,6 +94,9 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
+@@ -24,9 +27,18 @@
+ #include <rex/thread.h>
+ #include <rex/cvar.h>
+ 
++#include "mmcss.h"  // local change (28/11/2026)
++
+ REXCVAR_DEFINE_INT32(
+     audio_maxqframes, 8, "Audio",
+     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
++// Local change (pgr4 project, 26/11/2026, docs/audit_audio.md n° 7): the Audio Worker thread, which
++// runs the title's audio callback and hands its frames to the device, above normal priority, so a
++// shader compile or a load sharing the processor delays it less (a frame late is a frame of
++// silence, a crackle). Off: normal, as before. Read at each pass of the worker (live).
++REXCVAR_DEFINE_BOOL(audio_worker_priority, true, "Audio",
++                    "The Audio Worker thread above normal priority (local change, pgr4 project; "
++                    "live)");
+ 
+ // As with normal Microsoft, there are like twelve different ways to access
+ // the audio APIs. Early games use XMA*() methods almost exclusively to touch
+@@ -93,6 +105,9 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
    worker_thread_->set_name("Audio Worker");
    worker_thread_->Create();
  
@@ -3136,7 +3680,28 @@ index 7a711a8..4402176 100644
    return X_STATUS_SUCCESS;
  }
  
-@@ -148,6 +152,19 @@ void AudioSystem::WorkerThreadMain() {
+@@ -102,7 +117,20 @@ void AudioSystem::WorkerThreadMain() {
+ 
+   // Main run loop.
+   uint32_t diag_pump_count = 0;
++  int32_t worker_priority = INT32_MIN;
++  MmcssState mmcss;
+   while (worker_running_) {
++    // Local change (pgr4 project, 26/11/2026): audio_worker_priority, live.
++    if (const int32_t wanted = REXCVAR_GET(audio_worker_priority)
++                                   ? rex::thread::ThreadPriority::kAboveNormal
++                                   : rex::thread::ThreadPriority::kNormal;
++        wanted != worker_priority && worker_thread_ && worker_thread_->thread()) {
++      worker_thread_->thread()->set_priority(wanted);
++      worker_priority = wanted;
++      REXAPU_INFO("AudioWorker: thread priority {} ({})", wanted,
++                  REXCVAR_GET(audio_worker_priority) ? "above normal" : "normal");
++    }
++    MmcssFollow(mmcss, "AudioWorker");  // local change (28/11/2026): audio_mmcss, live
+     // These handles signify the number of submitted samples. Once we reach
+     // 64 samples, we wait until our audio backend releases a semaphore
+     // (signaling a sample has finished playing)
+@@ -148,6 +176,19 @@ void AudioSystem::WorkerThreadMain() {
          uint64_t args[] = {client_callback_arg};
          function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                        rex::countof(args));
@@ -3156,7 +3721,15 @@ index 7a711a8..4402176 100644
          if (diag_pump_count < 10) {
            REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
          }
-@@ -187,6 +204,11 @@ int AudioSystem::FindFreeClient() {
+@@ -169,6 +210,7 @@ void AudioSystem::WorkerThreadMain() {
+     }
+   }
+   worker_running_ = false;
++  MmcssLeave(mmcss, "AudioWorker");
+ 
+   // TODO(benvanik): call module API to kill?
+ }
+@@ -187,6 +229,11 @@ int AudioSystem::FindFreeClient() {
  void AudioSystem::Initialize() {}
  
  void AudioSystem::Shutdown() {
@@ -3168,7 +3741,7 @@ index 7a711a8..4402176 100644
    if (!worker_running_) {
      return;
    }
-@@ -273,7 +295,7 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+@@ -273,7 +320,7 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
    auto global_lock = global_critical_region_.Acquire();
    assert_true(index < kMaximumClientCount);
    assert_true(clients_[index].driver != NULL);
@@ -3177,6 +3750,233 @@ index 7a711a8..4402176 100644
  }
  
  void AudioSystem::UnregisterClient(size_t index) {
+diff --git a/src/audio/limiter.cpp b/src/audio/limiter.cpp
+new file mode 100644
+index 0000000..cbfcdd3
+--- /dev/null
++++ b/src/audio/limiter.cpp
+@@ -0,0 +1,108 @@
++/**
++ * @file        audio/limiter.cpp
++ * @brief       Lookahead peak limiter for the device output (local change, pgr4 project)
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
++ *              All rights reserved.
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++#include <algorithm>
++#include <cmath>
++
++#include <rex/audio/limiter.h>
++
++namespace rex::audio {
++
++void OutputLimiter::Configure(uint32_t rate, uint32_t channels) {
++  rate_ = std::max<uint32_t>(rate, 8000);
++  channels_ = std::clamp<uint32_t>(channels, 1, 8);
++  lookahead_ = std::max<uint32_t>(2, uint32_t(std::lround(rate_ * kLookaheadSeconds)));
++  release_ = 1.0 - std::exp(-1.0 / (kReleaseSeconds * rate_));
++  hold_value_.assign(lookahead_ + 1, 1.0);
++  hold_index_.assign(lookahead_ + 1, 0);
++  box_.assign(lookahead_, 1.0);
++  delay_.assign(size_t(lookahead_ - 1) * channels_, 0.0f);
++  Reset();
++}
++
++void OutputLimiter::Reset() {
++  envelope_ = 1.0;
++  hold_head_ = hold_size_ = 0;
++  index_ = 0;
++  std::fill(box_.begin(), box_.end(), 1.0);
++  box_pos_ = 0;
++  box_sum_ = double(lookahead_);
++  non_unity_ = 0;
++  std::fill(delay_.begin(), delay_.end(), 0.0f);
++  delay_pos_ = 0;
++}
++
++void OutputLimiter::Process(float* data, uint32_t frames, Stats* stats) {
++  if (!lookahead_ || !channels_) return;
++  const uint32_t capacity = lookahead_ + 1;
++  const uint32_t delay_frames = lookahead_ - 1;
++  for (uint32_t f = 0; f < frames; ++f) {
++    float* frame = data + size_t(f) * channels_;
++    float peak = 0.0f;
++    for (uint32_t c = 0; c < channels_; ++c) {
++      float v = frame[c];
++      if (!std::isfinite(v)) {
++        v = 0.0f;
++        frame[c] = 0.0f;
++        if (stats) ++stats->nonfinite;
++      }
++      const float a = std::abs(v);
++      peak = std::max(peak, a);
++      if (stats && a > 1.0f) ++stats->over;
++    }
++    // The gain this frame needs, released: down at once, back up exponentially.
++    const double need = peak > kCeiling ? double(kCeiling) / double(peak) : 1.0;
++    envelope_ = std::min(need, envelope_ + (1.0 - envelope_) * release_);
++    // Hold its minimum over the last L frames.
++    while (hold_size_ && hold_value_[(hold_head_ + hold_size_ - 1) % capacity] >= envelope_)
++      --hold_size_;
++    hold_value_[(hold_head_ + hold_size_) % capacity] = envelope_;
++    hold_index_[(hold_head_ + hold_size_) % capacity] = index_;
++    ++hold_size_;
++    while (hold_index_[hold_head_] + lookahead_ <= index_) {
++      hold_head_ = (hold_head_ + 1) % capacity;
++      --hold_size_;
++    }
++    const double held = hold_value_[hold_head_];
++    ++index_;
++    // Average over the last L frames.
++    const double old = box_[box_pos_];
++    non_unity_ -= old < 1.0;
++    non_unity_ += held < 1.0;
++    box_sum_ += held - old;
++    box_[box_pos_] = held;
++    box_pos_ = (box_pos_ + 1) % lookahead_;
++    const float gain = non_unity_ ? float(box_sum_ / double(lookahead_)) : 1.0f;
++    // The frame L - 1 back goes out at this gain; this frame takes its place.
++    float* slot = delay_frames ? &delay_[size_t(delay_pos_) * channels_] : nullptr;
++    for (uint32_t c = 0; c < channels_; ++c) {
++      const float in = frame[c];
++      float out = slot ? slot[c] : in;
++      if (slot) slot[c] = in;
++      if (gain != 1.0f) out *= gain;
++      const float a = std::abs(out);
++      if (a > 1.0f) {
++        out = std::clamp(out, -1.0f, 1.0f);
++        if (stats) ++stats->clamped;
++      }
++      frame[c] = out;
++      if (stats) stats->peak_out = std::max(stats->peak_out, std::min(a, 1.0f));
++    }
++    if (delay_frames) delay_pos_ = (delay_pos_ + 1) % delay_frames;
++    if (stats) {
++      ++stats->frames;
++      stats->limited += gain < 1.0f;
++      stats->peak_in = std::max(stats->peak_in, peak);
++      stats->min_gain = std::min(stats->min_gain, gain);
++    }
++  }
++}
++
++}  // namespace rex::audio
+diff --git a/src/audio/mmcss.cpp b/src/audio/mmcss.cpp
+new file mode 100644
+index 0000000..c654eff
+--- /dev/null
++++ b/src/audio/mmcss.cpp
+@@ -0,0 +1,79 @@
++// Local change (pgr4 project, 28/11/2026): the audio threads in Windows' "Pro Audio" multimedia
++// class (see mmcss.h). Apart from audio_system.cpp, which keeps windows.h out.
++#include "mmcss.h"
++
++#include <string>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
++// Read at each pass of the Audio Worker's and the XMA Decoder's loops (live). Off: as before.
++REXCVAR_DEFINE_BOOL(audio_mmcss, true, "Audio",
++                    "The Audio Worker and XMA Decoder threads in Windows' \"Pro Audio\" multimedia "
++                    "class (MMCSS): their share of the processor kept during shader compiles and "
++                    "loads (local change, pgr4 project; live)");
++
++namespace rex::audio {
++
++namespace {
++#ifdef _WIN32
++using AvSetFn = HANDLE(WINAPI*)(LPCWSTR, LPDWORD);
++using AvRevertFn = BOOL(WINAPI*)(HANDLE);
++struct Avrt {
++  AvSetFn set = nullptr;
++  AvRevertFn revert = nullptr;
++  Avrt() {
++    if (HMODULE m = LoadLibraryW(L"avrt.dll")) {
++      set = reinterpret_cast<AvSetFn>(GetProcAddress(m, "AvSetMmThreadCharacteristicsW"));
++      revert = reinterpret_cast<AvRevertFn>(GetProcAddress(m, "AvRevertMmThreadCharacteristics"));
++    }
++  }
++};
++const Avrt& GetAvrt() {
++  static const Avrt avrt;  // loaded once, at the first audio thread's first pass
++  return avrt;
++}
++#endif
++}  // namespace
++
++void MmcssFollow(MmcssState& state, const char* name) {
++#ifdef _WIN32
++  if (!REXCVAR_GET(audio_mmcss)) {
++    state.failed = false;  // tried again when switched on
++    if (state.task) MmcssLeave(state, name);
++    return;
++  }
++  if (state.task || state.failed) return;
++  const Avrt& avrt = GetAvrt();
++  DWORD index = 0;
++  state.task = avrt.set ? avrt.set(L"Pro Audio", &index) : nullptr;
++  if (state.task) {
++    REXAPU_INFO("{}: Windows' \"Pro Audio\" class (MMCSS) on", name);
++  } else {
++    state.failed = true;
++    REXAPU_WARN("{}: Windows' \"Pro Audio\" class (MMCSS) refused ({}); the thread as before", name,
++                avrt.set ? std::to_string(GetLastError()) : std::string("no avrt.dll"));
++  }
++#else
++  (void)state;
++  (void)name;
++#endif
++}
++
++void MmcssLeave(MmcssState& state, const char* name) {
++#ifdef _WIN32
++  if (!state.task) return;
++  if (const Avrt& avrt = GetAvrt(); avrt.revert) avrt.revert(state.task);
++  state.task = nullptr;
++  REXAPU_INFO("{}: Windows' \"Pro Audio\" class (MMCSS) off", name);
++#else
++  (void)state;
++  (void)name;
++#endif
++}
++
++}  // namespace rex::audio
+diff --git a/src/audio/mmcss.h b/src/audio/mmcss.h
+new file mode 100644
+index 0000000..c937e3a
+--- /dev/null
++++ b/src/audio/mmcss.h
+@@ -0,0 +1,22 @@
++// Local change (pgr4 project, 28/11/2026, Tazz: « c'est possible de mettre une priorité CPU sur
++// l'audio pour être sûr qu'il craque jamais ? »): the audio threads in Windows' "Pro Audio"
++// multimedia class (MMCSS, avrt.dll, as music software and most games do): the scheduler gives
++// them their share of the processor whatever else runs (a shader compile, a load). The Audio
++// Worker (audio_system.cpp) and the XMA Decoder (xma_decoder.cpp) call MmcssFollow at each pass
++// of their loop; audio_mmcss (audio_system.cpp) is read there (live). avrt.dll loaded on first
++// use: nothing to link; without it (or where it fails), logged once and the thread as before.
++#pragma once
++
++namespace rex::audio {
++
++struct MmcssState {
++  void* task = nullptr;  // AvSetMmThreadCharacteristicsW's handle while in the class
++  bool failed = false;   // tried and refused: not tried again until switched off and on
++};
++
++// On the calling thread: joins or leaves the class as audio_mmcss says. `name` for the log.
++void MmcssFollow(MmcssState& state, const char* name);
++// On the calling thread, before it ends: leaves the class.
++void MmcssLeave(MmcssState& state, const char* name);
++
++}  // namespace rex::audio
 diff --git a/src/audio/nop/nop_audio_system.cpp b/src/audio/nop/nop_audio_system.cpp
 index e479311..ea7cbc7 100644
 --- a/src/audio/nop/nop_audio_system.cpp
@@ -3354,23 +4154,79 @@ index 0000000..148c773
 +
 +}  // namespace rex::audio
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 20a2cd8..d867be1 100644
+index 20a2cd8..c39497d 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
-@@ -11,6 +11,7 @@
+@@ -11,25 +11,162 @@
  
  #include <algorithm>
  #include <array>
++#include <chrono>
 +#include <cmath>
++#include <cstdio>
  #include <cstring>
++#include <filesystem>
++#include <functional>
++#include <mutex>
++#include <string>
  
  #include <rex/assert.h>
-@@ -25,11 +26,29 @@
+ #include <rex/audio/conversion.h>
+ #include <rex/audio/downmix.h>
+ #include <rex/audio/flags.h>
++#include <rex/audio/limiter.h>
++#include <rex/audio/output_probe.h>
+ #include <rex/audio/sdl/sdl_audio_driver.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/perf/counter.h>
  #include <SDL3/SDL.h>
++#include <fmt/format.h>
  
  REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
 +REXCVAR_DEFINE_BOOL(audio_channel_probe, false, "Audio",
 +                    "Development: each guest 5.1 channel's level, in the log every half second");
++// Local change (pgr4 project, 26/11/2026, docs/audit_audio.md n° 4): the output's peaks held under
++// -0.3 dBFS by a lookahead limiter (OutputLimiter, 1.5 ms, release 100 ms, linked channels), the
++// same in every speaker layout, in place of the hard clip at +-1 (which still follows it, as a
++// safety). Below the ceiling it changes nothing but a 1.5 ms delay. Read at each device callback
++// (live); each way starts clean.
++REXCVAR_DEFINE_BOOL(audio_soft_limiter, true, "Audio",
++                    "The output's peaks held under -0.3 dBFS by a lookahead limiter, in every "
++                    "speaker layout; off: the hard clip at +-1 (local change, pgr4 project; live)");
++// Development: the output's probe, empty for none (never in a release). Every 10 s, in values: the
++// layout, frames played and silent ones put in for want of a frame (FAULT when between two real
++// ones), the guest's 5.1 peaks, the peak and the samples over 0 dBFS before the limiter (FAULT
++// when the hard clip cut them), the frames limited and the least gain (FAULT when heavy), the
++// samples still over 1 after it and the non-finite ones (FAULT), the XMA voice starts' skipped
++// subframes, and the title's values (SetOutputProbeExtra); and the output before and after the
++// limiter as float WAVs in this folder (30 s each, 8 pairs at most a session).
++REXCVAR_DEFINE_STRING(audio_output_probe_dir, "", "Audio",
++                      "Development: the device output's probe folder (log and WAVs); empty: off");
++
++namespace rex::audio {
++
++namespace {
++std::mutex g_probe_extra_mutex;
++std::function<std::string()> g_probe_extra;
++
++std::string ProbeExtraText() {
++  std::lock_guard<std::mutex> lock(g_probe_extra_mutex);
++  return g_probe_extra ? g_probe_extra() : std::string();
++}
++
++double Dbfs(double v) { return v > 0 ? 20.0 * std::log10(v) : -120.0; }
++}  // namespace
++
++bool OutputProbeEnabled() { return !REXCVAR_GET(audio_output_probe_dir).empty(); }
++
++void SetOutputProbeExtra(std::function<std::string()> extra) {
++  std::lock_guard<std::mutex> lock(g_probe_extra_mutex);
++  g_probe_extra = std::move(extra);
++}
++
++}  // namespace rex::audio
  
  namespace rex::audio::sdl {
  
@@ -3379,7 +4235,76 @@ index 20a2cd8..d867be1 100644
 +namespace {
 +// SDL takes any layout up to 7.1 and converts it to the endpoint's.
 +constexpr uint32_t kHostChannelsMax = 8;
++
++// A float WAV written as it goes, its sizes patched when it closes.
++struct WavFile {
++  FILE* file = nullptr;
++  uint64_t frames = 0;
++  uint32_t channels = 0;
++  bool Open(const std::string& path, uint32_t channel_count, uint32_t rate) {
++    Close();
++    file = std::fopen(path.c_str(), "wb");
++    frames = 0;
++    channels = channel_count;
++    if (!file) return false;
++    const uint32_t fmt_size = 16, bytes_per_s = rate * 4 * channel_count, zero = 0;
++    const uint16_t format = 3, ch = uint16_t(channel_count), align = uint16_t(4 * channel_count),
++                   bits = 32;
++    std::fwrite("RIFF", 1, 4, file);
++    std::fwrite(&zero, 4, 1, file);
++    std::fwrite("WAVEfmt ", 1, 8, file);
++    std::fwrite(&fmt_size, 4, 1, file);
++    std::fwrite(&format, 2, 1, file);
++    std::fwrite(&ch, 2, 1, file);
++    std::fwrite(&rate, 4, 1, file);
++    std::fwrite(&bytes_per_s, 4, 1, file);
++    std::fwrite(&align, 2, 1, file);
++    std::fwrite(&bits, 2, 1, file);
++    std::fwrite("data", 1, 4, file);
++    std::fwrite(&zero, 4, 1, file);
++    return true;
++  }
++  void Write(const float* data, uint32_t frame_count) {
++    if (!file) return;
++    std::fwrite(data, sizeof(float) * channels, frame_count, file);
++    frames += frame_count;
++  }
++  void Close() {
++    if (!file) return;
++    const uint32_t data = uint32_t(frames * 4 * channels), riff = 36 + data;
++    std::fseek(file, 4, SEEK_SET);
++    std::fwrite(&riff, 4, 1, file);
++    std::fseek(file, 40, SEEK_SET);
++    std::fwrite(&data, 4, 1, file);
++    std::fclose(file);
++    file = nullptr;
++  }
++  ~WavFile() { Close(); }
++};
 +}  // namespace
++
++// Local change (pgr4 project, 26/11/2026): the output's development probe (audio_output_probe_dir).
++struct SDLAudioDriver::OutputProbe {
++  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++  uint64_t real = 0, silent = 0, gaps = 0;
++  bool silent_run = false, seen_real = false;
++  std::array<float, 6> guest_peak = {};
++  float pre_peak = 0.0f, post_peak = 0.0f;
++  uint64_t pre_over = 0, post_clamped = 0;
++  OutputLimiter::Stats limiter;
++  WavFile pre_wav, post_wav;
++  uint32_t wav_pairs = 0;
++  bool recording = false;
++
++  void Reset() {
++    real = silent = gaps = 0;
++    guest_peak = {};
++    pre_peak = post_peak = 0.0f;
++    pre_over = post_clamped = 0;
++    limiter = {};
++  }
++};
++
 +
 +SDLAudioDriver::SDLAudioDriver(rex::thread::Semaphore* semaphore, uint32_t frequency,
 +                               uint32_t channels, bool need_format_conversion)
@@ -3397,7 +4322,7 @@ index 20a2cd8..d867be1 100644
  
  SDLAudioDriver::~SDLAudioDriver() {
    assert_true(frames_queued_.empty());
-@@ -49,6 +68,10 @@ bool SDLAudioDriver::Initialize() {
+@@ -49,6 +186,10 @@ bool SDLAudioDriver::Initialize() {
    }
    sdl_initialized_ = true;
  
@@ -3408,7 +4333,17 @@ index 20a2cd8..d867be1 100644
    SDL_AudioSpec desired_spec = {};
    SDL_AudioSpec obtained_spec = {};
    desired_spec.freq = frame_frequency_;
-@@ -109,25 +132,83 @@ bool SDLAudioDriver::Initialize() {
+@@ -93,6 +234,9 @@ bool SDLAudioDriver::Initialize() {
+     }
+   }
+ 
++  // Local change (pgr4 project, 26/11/2026): the output limiter on what the callback submits.
++  limiter_.Configure(frame_frequency_, sdl_device_channels_);
++
+   // The endpoint layout decides which mix the callback runs, and it is the
+   // first thing worth knowing when a report says the balance is wrong on one
+   // speaker setup and right on another.
+@@ -109,25 +253,83 @@ bool SDLAudioDriver::Initialize() {
    return true;
  }
  
@@ -3498,7 +4433,7 @@ index 20a2cd8..d867be1 100644
      sdl_submit_count++;
    }
  
-@@ -138,6 +219,18 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+@@ -138,6 +340,18 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
    }
  }
  
@@ -3517,7 +4452,7 @@ index 20a2cd8..d867be1 100644
  void SDLAudioDriver::Shutdown() {
    if (sdl_stream_) {
      SDL_DestroyAudioStream(sdl_stream_);
-@@ -166,8 +259,16 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -166,8 +380,16 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
      return;
    }
    const auto driver = static_cast<SDLAudioDriver*>(userdata);
@@ -3535,8 +4470,135 @@ index 20a2cd8..d867be1 100644
    const int len = static_cast<int>(sizeof(float) * sample_count);
    float* data = SDL_stack_alloc(float, sample_count);
    if (!data) {
-@@ -180,8 +281,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -178,48 +400,164 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+   const StereoFold fold = GetStereoFold();
+   const SurroundMix mix = GetSurroundMix();
    const float gain = GetOutputGain();
++  // Local change (pgr4 project, 26/11/2026): the output limiter, read at each callback; each way
++  // starts clean. The silence put in for want of a frame goes through it too, so its delay line
++  // keeps running.
++  const uint32_t channels = std::max<uint8_t>(sdl_device_channels_, 1);
++  const bool limit = REXCVAR_GET(audio_soft_limiter);
++  if (limiter_.channels() != channels) {
++    limiter_.Configure(frame_frequency_, channels);
++  } else if (limit != limiter_on_) {
++    limiter_.Reset();
++  }
++  limiter_on_ = limit;
++  const std::string probe_dir = REXCVAR_GET(audio_output_probe_dir);
++  if (probe_dir.empty()) {
++    output_probe_.reset();
++  } else if (!output_probe_) {
++    output_probe_ = std::make_unique<OutputProbe>();
++  }
++  OutputProbe* probe = output_probe_.get();
++  const auto convert = [&](float* out, const float* in, bool clamp) {
++    switch (sdl_device_channels_) {
++      case 2:
++        conversion::sequential_6_BE_to_interleaved_2_LE(out, in, channel_samples_, fold, gain,
++                                                        clamp);
++        break;
++      case 6:
++        conversion::sequential_6_BE_to_interleaved_6_LE(out, in, channel_samples_, mix, gain,
++                                                        clamp);
++        break;
++      default:
++        assert_unhandled_case(sdl_device_channels_);
++        break;
++    }
++  };
++  // The output stage after the mix: the limiter, or the hard clip the conversion did; and the
++  // probe on both sides of it. `guest` is the guest frame, null for silence put in.
++  const auto finish = [&](const float* guest) {
++    if (probe) {
++      // Before: what reaches the clip or the limiter, unclamped.
++      const float* pre = data;
++      if (guest && !limit && !REXCVAR_GET(audio_mute)) {
++        probe_scratch_.resize(sample_count);
++        convert(probe_scratch_.data(), guest, false);
++        pre = probe_scratch_.data();
++      }
++      for (int i = 0; i < sample_count; ++i) {
++        const float a = std::abs(pre[i]);
++        probe->pre_peak = std::max(probe->pre_peak, a);
++        probe->pre_over += a > 1.0f;
++      }
++      if (guest) {
++        for (uint32_t c = 0; c < 6; ++c) {
++          for (uint32_t i = 0; i < channel_samples_; ++i) {
++            probe->guest_peak[c] = std::max(
++                probe->guest_peak[c], std::abs(rex::byte_swap(guest[c * channel_samples_ + i])));
++          }
++        }
++      }
++      if (guest) {
++        ++probe->real;
++        if (probe->silent_run && probe->seen_real) ++probe->gaps;
++        probe->silent_run = false;
++        probe->seen_real = true;
++      } else {
++        ++probe->silent;
++        probe->silent_run = true;
++      }
++      if (!probe->recording && guest && probe->pre_peak > 0.0f && probe->wav_pairs < 8) {
++        std::error_code ec;
++        std::filesystem::create_directories(probe_dir, ec);
++        const std::string stem =
++            fmt::format("{}/output_{:02}_{}ch_{}", probe_dir, probe->wav_pairs++, channels,
++                        limit ? "limiter" : "hardclip");
++        probe->pre_wav.Open(stem + "_before.wav", channels, frame_frequency_);
++        probe->post_wav.Open(stem + "_after.wav", channels, frame_frequency_);
++        probe->recording = true;
++      }
++      if (probe->recording) probe->pre_wav.Write(pre, channel_samples_);
++    }
++    if (limit) limiter_.Process(data, channel_samples_, probe ? &probe->limiter : nullptr);
++    if (probe) {
++      for (int i = 0; i < sample_count; ++i) {
++        const float a = std::abs(data[i]);
++        probe->post_peak = std::max(probe->post_peak, a);
++      }
++      if (probe->recording) {
++        probe->post_wav.Write(data, channel_samples_);
++        if (probe->post_wav.frames >= uint64_t(frame_frequency_) * 30) {
++          probe->pre_wav.Close();
++          probe->post_wav.Close();
++          probe->recording = false;
++        }
++      }
++      const auto now = std::chrono::steady_clock::now();
++      if (now - probe->last >= std::chrono::seconds(10)) {
++        probe->last = now;
++        OutputProbe& p = *probe;
++        const OutputLimiter::Stats& l = p.limiter;
++        const double limited_pct = l.frames ? 100.0 * double(l.limited) / double(l.frames) : 0.0;
++        const XmaStartSkipCounts skips = TakeXmaStartSkipCounts();
++        std::string faults;
++        if (p.gaps) faults += fmt::format(" FAULT: {} gaps (silence between frames)", p.gaps);
++        if (!limit && p.pre_over)
++          faults += fmt::format(" FAULT: {} samples hard clipped", p.pre_over);
++        if (limit && l.clamped) faults += fmt::format(" FAULT: {} samples over 1 after the limiter", l.clamped);
++        if (l.nonfinite) faults += fmt::format(" FAULT: {} non-finite samples", l.nonfinite);
++        if (limit && (limited_pct > 2.0 || l.min_gain < 0.5f))
++          faults += " FAULT: heavy limiting";
++        const std::string extra = ProbeExtraText();
++        REXAPU_INFO(
++            "audio output probe over 10 s: {} ch at {} Hz, {}; frames {} played, {} silent put in "
++            "({} gaps); guest 5.1 peaks FL {:.1f} FR {:.1f} C {:.1f} LFE {:.1f} SL {:.1f} SR {:.1f} "
++            "dBFS; before the {} peak {:.2f} dBFS, {} samples over 0 dBFS; limiter {:.3f} % of "
++            "frames limited, least gain {:.2f} dB; out peak {:.2f} dBFS; XMA voice starts asked "
++            "to skip 0/1/2/3/4 subframes: {}/{}/{}/{}/{}, skips applied {}{}{}",
++            channels, frame_frequency_, limit ? "limiter" : "hard clip", p.real, p.silent, p.gaps,
++            Dbfs(p.guest_peak[0]), Dbfs(p.guest_peak[1]), Dbfs(p.guest_peak[2]),
++            Dbfs(p.guest_peak[3]), Dbfs(p.guest_peak[4]), Dbfs(p.guest_peak[5]),
++            limit ? "limiter" : "clip", Dbfs(p.pre_peak), p.pre_over, limited_pct,
++            Dbfs(l.min_gain), Dbfs(p.post_peak), skips.asked[0], skips.asked[1], skips.asked[2],
++            skips.asked[3], skips.asked[4], skips.applied, extra.empty() ? "" : "; ", extra);
++        if (!faults.empty()) REXAPU_INFO("audio output probe:{}", faults);
++        p.Reset();
++      }
++    }
++  };
    while (additional_amount > 0) {
      static uint32_t sdl_callback_count = 0;
 -    std::unique_lock<std::mutex> guard(driver->frames_mutex_);
@@ -3546,7 +4608,12 @@ index 20a2cd8..d867be1 100644
        if (sdl_callback_count < 10) {
          REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
          sdl_callback_count++;
-@@ -193,12 +294,12 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+       }
+       std::memset(data, 0, len);
++      finish(nullptr);
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
+         break;
        }
        additional_amount -= len;
      } else {
@@ -3558,19 +4625,22 @@ index 20a2cd8..d867be1 100644
          std::memset(data, 0, len);
        } else {
 -        switch (driver->sdl_device_channels_) {
-+        switch (sdl_device_channels_) {
-           case 2:
-             conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
-                                                             gain);
-@@ -208,18 +309,18 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
-                                                             gain);
-             break;
-           default:
+-          case 2:
+-            conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
+-                                                            gain);
+-            break;
+-          case 6:
+-            conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_, mix,
+-                                                            gain);
+-            break;
+-          default:
 -            assert_unhandled_case(driver->sdl_device_channels_);
-+            assert_unhandled_case(sdl_device_channels_);
-             break;
-         }
+-            break;
+-        }
++        // With the limiter the conversion leaves the samples above 1 to it.
++        convert(data, buffer, !limit);
        }
++      finish(buffer);
        if (!SDL_PutAudioStreamData(stream, data, len)) {
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
 -        driver->frames_unused_.push(buffer);
@@ -3585,7 +4655,7 @@ index 20a2cd8..d867be1 100644
        assert_true(ret);
        additional_amount -= len;
      }
-@@ -227,4 +328,34 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+@@ -227,4 +565,34 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
    SDL_stack_free(data);
  }
  
@@ -3654,10 +4724,10 @@ index 68da0cf..e8591af 100644
  
  }  // namespace rex::audio::sdl
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 11b83be..fa901eb 100644
+index 11b83be..84a4f53 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
-@@ -10,9 +10,16 @@
+@@ -10,9 +10,18 @@
  */
  
  #include <algorithm>
@@ -3668,13 +4738,15 @@ index 11b83be..fa901eb 100644
 +#include <mutex>
 +#include <set>
 +#include <string>
++#include <utility>
  
  #include <rex/audio/xma/context.h>
++#include <rex/audio/output_probe.h>
 +#include <rex/cvar.h>
  #include <rex/audio/xma/decoder.h>
  #include <rex/audio/xma/helpers.h>
  #include <rex/dbg.h>
-@@ -36,10 +43,112 @@ extern "C" {
+@@ -36,10 +45,130 @@ extern "C" {
  // Credits for most of this code goes to:
  // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
  
@@ -3702,12 +4774,25 @@ index 11b83be..fa901eb 100644
 +                    "A wave's last decoded frame put out at its end (a one-frame wave was silent)");
 +REXCVAR_DEFINE_BOOL(apu_xma_canary_30oct, false, "Audio",
 +                    "Xenia Canary's XMA fixes 6bef1fb and 7015473 (ported 30/10/2026)");
++// apu_xma_start_skip (local change, pgr4 project, 26/11/2026, docs/audit_audio.md n° 6, D3 of the
++// 15/11 audit): context word 1 bits 24-26 are numSubframesToSkip (SHAPE), which this decoder read
++// as an output padding. PGR4 writes them at each voice start (sub_82914F00: (start >> 7) & 3, the
++// read offset from its seek table at start >> 9), so a voice started inside a frame played up to
++// 384 samples early. The first frame decoded after a voice's start (a reset, or the title moving
++// the read offset) skips them, as loop_subframe_skip does at a loop start. Read at each decode.
++REXCVAR_DEFINE_BOOL(apu_xma_start_skip, true, "Audio",
++                    "An XMA voice's start skips the subframes its title asks for "
++                    "(numSubframesToSkip; local change, pgr4 project; live)");
 +
  namespace rex::audio {
  
  using stream::BitStream;
  
 +namespace {
++
++// apu_xma_start_skip: the voice starts seen, by the subframes asked, for the output probe.
++std::mutex start_skip_mutex;
++XmaStartSkipCounts start_skip_counts;
 +
 +// apu_xma_level_probe: by context, the sum of squares and count of the samples it wrote (big-endian
 +// int16) and the loops it took, logged and reset every half second.
@@ -3777,6 +4862,11 @@ index 11b83be..fa901eb 100644
 +
 +}  // namespace
 +
++XmaStartSkipCounts TakeXmaStartSkipCounts() {
++  std::lock_guard<std::mutex> lock(start_skip_mutex);
++  return std::exchange(start_skip_counts, {});
++}
++
 +// apu_xma_level_probe: whether a context is followed step by step (a short wave without loop).
 +bool XmaProbeWatched(uint32_t id) {
 +  if (!REXCVAR_GET(apu_xma_level_probe)) return false;
@@ -3787,10 +4877,13 @@ index 11b83be..fa901eb 100644
  const uint32_t XmaContext::kBitsPerPacketHeader;
  const uint32_t XmaContext::kOutputMaxSizeBytes;
  
-@@ -103,12 +212,30 @@ bool XmaContext::Work() {
+@@ -103,12 +232,33 @@ bool XmaContext::Work() {
    auto context_ptr = memory()->TranslateVirtual(guest_ptr());
    XMA_CONTEXT_DATA data(context_ptr);
    const XMA_CONTEXT_DATA initial_data = data;
++  // Local change (pgr4 project, 26/11/2026, D3): the title moved the read offset (a voice's
++  // start at its seek point).
++  if (data.input_buffer_read_offset != last_stored_read_offset_) voice_start_pending_ = true;
 +  bool watched = false;
 +  if (REXCVAR_GET(apu_xma_level_probe)) {
 +    std::lock_guard<std::mutex> lock(level_mutex);
@@ -3818,7 +4911,7 @@ index 11b83be..fa901eb 100644
  
    // Consume-only context: no input, just drain remaining subframes.
    if (data.IsConsumeOnlyContext()) {
-@@ -117,6 +244,7 @@ bool XmaContext::Work() {
+@@ -117,6 +267,7 @@ bool XmaContext::Work() {
      }
      Consume(&output_rb, &data);
      data.output_buffer_write_offset = output_rb.write_offset() / kOutputBytesPerBlock;
@@ -3826,7 +4919,7 @@ index 11b83be..fa901eb 100644
      StoreContextMerged(data, initial_data, context_ptr);
      return true;
    }
-@@ -124,28 +252,90 @@ bool XmaContext::Work() {
+@@ -124,28 +275,90 @@ bool XmaContext::Work() {
    // Minimum free blocks needed before attempting a decode.
    // Use subframe_decode_count (clamped to 1) instead of full frame size.
    const uint32_t effective_sdc = std::max(static_cast<uint32_t>(1), data.subframe_decode_count);
@@ -3922,7 +5015,7 @@ index 11b83be..fa901eb 100644
  
    StoreContextMerged(data, initial_data, context_ptr);
    return true;
-@@ -173,6 +363,16 @@ void XmaContext::Clear() {
+@@ -173,6 +386,16 @@ void XmaContext::Clear() {
  
    auto context_ptr = memory()->TranslateVirtual(guest_ptr());
    XMA_CONTEXT_DATA data(context_ptr);
@@ -3939,7 +5032,7 @@ index 11b83be..fa901eb 100644
    ClearLocked(&data);
    data.Store(context_ptr);
  }
-@@ -192,18 +392,22 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
+@@ -192,23 +415,28 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
  void XmaContext::ResetDecoderState() {
    // A freed or re-initialized context is a new logical stream, so the previous
    // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
@@ -3969,7 +5062,13 @@ index 11b83be..fa901eb 100644
    pending_output_limit_ = 0;
    pending_start_skip_ = 0;
    current_frame_remaining_subframes_ = 0;
-@@ -250,6 +454,9 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
+   loop_frame_output_limit_ = 0;
+   loop_start_skip_pending_ = false;
++  voice_start_pending_ = true;  // local change (D3)
+ }
+ 
+ void XmaContext::Disable() {
+@@ -250,6 +478,9 @@ void XmaContext::UpdateLoopStatus(XMA_CONTEXT_DATA* data) {
  
    data->input_buffer_read_offset = loop_start;
    loop_start_skip_pending_ = true;
@@ -3979,7 +5078,7 @@ index 11b83be..fa901eb 100644
  
    if (data->loop_count < 255) {
      data->loop_count--;
-@@ -316,7 +523,19 @@ uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_pack
+@@ -316,7 +547,19 @@ uint32_t XmaContext::GetNextPacketReadOffset(uint8_t* buffer, uint32_t next_pack
      if (packet_frame_offset <= kMaxFrameSizeinBits) {
        return (next_packet_index * kBitsPerPacket) + packet_frame_offset;
      }
@@ -4000,7 +5099,7 @@ index 11b83be..fa901eb 100644
    }
  
    return kBitsPerPacketHeader;
-@@ -359,6 +578,17 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
+@@ -359,6 +602,17 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
  
    while (true) {
      if (stream.BitsRemaining() < kBitsPerFrameHeader) {
@@ -4018,7 +5117,15 @@ index 11b83be..fa901eb 100644
        break;
      }
  
-@@ -432,7 +662,9 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -415,6 +669,7 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
+   }
+ 
+   fresh.input_buffer_read_offset = data.input_buffer_read_offset;
++  last_stored_read_offset_ = data.input_buffer_read_offset;  // local change (D3)
+   fresh.error_status = data.error_status;
+   fresh.current_buffer = data.current_buffer;
+   fresh.output_buffer_read_offset = data.output_buffer_read_offset;
+@@ -432,7 +687,9 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
                                      << data->is_stereo;
      const uint8_t consumed = total_subframes - current_frame_remaining_subframes_;
      if (consumed >= loop_frame_output_limit_) {
@@ -4029,7 +5136,7 @@ index 11b83be..fa901eb 100644
        current_frame_remaining_subframes_ = 0;
        loop_frame_output_limit_ = 0;
        return;
-@@ -440,8 +672,21 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -440,8 +697,21 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
    }
  
    const uint8_t effective_sdc = std::max(static_cast<uint32_t>(1), data->subframe_decode_count);
@@ -4051,7 +5158,7 @@ index 11b83be..fa901eb 100644
  
    if (loop_frame_output_limit_ > 0) {
      const uint8_t total_subframes = (kBytesPerFrameChannel / kOutputBytesPerBlock)
-@@ -453,14 +698,59 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
+@@ -453,14 +723,59 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA*
      }
    }
  
@@ -4113,7 +5220,7 @@ index 11b83be..fa901eb 100644
                                ? data->output_buffer_padding
                                : 0;
  
-@@ -545,6 +835,33 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -545,6 +860,33 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
  
    uint8_t* current_input_buffer = GetCurrentInputBuffer(data);
  
@@ -4147,7 +5254,7 @@ index 11b83be..fa901eb 100644
    input_buffer_.fill(0);
  
    // Loop-end frame: decode it here (output limited to loop_subframe_end),
-@@ -617,6 +934,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -617,6 +959,8 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
  
      uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
      if (frame_size == xma::kMaxFrameLength) {
@@ -4156,7 +5263,7 @@ index 11b83be..fa901eb 100644
        data->error_status = 4;
        return;
      }
-@@ -640,6 +959,12 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -640,6 +984,12 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
        const uint8_t* next_packet =
            GetNextPacket(data, next_packet_index, current_input_packet_count);
        if (!next_packet) {
@@ -4169,7 +5276,7 @@ index 11b83be..fa901eb 100644
          data->error_status = 4;
          return;
        }
-@@ -664,6 +989,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -664,6 +1014,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      // Reopening the codec restarts its output; the carried tail belongs to the
      // old stream.
      carry_valid_ = false;
@@ -4179,7 +5286,34 @@ index 11b83be..fa901eb 100644
    }
    PreparePacket(packet_info.current_frame_size_, padding_start);
    const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
-@@ -707,6 +1035,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+@@ -684,10 +1037,25 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+     // Loop start: skip leading subframes per loop_subframe_skip. skip == 4
+     // means the whole frame is a warm-up frame (frame-aligned loop start):
+     // decode seeds the codec state, output is fully discarded.
+-    const uint8_t decoded_start_skip =
++    uint8_t decoded_start_skip =
+         loop_start_skip_pending_ ? static_cast<uint8_t>(data->loop_subframe_skip << data->is_stereo)
+                                  : 0;
+     loop_start_skip_pending_ = false;
++    // Local change (pgr4 project, 26/11/2026, D3): a voice's first frame skips the subframes its
++    // title asked for (numSubframesToSkip, read here as output_buffer_padding), as a loop start
++    // does.
++    if (voice_start_pending_) {
++      voice_start_pending_ = false;
++      const uint32_t asked = std::min<uint32_t>(data->output_buffer_padding, 4);
++      const bool apply = asked && REXCVAR_GET(apu_xma_start_skip);
++      if (apply) {
++        decoded_start_skip =
++            std::max(decoded_start_skip, static_cast<uint8_t>(asked << data->is_stereo));
++      }
++      std::lock_guard<std::mutex> lock(start_skip_mutex);
++      ++start_skip_counts.asked[asked];
++      start_skip_counts.applied += apply;
++    }
+ 
+     if (carry_valid_) {
+       std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
+@@ -707,6 +1075,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
      // A dropped frame breaks the carry's adjacency; re-prime rather than splice
      // two blocks that are not neighbors.
      carry_valid_ = false;
@@ -4190,10 +5324,39 @@ index 11b83be..fa901eb 100644
  
    // Compute where to go next.
 diff --git a/src/audio/xma_decoder.cpp b/src/audio/xma_decoder.cpp
-index a0a178d..4e66d5d 100644
+index a0a178d..0ca692d 100644
 --- a/src/audio/xma_decoder.cpp
 +++ b/src/audio/xma_decoder.cpp
-@@ -299,12 +299,16 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -22,6 +22,8 @@
+ #include <rex/system/thread_state.h>
+ #include <rex/system/xthread.h>
+ 
++#include "mmcss.h"  // local change (28/11/2026)
++
+ extern "C" {
+ #include "libavutil/log.h"
+ }  // extern "C"
+@@ -138,7 +140,11 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
+ }
+ 
+ void XmaDecoder::WorkerThreadMain() {
++  // Local change (pgr4 project, 28/11/2026, mmcss.h): Windows' "Pro Audio" class, audio_mmcss
++  // read at each pass (live).
++  MmcssState mmcss;
+   while (worker_running_) {
++    MmcssFollow(mmcss, "XMA Decoder");
+     // Okay, let's loop through XMA contexts to find ones we need to decode!
+     bool did_work = false;
+     for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
+@@ -162,6 +168,7 @@ void XmaDecoder::WorkerThreadMain() {
+     // No work done this iteration, block until signaled.
+     rex::thread::Wait(work_event_.get(), false);
+   }
++  MmcssLeave(mmcss, "XMA Decoder");
+ }
+ 
+ void XmaDecoder::Shutdown() {
+@@ -299,12 +306,16 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
        if (kicked_value & 1) {
          uint32_t context_id = base_context_id + i;
          auto& context = contexts_[context_id];
@@ -4212,7 +5375,7 @@ index a0a178d..4e66d5d 100644
    } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
      // Context lock command.
      // This requests a lock by flagging the context.
-@@ -314,6 +318,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -314,6 +325,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
        if (value & 1) {
          uint32_t context_id = base_context_id + i;
          auto& context = contexts_[context_id];
@@ -4220,7 +5383,7 @@ index a0a178d..4e66d5d 100644
          context.Disable();
          // [XMA fix] Added Block(false) after Disable(). Without this, the game
          // could call XMADisableContext and start modifying the context struct
-@@ -332,6 +337,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
+@@ -332,6 +344,7 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
        if (value & 1) {
          uint32_t context_id = base_context_id + i;
          XmaContext& context = contexts_[context_id];
@@ -4228,6 +5391,73 @@ index a0a178d..4e66d5d 100644
          context.Clear();
        }
      }
+diff --git a/src/codegen/builders/helpers.h b/src/codegen/builders/helpers.h
+index ab6a8e0..ef1c7d0 100644
+--- a/src/codegen/builders/helpers.h
++++ b/src/codegen/builders/helpers.h
+@@ -280,8 +280,10 @@ inline void emitAtomicLoadReserve(BuilderContext& ctx, const char* ptr_type, con
+   if (ctx.insn.operands[1] != 0)
+     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
+   ctx.println("{}.u32;", ctx.r(ctx.insn.operands[2]));
+-  ctx.println("\t{}.{} = *({}*)REX_RAW_ADDR({});", ctx.reserved(), reserved_field, ptr_type,
+-              ctx.ea());
++  // Local change (26/11/2026, pgr4 branch cpu_thread): REX_GUEST_RESERVE_LOAD (pch_h.inja: a
++  // relaxed atomic load, the plain load as before with REX_VOLATILE_GUEST_ACCESS).
++  ctx.println("\t{}.{} = REX_GUEST_RESERVE_LOAD({}, REX_RAW_ADDR({}));", ctx.reserved(),
++              reserved_field, ptr_type, ctx.ea());
+   ctx.println("\t{}.u64 = {}({}.{});", ctx.r(ctx.insn.operands[0]), bswap_func, ctx.reserved(),
+               reserved_field);
+ }
+diff --git a/src/codegen/builders/memory.cpp b/src/codegen/builders/memory.cpp
+index a20762c..3974a4f 100644
+--- a/src/codegen/builders/memory.cpp
++++ b/src/codegen/builders/memory.cpp
+@@ -541,13 +541,17 @@ bool build_stfsux(BuilderContext& ctx) {
+ // Vector Loads (will be more comprehensive in vector.cpp)
+ //=============================================================================
+ 
++// Local change (26/11/2026, pgr4 branch cpu_thread): the guest memory side of lvx, lvlx, lvrx and
++// stvx goes through REX_GUEST_VLOAD / REX_GUEST_VSTORE (pch_h.inja: volatile beside the relaxed
++// scalar accesses, the plain simde load and store as before with REX_VOLATILE_GUEST_ACCESS).
++
+ bool build_lvx(BuilderContext& ctx) {
+   // NOTE(tomc): for endian swapping, we reverse the whole vector instead of individual elements.
+   // this is accounted for in every instruction (eg. dp3 sums yzw instead of xyz)
+   emitVectorEA(ctx, "0xF");
+   ctx.println(
+       "\tsimde_mm_store_si128((simde__m128i*){}.u8, "
+-      "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR({})), "
++      "simde_mm_shuffle_epi8(REX_GUEST_VLOAD(REX_RAW_ADDR({})), "
+       "simde_mm_load_si128((simde__m128i*)VectorMaskL)));",
+       ctx.v(ctx.insn.operands[0]), ctx.ea());
+   return true;
+@@ -557,7 +561,7 @@ bool build_lvlx(BuilderContext& ctx) {
+   emitVectorTempEA(ctx);
+   ctx.println(
+       "\tsimde_mm_store_si128((simde__m128i*){}.u8, "
+-      "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR({}.u32 & ~0xF)), "
++      "simde_mm_shuffle_epi8(REX_GUEST_VLOAD(REX_RAW_ADDR({}.u32 & ~0xF)), "
+       "simde_mm_load_si128((simde__m128i*)&VectorMaskL[({}.u32 & 0xF) * 16])));",
+       ctx.v(ctx.insn.operands[0]), ctx.temp(), ctx.temp());
+   return true;
+@@ -567,7 +571,7 @@ bool build_lvrx(BuilderContext& ctx) {
+   emitVectorTempEA(ctx);
+   ctx.println(
+       "\tsimde_mm_store_si128((simde__m128i*){}.u8, {}.u32 & 0xF ? "
+-      "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR({}.u32 & ~0xF)), "
++      "simde_mm_shuffle_epi8(REX_GUEST_VLOAD(REX_RAW_ADDR({}.u32 & ~0xF)), "
+       "simde_mm_load_si128((simde__m128i*)&VectorMaskR[({}.u32 & 0xF) * 16])) : "
+       "simde_mm_setzero_si128());",
+       ctx.v(ctx.insn.operands[0]), ctx.temp(), ctx.temp(), ctx.temp());
+@@ -646,7 +650,7 @@ bool build_stvrx(BuilderContext& ctx) {
+ bool build_stvx(BuilderContext& ctx) {
+   emitVectorEA(ctx, "0xF");
+   ctx.println(
+-      "\tsimde_mm_store_si128((simde__m128i*)REX_RAW_ADDR({}), "
++      "\tREX_GUEST_VSTORE(REX_RAW_ADDR({}), "
+       "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), "
+       "simde_mm_load_si128((simde__m128i*)VectorMaskL)));",
+       ctx.ea(), ctx.v(ctx.insn.operands[0]));
 diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
 index f560429..04f3292 100644
 --- a/src/codegen/builders/system.cpp

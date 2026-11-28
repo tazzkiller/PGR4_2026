@@ -549,8 +549,10 @@ void Pgr4BringWindowToFront();  // src/pgr4_menu.cpp
 bool Pgr4Precompiling();       // src/pgr4_profile.cpp
 REX_EXTERN(sub_826A03A8);  // a UI sound (object, index): hooked below
 void Pgr4CadenceFrame(const uint8_t* base);  // below: the frame-rate audit's counts
+void Pgr4AudioProbeAttach(const uint8_t* base);  // src/pgr4_audio_probe.cpp
 REX_HOOK_RAW(sub_824C6FD8) {
   ++g_frame_no;
+  Pgr4AudioProbeAttach(base);  // the development audio probe's game side (off: returns at once)
   {
     // A frame of 1/30 s, give or take 3 %, is one console frame (at a 30 FPS limit, every frame).
     const double seconds = REXCVAR_GET(pgr4_game_frame_time) ? double(Pgr4FrameStepSeconds())

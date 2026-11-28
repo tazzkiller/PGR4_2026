@@ -86,8 +86,25 @@ bool FrameGeneration::CopyAtHud(ID3D12GraphicsCommandList* list, uint64_t frame,
   }
   if (composited_frame_ != frame) return false;
   copy_frame_ = frame;
+  copied_since_composite_ = true;
+  // Taken again later in the frame (BeforeDraw's last_composite): the same image (Resolver's own
+  // destination, one per format and size), written over in the list's order.
   copy_ = resolver_.ResolveCopy(list, *front_);
   return true;
+}
+
+bool FrameGeneration::NoteComposite(uint64_t frame, const uint32_t* regs) {
+  using enum rex::graphics::Register;
+  const SurfaceRegs& f = front_->regs;
+  if (regs[XE_GPU_REG_RB_SURFACE_INFO] != f.surface_info ||
+      ColorStorage(regs[XE_GPU_REG_RB_COLOR_INFO]) != ColorStorage(f.color_info[front_->source]) ||
+      !(regs[XE_GPU_REG_RB_COLOR_MASK] & 0x7))
+    return false;
+  if ((regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF) == 0x0001) {
+    composited_frame_ = frame;
+    copied_since_composite_ = false;
+  }
+  return false;
 }
 
 void FrameGeneration::Destroy() {
