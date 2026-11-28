@@ -530,211 +530,6 @@ REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_probes, true, "PGR4 native",
                     "Development: the volumetric fog's probes in the draws (log every 2 s); only with "
                     "pgr4_native_capture_dir set, never in the release");
 static bool VolProbes() { return g_pgr4_dev && REXCVAR_GET(pgr4_native_volumetric_probes); }
-// Development (27/11/2026, issue 32: St Petersburg's Heavy Fog, the whole volumetric fog gone for
-// one frame, the GPU at its limit; volumetrics.h Pgr4FogFrame): each frame's way to its volume (the
-// game's fog copied, the fog draws' camera, the first fog-laying draw's camera, Apply's tries early
-// and at the resolve with their answer and values, the fog-laying draws given the volume or not). A
-// frame whose fog-laying draws had no volume or its flag off (the shaders keep the game's fog) after
-// one that had it: "FOG GONE" with both frames' values; its end "FOG BACK"; every 2 s the counts.
-// Read at each draw (live); only with the capture dir set, never in the release.
-REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_missing_probe, true, "PGR4 native",
-                    "Development: the volumetric fog's frames without their volume (issue 32), logged "
-                    "with their way to it; only with pgr4_native_capture_dir set, never in the release");
-namespace {
-using pgr4::native::Pgr4FogFrame;
-using pgr4::native::Pgr4FogTry;
-// Two views (split screen) a frame, 8 frames: (frame x 2 + view) % 16.
-Pgr4FogFrame g_pgr4_fog_frames[16];
-size_t FogFrameSlot(uint64_t key) {
-  return size_t((((key & ~(uint64_t(1) << 63)) << 1) | (key >> 63)) % 16);
-}
-const char* FogTryName(int code) {
-  switch (code) {
-    case pgr4::native::kFogTryNone: return "not tried";
-    case pgr4::native::kFogTryMade: return "MADE";
-    case pgr4::native::kFogTryLaid: return "LAID";
-    case pgr4::native::kFogTryOff: return "OFF (not ready, not enabled or no scene camera)";
-    case pgr4::native::kFogTryNoTarget: return "NO TARGET";
-    case pgr4::native::kFogTryNoAxes: return "NO AXES";
-    case pgr4::native::kFogTryNothing: return "NOTHING TO DRAW";
-    case pgr4::native::kFogTryNoSize: return "NO SIZE";
-    case pgr4::native::kFogTryNoVolume: return "NO VOLUME";
-    case pgr4::native::kFogTryNoPipeline: return "NO PIPELINE";
-  }
-  return "?";
-}
-std::string FogTryText(const Pgr4FogTry& t) {
-  if (t.code == pgr4::native::kFogTryNone) return "not tried";
-  return fmt::format(
-      "{} (enabled {}, scene camera {}, targets colour {} depth {} samples {}/{}, size {}x{}, axes {}, "
-      "the fog draws' camera {}; the game's fog (from {}): exp2 {:.4f}, {:.6f} per m, height {}, c12.y {:.3f}, "
-      "colour {:.3f} {:.3f} {:.3f}, laid again {}; sun-lit air {:.5f}, mist {:.5f}; eye {:.1f} {:.1f} "
-      "{:.1f}; near {:.3f}, far {:.0f}, tan {:.3f} {:.3f})",
-      FogTryName(t.code), int(t.enabled), int(t.clip_rows), int(t.color), int(t.depth),
-      t.color_samples, t.depth_samples, t.w, t.h, int(t.axes), int(t.fog_camera),
-      t.from_engine ? "the engine" : "the copy", t.fog_exp2,
-      t.fog_distance, t.height_on, t.fog_c12, t.fog_color[0], t.fog_color[1], t.fog_color[2],
-      t.replace, t.sigma, t.mist, t.eye[0], t.eye[1], t.eye[2], t.near_plane, t.far_plane,
-      t.tan_half[0], t.tan_half[1]);
-}
-// The probe's state by view: the last frame's key, whether it had its volume, the frames since
-// without it, the last frame that had it, the time of the frame's first record.
-struct FogMissingView {
-  uint64_t key = UINT64_MAX, good_key = UINT64_MAX;
-  bool good = false;
-  uint32_t bad_run = 0;
-  std::chrono::steady_clock::time_point first;
-};
-FogMissingView g_fog_missing_view[pgr4::native::kPgr4MaxViews];
-// The last copy of the game's fog taken (the fog block's), for the record of the copy a volume is
-// made from (Pgr4FogFrame::copy_used).
-Pgr4FogFrame::Copy g_fog_copy_last;
-// The previous made frame's fog colour by view (the early try's, c10 x c12.y; -1 none) and its key.
-float g_fog_colour_prev[pgr4::native::kPgr4MaxViews] = {-1.0f, -1.0f};
-uint64_t g_fog_colour_prev_key[pgr4::native::kPgr4MaxViews] = {UINT64_MAX, UINT64_MAX};
-struct FogMissingStats {
-  uint64_t frames = 0, bad = 0, partial = 0, gone_logged = 0, by_code[11] = {};
-  uint64_t colour_jumps = 0, colour_logged = 0, black_copies = 0;
-  uint32_t longest = 0;
-};
-FogMissingStats g_fog_missing_stats;
-}  // namespace
-bool pgr4::native::Pgr4FogMissingProbe() {
-  return g_pgr4_dev && REXCVAR_GET(pgr4_native_volumetric_missing_probe);
-}
-Pgr4FogFrame& pgr4::native::Pgr4FogFrameOf(uint64_t key) {
-  Pgr4FogFrame& f = g_pgr4_fog_frames[FogFrameSlot(key)];
-  if (f.key != key) {
-    f = Pgr4FogFrame{};
-    f.key = key;
-  }
-  return f;
-}
-std::string pgr4::native::Pgr4FogFrameText(uint64_t key) {
-  const Pgr4FogFrame& f = g_pgr4_fog_frames[FogFrameSlot(key)];
-  if (f.key != key) return "(not recorded)";
-  const auto draw = [](uint32_t d) { return d == UINT32_MAX ? std::string("-") : std::to_string(d); };
-  return fmt::format(
-      "enabled {}; fog-laying draws {} (from draw {}): given the volume {}, its flag off {}, before it "
-      "was made {} (the first: draw {}, ps {:016X}, viewport half width {:.0f}, the volume's frame {}, "
-      "its resources {}); the game's fog copied by {} draws ({} of the main view); the fog draws' "
-      "camera taken {}, off their eye {} (nearest {:.3f} m), mirrored {}, a smaller view's {}; the "
-      "first draw's camera: {} tries, no camera {}, singular {}, off its eye {} (nearest {:.3f} m), "
-      "mirrored {}, a smaller view's {}, Apply called at draw {} (ps {:016X}); the copy it took: {}; "
-      "black fog colour copies {}; early ({} calls): {}; at the resolve: {}; GPU busy {:.2f} ms, "
-      "{:.2f} ms since the frame before",
-      int(f.enabled), f.fog_draws, draw(f.first_fog_draw), f.given, f.given_off, f.not_made,
-      draw(f.first_bad_draw), f.first_bad_ps, f.first_bad_xscale,
-      f.share_frame == UINT64_MAX ? std::string("none") : std::to_string(f.share_frame & ~(uint64_t(1) << 63)),
-      int(f.share_resources), f.copy_full, f.copy_main, f.cam_taken, f.cam_off_eye,
-      std::isfinite(f.cam_gap_min) ? f.cam_gap_min : -1.0f, f.cam_mirror, f.cam_small, f.first_tries,
-      f.first_no_camera, f.first_singular, f.first_off_eye,
-      std::isfinite(f.first_gap_min) ? f.first_gap_min : -1.0f, f.first_mirror, f.first_small,
-      draw(f.first_apply_draw), f.first_apply_ps,
-      f.copy_used.key == UINT64_MAX
-          ? std::string("none")
-          : fmt::format("frame {}{} draw {} ps {:016X} c10 {:.4f} {:.4f} {:.4f} {:.6f} c12.y {:.3f} "
-                        "blend {:08X} full {} main {}",
-                        f.copy_used.key & ~(uint64_t(1) << 63),
-                        f.copy_used.key == f.key ? " (this one)" : " (BEFORE)", draw(f.copy_used.draw),
-                        f.copy_used.ps, f.copy_used.c10[0], f.copy_used.c10[1], f.copy_used.c10[2],
-                        f.copy_used.c10[3], f.copy_used.c12y, f.copy_used.blend, int(f.copy_used.full),
-                        int(f.copy_used.main)),
-      f.copy_black, f.early_calls, FogTryText(f.early), FogTryText(f.late), f.gpu_busy_ms,
-      f.since_prev_ms);
-}
-namespace {
-// A finished frame (its view's next began): counted, its volume missing after a frame that had it
-// logged with both; its end logged; every 2 s the counts.
-void FogMissingFinish(uint64_t key, uint32_t view) {
-  const Pgr4FogFrame& f = g_pgr4_fog_frames[FogFrameSlot(key)];
-  FogMissingView& v = g_fog_missing_view[view];
-  FogMissingStats& st = g_fog_missing_stats;
-  if (f.key == key && f.enabled && f.fog_draws) {
-    ++st.frames;
-    st.black_copies += f.copy_black;
-    // The fog's colour the volume was made with (c10 x c12.y, the early try's) against the
-    // previous made frame's: under half or over twice is a "FOG COLOUR JUMP" (the fog laid
-    // without its light: the far scene black), logged with both frames.
-    if (f.early.code == pgr4::native::kFogTryMade) {
-      const float lum = 0.2126f * f.early.fog_color[0] + 0.7152f * f.early.fog_color[1] +
-                        0.0722f * f.early.fog_color[2];
-      const float prev = g_fog_colour_prev[view];
-      if (prev > 0.0f && !(lum >= 0.5f * prev && lum <= 2.0f * prev)) {
-        ++st.colour_jumps;
-        if (st.colour_logged < 20) {
-          ++st.colour_logged;
-          const uint64_t pk = g_fog_colour_prev_key[view];
-          REXLOG_INFO("PGR4 fog missing probe: FOG COLOUR JUMP frame {} (view {}): the fog's colour "
-                      "{:.4f} against {:.4f}: {} || frame {}: {}",
-                      key & ~(uint64_t(1) << 63), view, lum, prev, pgr4::native::Pgr4FogFrameText(key),
-                      pk & ~(uint64_t(1) << 63), pgr4::native::Pgr4FogFrameText(pk));
-        }
-      }
-      g_fog_colour_prev[view] = lum;
-      g_fog_colour_prev_key[view] = key;
-    }
-    const bool bad = f.not_made + f.given_off > 0;
-    if (bad) {
-      ++st.bad;
-      st.partial += f.given > 0;
-      ++st.by_code[std::clamp(f.early.code + 1, 0, 10)];
-      ++v.bad_run;
-      st.longest = std::max(st.longest, v.bad_run);
-      if (v.good && st.gone_logged < 20) {
-        ++st.gone_logged;
-        const uint64_t frame = key & ~(uint64_t(1) << 63);
-        REXLOG_INFO("PGR4 fog missing probe: FOG GONE frame {} (view {}): {} || the frame before that had "
-                    "it, {}: {}",
-                    frame, view, pgr4::native::Pgr4FogFrameText(key),
-                    v.good_key == UINT64_MAX ? uint64_t(0) : (v.good_key & ~(uint64_t(1) << 63)),
-                    v.good_key == UINT64_MAX ? std::string("(none)") : pgr4::native::Pgr4FogFrameText(v.good_key));
-      }
-    } else {
-      if (v.bad_run && !v.good)
-        REXLOG_INFO("PGR4 fog missing probe: FOG BACK frame {} (view {}) after {} frames without the volume",
-                    key & ~(uint64_t(1) << 63), view, v.bad_run);
-      v.bad_run = 0;
-      v.good_key = key;
-    }
-    v.good = !bad;
-  }
-  static auto last = std::chrono::steady_clock::now();
-  if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(2)) {
-    last = now;
-    if (st.frames) {
-      std::string codes;
-      for (int c = 0; c < 11; ++c)
-        if (st.by_code[c]) codes += fmt::format(" {} {};", FogTryName(c - 1), st.by_code[c]);
-      REXLOG_INFO("PGR4 fog missing probe: {} frames, {} without their volume ({} in part), the longest "
-                  "run {}; by the early try's answer:{}; the fog's colour jumping in {}, black fog "
-                  "colour copies {}{}{}",
-                  st.frames, st.bad, st.partial, st.longest, codes.empty() ? std::string(" -") : codes,
-                  st.colour_jumps, st.black_copies, st.bad ? " FOG GONE" : "",
-                  st.colour_jumps ? " FOG COLOUR JUMP" : "");
-    }
-    st = FogMissingStats{};
-  }
-}
-// The frame's record (the draws' view), its view's previous frame finished at a new key.
-Pgr4FogFrame& FogMissingRecord(uint64_t frame, uint64_t gpu_busy_ns) {
-  const uint32_t view = std::min(pgr4::native::g_pgr4_scene_view, pgr4::native::kPgr4MaxViews - 1);
-  const uint64_t key = pgr4::native::Pgr4ViewKey(frame);
-  FogMissingView& v = g_fog_missing_view[view];
-  if (v.key != key) {
-    if (v.key != UINT64_MAX) FogMissingFinish(v.key, view);
-    const auto now = std::chrono::steady_clock::now();
-    Pgr4FogFrame& f = pgr4::native::Pgr4FogFrameOf(key);
-    f.enabled = pgr4::native::Volumetrics::Enabled();
-    f.gpu_busy_ms = double(gpu_busy_ns) / 1e6;
-    f.since_prev_ms = v.key == UINT64_MAX ? 0.0 : std::chrono::duration<double, std::milli>(now - v.first).count();
-    v.first = now;
-    v.key = key;
-    return f;
-  }
-  return pgr4::native::Pgr4FogFrameOf(key);
-}
-}  // namespace
 // Development (22/11/2026): the process's private memory in MB (the race probe, the prewarm's lines).
 static uint64_t ProcessPrivateMb() {
   PROCESS_MEMORY_COUNTERS_EX pmc = {};
@@ -935,352 +730,6 @@ pgr4::native::FgProbeDraws& Pgr4FgDraws(uint64_t frame) {
 // particles under a bridge.
 int g_pgr4_weather_kind = -1;
 const uint8_t* g_pgr4_guest_base = nullptr;  // development: the rain's log, EndFrame
-// Development (27/11/2026, issue 32, Tazz: « fais la sonde de la piste 2 »): where the game's fog
-// constants come from. The game's fog shaders read their own g_fogData (c10: colour, density per
-// metre), g_heightFogData (c11) and the scale after the fog (c12.y) at each draw; the engine keeps
-// its fog as a global state (Render.RenderState.Fog.Colour 0x82C95310, Depth.Density, the height
-// fog object *0x82A80C0C +0x20..+0x30 that sub_823CEEF0 fills from Lighting.HeightFog.*
-// 0x82AA248C..0x82AA2518). The volume takes its colour from one copy, the previous frame's last
-// (Pgr4FogFrame::copy_used). Per frame, over the main view's scene draws reading c10: the values
-// each draw has (c10, c11, c12.y), the most common one, the shaders whose values differ from it (by
-// what, how often, an example, their viewport and blend); the volume's copy against that frame's
-// most common ("COPY OFF"); every 2 s the engine's candidates read in guest memory against it
-// ("ENGINE MATCH" / "ENGINE DIFFERS"); at each change of the most common values, the guest's data
-// (0x82000000-0x83000000 and the height fog object) searched for them, the addresses found.
-// Read at each draw; only with the capture dir set, never in the release.
-REXCVAR_DEFINE_BOOL(pgr4_native_volumetric_fog_source_probe, true, "PGR4 native",
-                    "Development: where the game's fog constants come from (issue 32): the draws' "
-                    "c10, c11 and c12.y by frame, those off the frame's most common, the volume's "
-                    "copy against it, the engine's fog state; only with pgr4_native_capture_dir set");
-namespace {
-// c10 xyzw, c11 xyz, c12.y (-1 not read), as their bits; b158 (the height fog on: 0, 1; 2 c11 not
-// read).
-using FogSrcKey = std::array<uint32_t, 9>;
-struct FogSrcDraw {
-  FogSrcKey key;
-  uint64_t ps;
-  float xscale;
-  uint32_t blend, draw;
-};
-struct FogSrcShader {
-  uint64_t draws = 0, off_c10 = 0, off_c11 = 0, off_c12 = 0;
-  FogSrcKey example{};
-  float xscale = 0.0f;
-  uint32_t blend = 0, draw = 0;
-};
-struct FogSrcState {
-  uint64_t key = UINT64_MAX;  // the frame being gathered (Pgr4ViewKey)
-  std::vector<FogSrcDraw> draws;
-  // Every 2 s: frames, frames whose draws had more than one c10, the volume's copies off.
-  uint64_t frames = 0, frames_mixed = 0, copy_off = 0, copy_logged = 0;
-  // ... and the engine's values (FogSrcEngineKey) against each frame's: the same, off, unread.
-  uint64_t engine_same = 0, engine_off = 0, engine_unread = 0, engine_logged = 0;
-  std::map<uint64_t, FogSrcShader> shaders;
-  FogSrcKey dominant{};  // the last frame's most common values
-  bool have_dominant = false;
-  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now(), searched{};
-  FogSrcKey searched_key{};
-};
-FogSrcState g_fog_src;
-float FogSrcF(uint32_t bits) {
-  float f;
-  std::memcpy(&f, &bits, 4);
-  return f;
-}
-std::string FogSrcText(const FogSrcKey& k) {
-  return fmt::format("c10 {:.4f} {:.4f} {:.4f} {:.6f} c11 {:.3f} {:.5f} {:.5f} c12.y {:.3f} b158 {}",
-                     FogSrcF(k[0]), FogSrcF(k[1]), FogSrcF(k[2]), FogSrcF(k[3]), FogSrcF(k[4]),
-                     FogSrcF(k[5]), FogSrcF(k[6]), FogSrcF(k[7]), k[8] == 2 ? std::string("-") : std::to_string(k[8]));
-}
-bool FogSrcReadable(const uint8_t* base, uint32_t a, uint32_t size) {
-  MEMORY_BASIC_INFORMATION info;
-  if (!base || a < 0x10000 || uint64_t(a) + size > 0xC0000000ull) return false;
-  if (!VirtualQuery(base + a, &info, sizeof(info)) || info.State != MEM_COMMIT ||
-      (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-    return false;
-  return uint64_t(a) + size <= uint64_t(reinterpret_cast<const uint8_t*>(info.BaseAddress) - base) + info.RegionSize;
-}
-float FogSrcBeF(const uint8_t* base, uint32_t a) {
-  const uint32_t v = uint32_t(base[a]) << 24 | uint32_t(base[a + 1]) << 16 | uint32_t(base[a + 2]) << 8 | base[a + 3];
-  return FogSrcF(v);
-}
-// The guest's committed memory in [lo, hi) searched for `pattern` (big-endian floats), at most 12
-// addresses.
-std::string FogSrcSearch(const uint8_t* base, uint32_t lo, uint32_t hi, const float* values, int count) {
-  uint8_t pattern[16];
-  for (int i = 0; i < count; ++i) {
-    uint32_t v;
-    std::memcpy(&v, &values[i], 4);
-    pattern[4 * i] = uint8_t(v >> 24);
-    pattern[4 * i + 1] = uint8_t(v >> 16);
-    pattern[4 * i + 2] = uint8_t(v >> 8);
-    pattern[4 * i + 3] = uint8_t(v);
-  }
-  const size_t n = size_t(4 * count);
-  std::string out;
-  int found = 0;
-  for (uint64_t a = lo; a < hi && found < 12;) {
-    MEMORY_BASIC_INFORMATION info;
-    if (!VirtualQuery(base + a, &info, sizeof(info))) break;
-    const uint64_t region_end =
-        std::min<uint64_t>(hi, uint64_t(reinterpret_cast<const uint8_t*>(info.BaseAddress) - base) + info.RegionSize);
-    if (info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && region_end > a + n) {
-      const uint8_t* p = base + a;
-      const uint8_t* end = base + region_end;
-      while (found < 12) {
-        const uint8_t* hit = std::search(p, end, pattern, pattern + n);
-        if (hit == end) break;
-        out += fmt::format(" {:08X}", uint32_t(hit - base));
-        ++found;
-        p = hit + 4;
-      }
-    }
-    a = region_end;
-  }
-  return out.empty() ? std::string(" none") : out;
-}
-// The engine's candidates, read now: Render.RenderState (0x82C95310.., its values by 4 floats from
-// +32), the height fog object, Lighting.HeightFog.
-std::string FogSrcEngine(const uint8_t* base, const FogSrcKey& dom, bool& match_colour) {
-  match_colour = false;
-  if (!base) return "(no guest base)";
-  std::string out;
-  if (FogSrcReadable(base, 0x82C95310, 0x1A0)) {
-    const float col[4] = {FogSrcBeF(base, 0x82C95330), FogSrcBeF(base, 0x82C95334),
-                          FogSrcBeF(base, 0x82C95338), FogSrcBeF(base, 0x82C9533C)};
-    out += fmt::format("Fog.Colour (0x82C95330) {:.4f} {:.4f} {:.4f} {:.4f}; Depth.Density (0x82C95398) "
-                       "{:.6f}, (0x82C953B8) {:.6f}; HeightFog block 0x82C95400..: {:.4f} {:.4f} {:.4f} "
-                       "{:.4f} {:.4f} {:.4f}",
-                       col[0], col[1], col[2], col[3], FogSrcBeF(base, 0x82C95398),
-                       FogSrcBeF(base, 0x82C953B8), FogSrcBeF(base, 0x82C95420),
-                       FogSrcBeF(base, 0x82C95444), FogSrcBeF(base, 0x82C95478),
-                       FogSrcBeF(base, 0x82C954AC), FogSrcBeF(base, 0x82C95424),
-                       FogSrcBeF(base, 0x82C95458));
-    match_colour = std::abs(col[0] - FogSrcF(dom[0])) < 1e-4f && std::abs(col[1] - FogSrcF(dom[1])) < 1e-4f &&
-                   std::abs(col[2] - FogSrcF(dom[2])) < 1e-4f;
-  }
-  if (FogSrcReadable(base, 0x82A80C0C, 4)) {
-    const uint32_t o = uint32_t(base[0x82A80C0C]) << 24 | uint32_t(base[0x82A80C0D]) << 16 |
-                       uint32_t(base[0x82A80C0E]) << 8 | base[0x82A80C0F];
-    if (FogSrcReadable(base, o, 0x40))
-      out += fmt::format("; height fog object {:08X}: on {} +0x28 {:.6f} +0x2C {:.3f} +0x30 {:.5f}", o,
-                         uint32_t(base[o + 0x23]), FogSrcBeF(base, o + 0x28), FogSrcBeF(base, o + 0x2C),
-                         FogSrcBeF(base, o + 0x30));
-  }
-  if (FogSrcReadable(base, 0x82AA248C, 0x90))
-    out += fmt::format("; Lighting.HeightFog on {} height {:.3f} distance {:.3f} falloff {:.4f}",
-                       uint32_t(base[0x82AA248C]), FogSrcBeF(base, 0x82AA24B0), FogSrcBeF(base, 0x82AA24E4),
-                       FogSrcBeF(base, 0x82AA2518));
-  return out;
-}
-// The fog constants as the engine computes them (audit of 27/11/2026): sub_823C53A8 (the
-// scene's lighting set-up) writes into the D3D device's PS constants c10 = sub_823CD8E8 of the
-// lighting 0x82A1D220 (rgb its +0xC4..+0xCC times +0xD0, w 1 / its +0x80; Lighting.OverrideFogDistance
-// gives w from Car.Render.CubeMap.FogDistance instead, for the car's cube map) and c11 =
-// sub_823CD968 (Lighting.HeightFog: 0x82AA24B0, 1 / 0x82AA24E4, 1 / 0x82AA2518); sub_822B40C0
-// writes c12 (y Shaders.OutputGain 0x82AB54BC, z 1 / Shaders.OutputGamma 0x82AB54F0). Read now from
-// guest memory into a key as the draws' (c11.w and c12.x not compared). False: not readable.
-bool FogSrcEngineKey(const uint8_t* base, FogSrcKey& k) {
-  (void)base;  // the same reader as the volume's (Pgr4EngineFog, g_pgr4_guest_base)
-  float c10[4], c11[3], gain;
-  bool height_on;
-  if (!pgr4::native::Pgr4EngineFog(c10, c11, gain, height_on)) return false;
-  const auto bits = [](float f) {
-    uint32_t b;
-    std::memcpy(&b, &f, 4);
-    return b;
-  };
-  for (int i = 0; i < 4; ++i) k[i] = bits(c10[i]);
-  for (int i = 0; i < 3; ++i) k[4 + i] = bits(c11[i]);
-  k[7] = bits(gain);
-  k[8] = height_on ? 1u : 0u;
-  return true;
-}
-// Which of c10 (4), c11 (3), c12.y, b158 the engine's values differ in from a frame's (relative
-// 1e-4; c11 and b158 left out where the draws do not read c11, c12.y where not read), as text;
-// empty: all the same.
-std::string FogSrcEngineDiff(const FogSrcKey& e, const FogSrcKey& d) {
-  static const char* const kNames[8] = {"c10.r", "c10.g", "c10.b", "c10.w", "c11.x", "c11.y", "c11.z", "c12.y"};
-  const bool no_c11 = d[8] == 2;
-  std::string out;
-  if (!no_c11 && e[8] != d[8]) out += fmt::format(" b158 {} (draws {})", e[8], d[8]);
-  for (int i = 0; i < 8; ++i) {
-    if ((i >= 4 && i <= 6 && no_c11) || (i == 7 && d[7] == 0xBF800000u)) continue;
-    const float a = FogSrcF(e[i]), b = FogSrcF(d[i]);
-    if (!(std::abs(a - b) <= 1e-4f * std::max({std::abs(a), std::abs(b), 1e-6f})))
-      out += fmt::format(" {} {:.6g} (draws {:.6g})", kNames[i], a, b);
-  }
-  return out;
-}
-// A frame's draws done (its view's next frame began, or the probe's check): its most common
-// values, the shaders off them, the volume's copy against them; the 2 s summary.
-void FogSrcFinish(const uint8_t* base) {
-  FogSrcState& st = g_fog_src;
-  if (st.key == UINT64_MAX || st.draws.empty()) return;
-  std::map<FogSrcKey, uint32_t> counts;
-  std::map<std::array<uint32_t, 4>, uint32_t> c10s;
-  for (const FogSrcDraw& d : st.draws) {
-    ++counts[d.key];
-    ++c10s[{d.key[0], d.key[1], d.key[2], d.key[3]}];
-  }
-  // The most common c10 and, among its draws, the most common c11 and c12.y.
-  std::array<uint32_t, 4> top_c10{};
-  uint32_t best = 0;
-  for (const auto& [k, n] : c10s)
-    if (n > best) best = n, top_c10 = k;
-  FogSrcKey dom{};
-  best = 0;
-  for (const auto& [k, n] : counts)
-    if (k[0] == top_c10[0] && k[1] == top_c10[1] && k[2] == top_c10[2] && k[3] == top_c10[3] &&
-        k[7] != FogSrcKey::value_type(0xBF800000u) && n > best)
-      best = n, dom = k;
-  if (!best) {
-    for (const auto& [k, n] : counts)
-      if (k[0] == top_c10[0] && k[1] == top_c10[1] && k[2] == top_c10[2] && k[3] == top_c10[3] && n > best)
-        best = n, dom = k;
-  }
-  ++st.frames;
-  st.frames_mixed += c10s.size() > 1;
-  // The engine's values against the frame's most common (read now, during the next frame: the
-  // game's fog changes with the weather and the time, not frame to frame).
-  {
-    FogSrcKey eng{};
-    if (!FogSrcEngineKey(base, eng)) {
-      ++st.engine_unread;
-    } else if (const std::string diff = FogSrcEngineDiff(eng, dom); diff.empty()) {
-      ++st.engine_same;
-    } else {
-      ++st.engine_off;
-      if (st.engine_logged < 10) {
-        ++st.engine_logged;
-        REXLOG_INFO("PGR4 fog source probe: ENGINE OFF frame {}:{}; the frame's draws {}",
-                    st.key & ~(uint64_t(1) << 63), diff, FogSrcText(dom));
-      }
-    }
-  }
-  for (const FogSrcDraw& d : st.draws) {
-    FogSrcShader& s = st.shaders[d.ps];
-    ++s.draws;
-    const bool c10_off = d.key[0] != dom[0] || d.key[1] != dom[1] || d.key[2] != dom[2] || d.key[3] != dom[3];
-    const bool c11_off = d.key[8] != 2 && dom[8] != 2 &&
-                         (d.key[4] != dom[4] || d.key[5] != dom[5] || d.key[6] != dom[6] || d.key[8] != dom[8]);
-    const bool c12_off = d.key[7] != 0xBF800000u && dom[7] != 0xBF800000u && d.key[7] != dom[7];
-    s.off_c10 += c10_off;
-    s.off_c11 += c11_off;
-    s.off_c12 += c12_off;
-    if (c10_off || c11_off || c12_off) {
-      s.example = d.key;
-      s.xscale = d.xscale;
-      s.blend = d.blend;
-      s.draw = d.draw;
-    }
-  }
-  // The volume made for this frame took its copy (Pgr4FogFrame::copy_used): against the frame's
-  // most common c10 and c12.y.
-  const Pgr4FogFrame& f = g_pgr4_fog_frames[FogFrameSlot(st.key)];  // read only (no slot cleared)
-  if (f.key == st.key && f.copy_used.key != UINT64_MAX) {
-    uint32_t cb[4], c12b;
-    std::memcpy(cb, f.copy_used.c10, 16);
-    std::memcpy(&c12b, &f.copy_used.c12y, 4);
-    const bool off = cb[0] != dom[0] || cb[1] != dom[1] || cb[2] != dom[2] || cb[3] != dom[3] ||
-                     (f.copy_used.c12y >= 0.0f && dom[7] != 0xBF800000u && c12b != dom[7]);
-    if (off) {
-      ++st.copy_off;
-      if (st.copy_logged < 10) {
-        ++st.copy_logged;
-        REXLOG_INFO("PGR4 fog source probe: COPY OFF frame {}: the volume's copy (frame {}, draw {}, ps "
-                    "{:016X}) c10 {:.4f} {:.4f} {:.4f} {:.6f} c12.y {:.3f}, the frame's draws' most common "
-                    "{} ({} of {} draws)",
-                    st.key & ~(uint64_t(1) << 63), f.copy_used.key & ~(uint64_t(1) << 63), f.copy_used.draw,
-                    f.copy_used.ps, f.copy_used.c10[0], f.copy_used.c10[1], f.copy_used.c10[2],
-                    f.copy_used.c10[3], f.copy_used.c12y, FogSrcText(dom), best, st.draws.size());
-      }
-    }
-  }
-  // The guest's data searched for the most common values when they change (at most every 5 s).
-  const auto now = std::chrono::steady_clock::now();
-  if (base && dom != st.searched_key && now - st.searched >= std::chrono::seconds(5)) {
-    st.searched = now;
-    st.searched_key = dom;
-    const float rgb[3] = {FogSrcF(dom[0]), FogSrcF(dom[1]), FogSrcF(dom[2])};
-    const float w = FogSrcF(dom[3]);
-    const float h[3] = {FogSrcF(dom[4]), FogSrcF(dom[5]), FogSrcF(dom[6])};
-    REXLOG_INFO("PGR4 fog source probe: SEARCH for {}: c10.rgb at{}; c10.w at{}; c11.xyz at{}",
-                FogSrcText(dom), FogSrcSearch(base, 0x82000000u, 0x83000000u, rgb, 3),
-                FogSrcSearch(base, 0x82000000u, 0x83000000u, &w, 1),
-                FogSrcSearch(base, 0x82000000u, 0x83000000u, h, 3));
-  }
-  st.dominant = dom;
-  st.have_dominant = true;
-  st.draws.clear();
-  if (now - st.last >= std::chrono::seconds(2)) {
-    st.last = now;
-    bool match = false;
-    const std::string engine = FogSrcEngine(base, dom, match);
-    std::string off;
-    int listed = 0;
-    for (const auto& [ps, s] : st.shaders) {
-      if (!(s.off_c10 || s.off_c11 || s.off_c12) || listed >= 12) continue;
-      ++listed;
-      off += fmt::format(" | {:016X}: {} draws, off in c10 {}, c11 {}, c12.y {} (e.g. draw {}: {}, viewport "
-                         "half width {:.0f}, blend {:08X})",
-                         ps, s.draws, s.off_c10, s.off_c11, s.off_c12, s.draw, FogSrcText(s.example),
-                         s.xscale, s.blend);
-    }
-    // The engine's values (sub_823C53A8's sources) now, and its fog object 0x82A80C20 whole.
-    FogSrcKey eng{};
-    const bool eng_read = FogSrcEngineKey(base, eng);
-    std::string object;
-    if (base && FogSrcReadable(base, 0x82A80C20, 0x70))
-      for (uint32_t o = 0; o < 0x70; o += 4) object += fmt::format(" {:.5g}", FogSrcBeF(base, 0x82A80C20 + o));
-    REXLOG_INFO("PGR4 fog source probe: {} frames, {} with more than one c10, the volume's copy off in {}{}; "
-                "the engine's values (lighting 0x82A1D220, Lighting.HeightFog, Shaders.OutputGain) the "
-                "same as the draws' in {}, off in {}{}, unread in {}: {}; most common {}; shaders: {}{}; "
-                "fog object 0x82A80C20:{}; tunables: {}",
-                st.frames, st.frames_mixed, st.copy_off, st.copy_off ? " COPY OFF" : "", st.engine_same,
-                st.engine_off, st.engine_off ? " ENGINE OFF" : "", st.engine_unread,
-                eng_read ? FogSrcText(eng) : std::string("(not readable)"), FogSrcText(dom),
-                st.shaders.size(), off.empty() ? std::string(" none off") : off,
-                object.empty() ? std::string(" (not readable)") : object, engine);
-    (void)match;
-    st.frames = st.frames_mixed = st.copy_off = st.copy_logged = 0;
-    st.engine_same = st.engine_off = st.engine_unread = st.engine_logged = 0;
-    st.shaders.clear();
-  }
-}
-}  // namespace
-// Local change (27/11/2026, issue 32: the volume's fog from one draw's copy, the previous frame's
-// last; on one frame the whole fog laid without its light, the far scene black): the game's fog as
-// its engine computes it for the scene's draws, read from guest memory (audit of 27/11/2026, its
-// equality with the draws' measured on 10 372 frames in Shanghai's Heavy Fog): sub_823C53A8 (the
-// scene's lighting set-up) writes c10 = sub_823CD8E8 of the lighting 0x82A1D220 (rgb its
-// +0xC4..+0xCC times +0xD0, w 1 / its +0x80) and c11 = sub_823CD968 (Lighting.HeightFog: 0x82AA24B0,
-// 1 / 0x82AA24E4, 1 / 0x82AA2518); sub_822B40C0 writes c12.y = Shaders.OutputGain (0x82AB54BC); the
-// height fog on is Lighting.HeightFog.Enable (0x82AA248C), from which sub_823CEEF0 selects the
-// shaders' b158. False (the caller keeps the copy): the guest's memory not known yet (no race loaded
-// since the start: g_pgr4_guest_base) or not readable, or a value not finite.
-bool pgr4::native::Pgr4EngineFog(float c10[4], float c11[3], float& gain, bool& height_on) {
-  const uint8_t* const base = g_pgr4_guest_base;
-  constexpr uint32_t kLighting = 0x82A1D220;
-  if (!FogSrcReadable(base, kLighting + 0x80, 0x54) || !FogSrcReadable(base, 0x82AA248C, 0x90) ||
-      !FogSrcReadable(base, 0x82AB54BC, 0x4))
-    return false;
-  const float intensity = FogSrcBeF(base, kLighting + 0xD0);
-  c10[0] = FogSrcBeF(base, kLighting + 0xC4) * intensity;
-  c10[1] = FogSrcBeF(base, kLighting + 0xC8) * intensity;
-  c10[2] = FogSrcBeF(base, kLighting + 0xCC) * intensity;
-  c10[3] = 1.0f / FogSrcBeF(base, kLighting + 0x80);
-  c11[0] = FogSrcBeF(base, 0x82AA24B0);
-  c11[1] = 1.0f / FogSrcBeF(base, 0x82AA24E4);
-  c11[2] = 1.0f / FogSrcBeF(base, 0x82AA2518);
-  gain = FogSrcBeF(base, 0x82AB54BC);
-  height_on = base[0x82AA248C] != 0;
-  for (int i = 0; i < 4; ++i)
-    if (!std::isfinite(c10[i])) return false;
-  for (int i = 0; i < 3; ++i)
-    if (!std::isfinite(c11[i])) return false;
-  return std::isfinite(gain);
-}
 bool g_pgr4_light_rain = false;  // its record's name has "Light Rain": half the running drops
 // On a race's screens (src/pgr4_menu.cpp): the garages and the menus keep the last race's weather otherwise.
 bool g_pgr4_race_screen = false;
@@ -9576,34 +9025,6 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       }
     }
   }
-  // Development (27/11/2026, issue 32, pgr4_native_volumetric_fog_source_probe): the main view's
-  // scene draws reading c10, their fog constants by frame (FogSrcFinish at the next frame).
-  if (g_pgr4_dev && ps && REXCVAR_GET(pgr4_native_volumetric_fog_source_probe) &&
-      Upscaler::IsScene(sdr.rb_surface_info) && Volumetrics::Enabled() &&
-      std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth()) {
-    const Shader::ConstantRegisterMap& fm = ps->constant_register_map();
-    if (!fm.float_dynamic_addressing && ((fm.float_bitmap[0] >> 10) & 1)) {
-      const uint64_t key = Pgr4ViewKey(r.frame_index());
-      if (g_fog_src.key != key) {
-        FogSrcFinish(g_pgr4_guest_base);
-        g_fog_src.key = key;
-      }
-      const auto pc = [&](uint32_t reg, uint32_t k) {
-        return regs[XE_GPU_REG_SHADER_CONSTANT_256_X + reg * 4 + k];
-      };
-      FogSrcDraw d;
-      for (uint32_t k = 0; k < 4; ++k) d.key[k] = pc(10, k);
-      const bool c11 = (fm.float_bitmap[0] >> 11) & 1, c12 = (fm.float_bitmap[0] >> 12) & 1;
-      for (uint32_t k = 0; k < 3; ++k) d.key[4 + k] = c11 ? pc(11, k) : 0u;
-      d.key[7] = c12 ? pc(12, 1) : 0xBF800000u;  // -1: not read
-      d.key[8] = c11 ? (regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + (158 >> 5)] >> (158 & 31)) & 1 : 2u;
-      d.ps = ps->ucode_data_hash();
-      d.xscale = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE));
-      d.blend = regs[XE_GPU_REG_RB_BLENDCONTROL0];
-      d.draw = draw_index;
-      g_fog_src.draws.push_back(d);
-    }
-  }
   // Development (21/11/2026, the volumetric fog in place of the game's): the scene shaders' fog,
   // every 2 s while the volumetric option is on: the distance fog (c10.w per metre, c10.rgb its
   // color), the height fog (bool 158 on: c11.x its layer's height, c11.y its density, c11.z its
@@ -9652,27 +9073,6 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
       // made at the first fog draw (the bumper view): the fog's colour six times too dark.
       const bool main_view = !REXCVAR_GET(pgr4_native_volumetric_fog_main_view) ||
                              std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth();
-      // Development (27/11/2026, issue 32): the frame's fog copies (its way to the volume).
-      Pgr4FogFrame* const miss = pgr4::native::Pgr4FogMissingProbe()
-                                     ? &FogMissingRecord(r.frame_index(), r.device().gpu_busy_ns())
-                                     : nullptr;
-      if (miss) {
-        miss->copy_full += full;
-        miss->copy_main += (full || !from_code) && main_view;
-        // The copy taken now (below), kept as the last one; a black colour with a density counted.
-        if ((full || !from_code) && main_view) {
-          Pgr4FogFrame::Copy& cp = g_fog_copy_last;
-          cp.key = pgr4::native::Pgr4ViewKey(r.frame_index());
-          cp.draw = draw_index;
-          cp.ps = ps->ucode_data_hash();
-          for (int k = 0; k < 4; ++k) cp.c10[k] = c(10, k);
-          cp.c12y = ((pmap.float_bitmap[0] >> 12) & 1) ? c(12, 1) : -1.0f;
-          cp.blend = regs[XE_GPU_REG_RB_BLENDCONTROL0];
-          cp.full = full;
-          cp.main = main_view;
-          miss->copy_black += cp.c10[0] + cp.c10[1] + cp.c10[2] < 1e-4f && cp.c10[3] > 0.0f;
-        }
-      }
       if ((full || !from_code) && main_view) {
         for (int k = 0; k < 4; ++k) {
           g_pgr4_fog_c10[k].store(c(10, k), std::memory_order_relaxed);
@@ -9757,21 +9157,14 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
                                  std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) > Upscaler::MainViewHalfWidth();
         if (!(gap <= 0.05f + 1e-4f * scale)) {
           ++g_pgr4_fog_camera_stats[1];
-          if (miss) {
-            ++miss->cam_off_eye;
-            miss->cam_gap_min = std::min(miss->cam_gap_min, gap);
-          }
         } else if (!(m[5] > 0.0f)) {
           ++g_pgr4_fog_camera_stats[2];  // the world's up drawn downwards: the reflection's
-          if (miss) ++miss->cam_mirror;
         } else if (!camera_view) {
           // another view's (a smaller viewport): not the volume's
-          if (miss) ++miss->cam_small;
         } else {
           std::memcpy(g_pgr4_fog_clip, m, sizeof(m));
           g_pgr4_fog_clip_frame = Pgr4ViewKey(r.frame_index());
           ++g_pgr4_fog_camera_stats[0];
-          if (miss) ++miss->cam_taken;
         }
       }
       // Local change (21/11/2026, the fog to be laid by each shader: the volume before the scene's
@@ -9787,12 +9180,6 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
             g_view_volume_frame = r.frame_index();
             ++g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)].volume_frames;
           }
-        }
-        if (Volumetrics* v = r.volumetrics();
-            miss && v && !v->VolumeMade(r.frame_index()) && miss->first_apply_draw == UINT32_MAX) {
-          miss->first_apply_draw = draw_index;  // development (27/11/2026, issue 32)
-          miss->first_apply_ps = ps->ucode_data_hash();
-          miss->copy_used = g_fog_copy_last;  // the copy the volume is made from
         }
         if (Volumetrics* v = r.volumetrics(); v && !v->VolumeMade(r.frame_index()) &&
                                                v->Apply(list, r.render_targets(),
@@ -9905,11 +9292,6 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     }
     ++draws_in_frame;
     Volumetrics* v = r.volumetrics();
-    // Development (27/11/2026, issue 32): the first draw's camera tries (its way to the volume).
-    Pgr4FogFrame* const miss = pgr4::native::Pgr4FogMissingProbe() && v && !v->VolumeMade(r.frame_index())
-                                   ? &FogMissingRecord(r.frame_index(), r.device().gpu_busy_ns())
-                                   : nullptr;
-    if (miss) ++miss->first_tries;
     if (v && !v->VolumeMade(r.frame_index())) {
       const Shader::ConstantRegisterMap& vm = vs->constant_register_map();
       const uint64_t bits = vm.float_dynamic_addressing ? 0u : vm.float_bitmap[0];
@@ -9960,7 +9342,6 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
               }
           } else {
             ++fs.singular;
-            if (miss) ++miss->first_singular;
           }
           from = 2;
         } else {
@@ -9969,7 +9350,6 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         }
       } else {
         ++fs.no_camera;
-        if (miss) ++miss->first_no_camera;
       }
       if (from && ok) {
         // The centre (clip x, y and w 0: rows 0, 1 and 3) by Cramer's rule, against c24.
@@ -10000,25 +9380,14 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
         const float scale = std::max({std::abs(eye[0]), std::abs(eye[1]), std::abs(eye[2]), 1.0f});
         if (!(gap <= 0.05f + 1e-4f * scale)) {
           ++fs.off_eye;
-          if (miss) {
-            ++miss->first_off_eye;
-            miss->first_gap_min = std::min(miss->first_gap_min, gap);
-          }
         } else if (!(w2c[5] > 0.0f)) {
           ++fs.mirrored;
-          if (miss) ++miss->first_mirror;
         } else if (REXCVAR_GET(pgr4_native_volumetric_camera_main_view) &&
                    std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) <= Upscaler::MainViewHalfWidth()) {
           // Local change (22/11/2026, pgr4_native_volumetric_camera_main_view): another view's
           // draw (a smaller viewport): neither its camera nor the volume made now.
           if (ViewProbeOn()) ++g_view_probe[g_pgr4_view_mode.load(std::memory_order_relaxed)].left_small;
-          if (miss) ++miss->first_small;
         } else {
-          if (miss && miss->first_apply_draw == UINT32_MAX) {
-            miss->first_apply_draw = draw_index;
-            miss->first_apply_ps = ps->ucode_data_hash();
-            miss->copy_used = g_fog_copy_last;  // the copy the volume is made from
-          }
           std::memcpy(g_pgr4_fog_clip, w2c, sizeof(w2c));
           g_pgr4_fog_clip_frame = Pgr4ViewKey(r.frame_index());
           std::memcpy(first_clip, w2c, sizeof(w2c));
@@ -10271,21 +9640,6 @@ void DrawRenderer::Impl::Draw(const DrawState& s, const DrawPrep* prep) {
     static auto fog_volume_last = std::chrono::steady_clock::now();
     const Volumetrics* const v = r.volumetrics();
     const bool made = v && v->share().volume && v->share().range && v->share().frame == Pgr4ViewKey(r.frame_index());
-    // Development (27/11/2026, issue 32): the fog-laying draws of the scene given the volume with
-    // its flag on (the shader lays ours), with it off or without it (the game's fog kept).
-    if (fog_in_shader && pgr4::native::Pgr4FogMissingProbe()) {
-      Pgr4FogFrame& miss = FogMissingRecord(r.frame_index(), r.device().gpu_busy_ns());
-      if (!miss.fog_draws++) miss.first_fog_draw = draw_index;
-      const bool on = made && v->share().shader[15] > 0.5f;
-      ++(on ? miss.given : made ? miss.given_off : miss.not_made);
-      if (!on && miss.first_bad_draw == UINT32_MAX) {
-        miss.first_bad_draw = draw_index;
-        miss.first_bad_ps = ps ? ps->ucode_data_hash() : 0;
-        miss.first_bad_xscale = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE));
-        miss.share_frame = v ? v->share().frame : UINT64_MAX;
-        miss.share_resources = v && v->share().volume && v->share().range;
-      }
-    }
     if (made) {
       const Volumetrics::Share& sh = v->share();
       if (fog_volume_view != sh.volume || fog_volume_generation != sh.generation ||

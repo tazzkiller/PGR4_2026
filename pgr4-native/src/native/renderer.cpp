@@ -194,9 +194,13 @@ pgr4::native::FgProbeDraws& Pgr4FgDraws(uint64_t frame);
 // DLSS-G): the HUD-less copy taken after the frame's last opaque composite (the tone map, before the
 // HUD), not its first (the scene's, before its shadows, flares, rain and tone map: the copy 0.66 of
 // the image, so FidelityFX took most of the frame for HUD). Read at each draw.
-REXCVAR_DEFINE_BOOL(pgr4_native_hudless_last_composite, true, "PGR4 native",
+// Local change (28/11/2026): off by default, the copy where v1.65 takes it. On, the generated
+// frames ghosted around the cars and the HUD, and a dark frame showed around the minimap with FSR's
+// frame generation, the camera moving (Tazz, the v1.68 release withdrawn): the shadows, flares and
+// rain are then interpolated, not copied.
+REXCVAR_DEFINE_BOOL(pgr4_native_hudless_last_composite, false, "PGR4 native",
                     "Frame generation (FSR's and DLSS-G): the HUD-less copy taken after the frame's "
-                    "last opaque composite (the tone map), not its first (off: as before)");
+                    "last opaque composite (the tone map), not its first (off: as in v1.65)");
 REXCVAR_DEFINE_BOOL(pgr4_native_fg_probe, true, "PGR4 native",
                     "Development (the capture dir set): the frame generation probe (fg_probe.h), "
                     "each frame's image, generated frame and HUD-less copy against each other, "

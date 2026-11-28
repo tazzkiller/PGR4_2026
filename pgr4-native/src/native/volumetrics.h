@@ -76,83 +76,6 @@ inline uint32_t Pgr4ViewSlot(uint64_t frame, uint32_t frames_in_flight) {
 // (the scene's whole height, as before).
 extern uint32_t g_pgr4_split_rows;
 
-// Development (27/11/2026, issue 32: on one frame the whole volumetric fog gone, St Petersburg's
-// Heavy Fog, the GPU at its limit): each frame's way to its volume, by its key (Pgr4ViewKey) in
-// slot key % 8, filled by the draws (draw.cpp) and by Apply's tries. A frame whose fog-laying draws
-// had no volume, or its flag off (the shaders then keep the game's fog), after a frame that had it
-// is logged with both ("FOG GONE"), and so is a frame whose grid points all jump ("SCENE JUMP",
-// GridProbe). pgr4_native_volumetric_missing_probe, only with the capture dir (never in the release).
-// Apply's answer at a try: why it returned.
-enum Pgr4FogTryCode : int {
-  kFogTryNone = -1,       // not tried this frame
-  kFogTryMade = 0,        // the volume made (early), or made and laid (at the resolve)
-  kFogTryLaid = 1,        // at the resolve: laid, the volume made early
-  kFogTryOff = 2,         // not ready, not Enabled, or no scene camera (clip_rows_)
-  kFogTryNoTarget = 3,    // the draw's colour or depth target not found, or they differ
-  kFogTryNoAxes = 4,      // the world's axes not seen through the frame's clip transform
-  kFogTryNothing = 5,     // nothing to draw: the game's fog not known, no sun, no mist
-  kFogTryNoSize = 6,      // a size of 0, or its targets refused
-  kFogTryNoVolume = 7,    // the volume's memory refused
-  kFogTryNoPipeline = 8,  // at the resolve: the apply's pipeline missing
-};
-struct Pgr4FogTry {
-  int code = kFogTryNone;
-  bool enabled = false, clip_rows = false, axes = false, fog_camera = false;
-  bool color = false, depth = false, same_target = false;
-  bool from_engine = false;  // the fog read from the engine (Pgr4EngineFog), not the copy
-  uint32_t w = 0, h = 0, color_samples = 0, depth_samples = 0, replace = 0, height_on = 0;
-  float fog_exp2 = 0.0f, fog_distance = 0.0f, fog_c12 = 0.0f, fog_color[3] = {}, eye[3] = {};
-  float sigma = 0.0f, mist = 0.0f, near_plane = 0.0f, far_plane = 0.0f, tan_half[2] = {};
-};
-struct Pgr4FogFrame {
-  uint64_t key = UINT64_MAX;
-  bool enabled = false;  // Volumetrics::Enabled at the frame's first fog-laying draw
-  // The scene's draws laying the fog themselves: given the volume with its flag on, with it off,
-  // the volume not made for this frame; the first such draw, the first without the volume.
-  uint32_t fog_draws = 0, given = 0, given_off = 0, not_made = 0;
-  uint32_t first_fog_draw = UINT32_MAX, first_bad_draw = UINT32_MAX;
-  uint64_t first_bad_ps = 0, share_frame = UINT64_MAX;
-  float first_bad_xscale = 0.0f;
-  bool share_resources = false;
-  // The game's fog copied (draws reading all of it; of the main view) and the fog draws' camera:
-  // taken, off their eye c5 (the nearest gap), mirrored, a smaller viewport's.
-  uint32_t copy_full = 0, copy_main = 0, cam_taken = 0, cam_off_eye = 0, cam_mirror = 0,
-           cam_small = 0;
-  float cam_gap_min = INFINITY;
-  // The first fog-laying draw's camera (pgr4_native_volumetric_volume_first_draw), while the
-  // volume is not made: its tries, without a camera, c0-c2 singular, off its eye c24, mirrored, a
-  // smaller viewport's; the draw that called Apply.
-  uint32_t first_tries = 0, first_no_camera = 0, first_singular = 0, first_off_eye = 0,
-           first_mirror = 0, first_small = 0, first_apply_draw = UINT32_MAX;
-  float first_gap_min = INFINITY;
-  uint64_t first_apply_ps = 0;
-  // The game's fog copied (draw.cpp, g_pgr4_fog_c10 and the others): the copy the volume was made
-  // from (the last before Apply's first try: this frame's or the one before's), and the frame's
-  // copies whose fog colour was black (c10.rgb 0) with a density (c10.w over 0). Each copy: its
-  // frame and view, draw, pixel shader, c10, c12.y (-1 not read), blend control 0, full (its fog code
-  // read) and of the main view.
-  struct Copy {
-    uint64_t key = UINT64_MAX, ps = 0;
-    uint32_t draw = UINT32_MAX, blend = 0;
-    float c10[4] = {}, c12y = -1.0f;
-    bool full = false, main = false;
-  };
-  Copy copy_used;
-  uint32_t copy_black = 0;
-  // Apply's tries: early (the first that went past "tried already"; its calls), at the resolve.
-  uint32_t early_calls = 0;
-  Pgr4FogTry early, late;
-  // The GPU's busy time (the last measured frame's) and the time since the previous frame's first
-  // fog-laying draw.
-  double gpu_busy_ms = 0.0, since_prev_ms = 0.0;
-};
-// draw.cpp (27/11/2026, issue 32): the game's fog as its engine computes it for the scene's draws
-// (c10, c11 xyz, c12.y, the height fog on), read from guest memory; false: not known yet.
-bool Pgr4EngineFog(float c10[4], float c11[3], float& gain, bool& height_on);
-bool Pgr4FogMissingProbe();                // draw.cpp: the probe on (development only)
-Pgr4FogFrame& Pgr4FogFrameOf(uint64_t key);  // draw.cpp: its slot, cleared for a new key
-std::string Pgr4FogFrameText(uint64_t key);  // draw.cpp: its values, or "(not recorded)"
-
 class Volumetrics {
  public:
   bool Initialize(ID3D12Device* device);
@@ -275,7 +198,6 @@ class Volumetrics {
   D3D12_RESOURCE_STATES media_state_[2] = {D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
   uint32_t media_now_ = 0;
-  uint64_t media_uav_barriers_ = 0;  // development (28/11/2026, issue 32): the media UAV barriers put
   bool media_valid_ = false;
   float temporal_header_[20] = {};
   float temporal_prev_[16] = {};  // eye 3, east 3, up 3, north 3, tan 2, range, set
